@@ -1,0 +1,14 @@
+[package]
+name = "rustgit_wasm_runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Gitpod-compatible WASM workspace runtime foundation"
+license = "MIT"
+
+[lib]
+name = "rustgit_wasm_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wasm-workspace-cli"
+path = "src/bin/wasm_workspace_cli.rs"
