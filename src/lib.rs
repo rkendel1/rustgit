@@ -14,6 +14,7 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 pub enum RuntimeError {
     WorkspaceMissing(String),
     UnsupportedRepository(String),
+    ExecutionContextMissing(String),
     InvalidTransition {
         from: WorkspaceState,
         to: WorkspaceState,
@@ -28,6 +29,9 @@ impl Display for RuntimeError {
         match self {
             Self::WorkspaceMissing(id) => write!(f, "workspace not found: {id}"),
             Self::UnsupportedRepository(reason) => write!(f, "unsupported repository: {reason}"),
+            Self::ExecutionContextMissing(id) => {
+                write!(f, "execution context missing for workspace: {id}")
+            }
             Self::InvalidTransition { from, to } => {
                 write!(f, "invalid workspace transition: {:?} -> {:?}", from, to)
             }
@@ -162,11 +166,20 @@ pub struct ExecutionContext {
     pub network: NetworkPolicy,
 }
 
+/// Provider contract for deterministic workspace execution.
+///
+/// Implementations are selected via `can_handle`, then called in the
+/// lifecycle order `prepare` -> `start` -> `health` (and eventually `stop`).
 pub trait ExecutionProvider {
+    /// Returns true when this provider owns runtime execution for `ctx`.
     fn can_handle(&self, ctx: &ExecutionContext) -> bool;
+    /// Mutates provider-specific runtime details before start.
     fn prepare(&self, ctx: &mut ExecutionContext) -> Result<()>;
+    /// Starts execution from an immutable execution contract.
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle>;
+    /// Stops a process started by this provider.
     fn stop(&self, handle: &ProcessHandle) -> Result<()>;
+    /// Reports process health after startup and during monitoring.
     fn health(&self, handle: &ProcessHandle) -> Result<HealthStatus>;
 }
 
@@ -212,7 +225,10 @@ impl ExecutionEngine {
             .find(|provider| provider.can_handle(ctx))
             .map(|provider| provider.as_ref())
             .ok_or_else(|| {
-                RuntimeError::UnsupportedRepository("no runtime provider matched".into())
+                RuntimeError::UnsupportedRepository(format!(
+                    "no execution provider matched for workspace {} with framework {:?}",
+                    ctx.workspace_id, ctx.analysis.framework
+                ))
             })
     }
 
@@ -224,11 +240,16 @@ impl ExecutionEngine {
         if health.healthy {
             Ok(handle)
         } else {
-            let _ = provider.stop(&handle);
-            Err(RuntimeError::CommandFailed(format!(
-                "provider reported unhealthy process: {}",
-                health.message
-            )))
+            match provider.stop(&handle) {
+                Ok(()) => Err(RuntimeError::CommandFailed(format!(
+                    "provider reported unhealthy process: {}",
+                    health.message
+                ))),
+                Err(stop_err) => Err(RuntimeError::CommandFailed(format!(
+                    "provider reported unhealthy process: {}; cleanup failed: {stop_err}",
+                    health.message
+                ))),
+            }
         }
     }
 
@@ -463,12 +484,10 @@ impl WasmWorkspace for WorkspaceManager {
             .get_mut(id)
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
         Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
-        let mut execution_context = record.execution_context.clone().ok_or_else(|| {
-            RuntimeError::CommandFailed(
-                "execution context not available; workspace may not have launched successfully"
-                    .to_string(),
-            )
-        })?;
+        let mut execution_context = record
+            .execution_context
+            .clone()
+            .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?;
         let handle = self.execution_engine.start(&mut execution_context)?;
         Self::transition_state(&mut record.workspace, WorkspaceState::Running)?;
         record.execution_context = Some(execution_context);
@@ -1053,6 +1072,59 @@ mod tests {
                 from: WorkspaceState::Stopped,
                 to: WorkspaceState::Stopping,
             },
+        ));
+    }
+
+    #[test]
+    fn state_machine_allows_and_rejects_expected_transitions() {
+        assert!(can_transition(
+            WorkspaceState::Created,
+            WorkspaceState::Materializing
+        ));
+        assert!(can_transition(
+            WorkspaceState::Materializing,
+            WorkspaceState::Analyzing
+        ));
+        assert!(can_transition(
+            WorkspaceState::Analyzing,
+            WorkspaceState::Planning
+        ));
+        assert!(can_transition(
+            WorkspaceState::Planning,
+            WorkspaceState::Starting
+        ));
+        assert!(can_transition(
+            WorkspaceState::Starting,
+            WorkspaceState::Running
+        ));
+        assert!(can_transition(
+            WorkspaceState::Paused,
+            WorkspaceState::Running
+        ));
+        assert!(can_transition(
+            WorkspaceState::Failed,
+            WorkspaceState::Starting
+        ));
+        assert!(can_transition(
+            WorkspaceState::Stopped,
+            WorkspaceState::Destroyed
+        ));
+
+        assert!(!can_transition(
+            WorkspaceState::Created,
+            WorkspaceState::Running
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Running,
+            WorkspaceState::Created
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Stopped,
+            WorkspaceState::Stopping
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Destroyed,
+            WorkspaceState::Created
         ));
     }
 
