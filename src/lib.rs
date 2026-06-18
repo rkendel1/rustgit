@@ -76,7 +76,7 @@ pub enum Language {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeType {
     Node,
     Rust,
@@ -953,7 +953,7 @@ impl RepositoryRegistry {
             }
         }
 
-        let classification = classify_repository(root, framework, &snapshot, &package_content);
+        let classification = classify_repository(framework, &snapshot, &package_content);
         let profile = ExecutionProfile {
             fingerprint,
             classification: classification.clone(),
@@ -1091,7 +1091,7 @@ fn collect_repository_snapshot_inner(
             continue;
         }
         let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-        if should_ignore_path(&relative_str, is_dir, patterns) {
+        if should_ignore_path(&relative_str, patterns) {
             continue;
         }
         if is_dir {
@@ -1113,7 +1113,7 @@ fn read_gitignore_patterns(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn should_ignore_path(relative: &str, is_dir: bool, patterns: &[String]) -> bool {
+fn should_ignore_path(relative: &str, patterns: &[String]) -> bool {
     for pattern in patterns {
         let normalized = pattern.trim_start_matches("./").trim_start_matches('/');
         if normalized.is_empty() {
@@ -1138,9 +1138,10 @@ fn should_ignore_path(relative: &str, is_dir: bool, patterns: &[String]) -> bool
             }
             continue;
         }
-        if relative
-            .split('/')
-            .any(|segment| segment == normalized || (is_dir && relative == normalized))
+        if relative == normalized
+            || relative
+                .split('/')
+                .any(|segment| segment == normalized)
         {
             return true;
         }
@@ -1240,7 +1241,6 @@ fn language_signature(snapshot: &HashMap<String, String>, primary: Language) -> 
 }
 
 fn classify_repository(
-    root: &Path,
     framework: Framework,
     snapshot: &HashMap<String, String>,
     package_content: &str,
@@ -1289,10 +1289,8 @@ fn classify_repository(
     {
         secondary_runtimes.push(RuntimeType::Node);
     }
-    secondary_runtimes.sort_by_key(|runtime| format!("{runtime:?}"));
+    secondary_runtimes.sort();
     secondary_runtimes.dedup();
-
-    let _ = root;
 
     RepositoryClassification {
         class,
