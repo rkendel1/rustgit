@@ -14,6 +14,11 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 pub enum RuntimeError {
     WorkspaceMissing(String),
     UnsupportedRepository(String),
+    ExecutionContextMissing(String),
+    InvalidTransition {
+        from: WorkspaceState,
+        to: WorkspaceState,
+    },
     InvalidPath(String),
     Io(io::Error),
     CommandFailed(String),
@@ -24,6 +29,12 @@ impl Display for RuntimeError {
         match self {
             Self::WorkspaceMissing(id) => write!(f, "workspace not found: {id}"),
             Self::UnsupportedRepository(reason) => write!(f, "unsupported repository: {reason}"),
+            Self::ExecutionContextMissing(id) => {
+                write!(f, "execution context missing for workspace: {id}")
+            }
+            Self::InvalidTransition { from, to } => {
+                write!(f, "invalid workspace transition: {:?} -> {:?}", from, to)
+            }
             Self::InvalidPath(path) => write!(f, "invalid path: {path}"),
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::CommandFailed(message) => write!(f, "command failed: {message}"),
@@ -66,9 +77,17 @@ pub enum Language {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceState {
+    Created,
+    Materializing,
+    Analyzing,
+    Planning,
     Starting,
     Running,
+    Paused,
+    Failed,
+    Stopping,
     Stopped,
+    Destroyed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,9 +122,14 @@ pub struct BuildArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeInstance {
+pub struct ProcessHandle {
     pub pid_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthStatus {
     pub healthy: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,10 +156,31 @@ pub struct Workspace {
     pub resource_quotas: ResourceQuotas,
 }
 
-pub trait RuntimeProvider {
-    fn can_run(&self, repo: &RepositoryAnalysis) -> bool;
-    fn build(&self, repo: &RepositoryAnalysis) -> Result<BuildArtifact>;
-    fn execute(&self, artifact: &BuildArtifact) -> Result<RuntimeInstance>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionContext {
+    pub workspace_id: String,
+    pub repo_path: String,
+    pub analysis: RepositoryAnalysis,
+    pub execution_plan: ExecutionPlan,
+    pub resources: ResourceQuotas,
+    pub network: NetworkPolicy,
+}
+
+/// Provider contract for deterministic workspace execution.
+///
+/// Implementations are selected via `can_handle`, then called in the
+/// lifecycle order `prepare` -> `start` -> `health` (and eventually `stop`).
+pub trait ExecutionProvider {
+    /// Returns true when this provider owns runtime execution for `ctx`.
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool;
+    /// Mutates provider-specific runtime details before start.
+    fn prepare(&self, ctx: &mut ExecutionContext) -> Result<()>;
+    /// Starts execution from an immutable execution contract.
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle>;
+    /// Stops a process started by this provider.
+    fn stop(&self, handle: &ProcessHandle) -> Result<()>;
+    /// Reports process health after startup and during monitoring.
+    fn health(&self, handle: &ProcessHandle) -> Result<HealthStatus>;
 }
 
 pub trait WasmWorkspace {
@@ -150,15 +195,68 @@ pub trait WasmWorkspace {
 struct WorkspaceRecord {
     workspace: Workspace,
     logs: Vec<String>,
+    execution_context: Option<ExecutionContext>,
+    process_handle: Option<ProcessHandle>,
+}
+
+pub struct ExecutionEngine {
+    providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>,
 }
 
 pub struct WorkspaceManager {
     root: PathBuf,
-    providers: Vec<Box<dyn RuntimeProvider + Send + Sync>>,
+    execution_engine: ExecutionEngine,
     workspaces: Arc<Mutex<HashMap<String, WorkspaceRecord>>>,
     repository_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
-    build_cache: Arc<Mutex<HashMap<String, BuildArtifact>>>,
     sequence: AtomicU64,
+}
+
+impl ExecutionEngine {
+    pub fn new(providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>) -> Self {
+        Self { providers }
+    }
+
+    fn provider_for(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<&(dyn ExecutionProvider + Send + Sync)> {
+        self.providers
+            .iter()
+            .find(|provider| provider.can_handle(ctx))
+            .map(|provider| provider.as_ref())
+            .ok_or_else(|| {
+                RuntimeError::UnsupportedRepository(format!(
+                    "no execution provider matched for workspace {} with framework {:?}",
+                    ctx.workspace_id, ctx.analysis.framework
+                ))
+            })
+    }
+
+    pub fn start(&self, ctx: &mut ExecutionContext) -> Result<ProcessHandle> {
+        let provider = self.provider_for(ctx)?;
+        provider.prepare(ctx)?;
+        let handle = provider.start(ctx)?;
+        let health = provider.health(&handle)?;
+        if health.healthy {
+            Ok(handle)
+        } else {
+            match provider.stop(&handle) {
+                Ok(()) => Err(RuntimeError::CommandFailed(format!(
+                    "provider reported unhealthy process: {}",
+                    health.message
+                ))),
+                Err(stop_err) => Err(RuntimeError::CommandFailed(format!(
+                    "provider reported unhealthy process: {}; cleanup failed: {stop_err}",
+                    health.message
+                ))),
+            }
+        }
+    }
+
+    pub fn stop(&self, ctx: &ExecutionContext, handle: &ProcessHandle) -> Result<()> {
+        let provider = self.provider_for(ctx)?;
+        provider.stop(handle)
+    }
 }
 
 impl WorkspaceManager {
@@ -172,7 +270,7 @@ impl WorkspaceManager {
                 .join(requested_root)
         };
 
-        let providers: Vec<Box<dyn RuntimeProvider + Send + Sync>> = vec![
+        let providers: Vec<Box<dyn ExecutionProvider + Send + Sync>> = vec![
             Box::new(NodeRuntimeProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
@@ -180,10 +278,9 @@ impl WorkspaceManager {
 
         Self {
             root: normalized_root,
-            providers,
+            execution_engine: ExecutionEngine::new(providers),
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             repository_cache: Arc::new(Mutex::new(HashMap::new())),
-            build_cache: Arc::new(Mutex::new(HashMap::new())),
             sequence: AtomicU64::new(0),
         }
     }
@@ -205,44 +302,16 @@ impl WorkspaceManager {
         format!("ws-{ts}-{seq}")
     }
 
-    fn build_or_reuse(&self, analysis: &RepositoryAnalysis) -> Result<BuildArtifact> {
-        if let Some(artifact) = self
-            .build_cache
-            .lock()
-            .expect("build cache lock poisoned")
-            .get(&analysis.execution_plan.cache_key)
-            .cloned()
-        {
-            return Ok(artifact);
-        }
-
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.can_run(analysis))
-            .ok_or_else(|| {
-                RuntimeError::UnsupportedRepository("no runtime provider matched".into())
-            })?;
-
-        let artifact = provider.build(analysis)?;
-        self.build_cache
-            .lock()
-            .expect("build cache lock poisoned")
-            .insert(analysis.execution_plan.cache_key.clone(), artifact.clone());
-        Ok(artifact)
-    }
-
-    fn provider_for(
-        &self,
-        analysis: &RepositoryAnalysis,
-    ) -> Result<&(dyn RuntimeProvider + Send + Sync)> {
-        self.providers
-            .iter()
-            .find(|provider| provider.can_run(analysis))
-            .map(|provider| provider.as_ref())
-            .ok_or_else(|| {
-                RuntimeError::UnsupportedRepository("no runtime provider matched".into())
+    fn transition_state(workspace: &mut Workspace, to: WorkspaceState) -> Result<()> {
+        if can_transition(workspace.state, to) {
+            workspace.state = to;
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidTransition {
+                from: workspace.state,
+                to,
             })
+        }
     }
 
     fn materialize_repository(&self, repo_url: &str, destination: &Path) -> Result<()> {
@@ -305,24 +374,13 @@ impl WasmWorkspace for WorkspaceManager {
         let workspace_root = self.root.join("workspaces").join(&id);
         let repository_root = workspace_root.join("repo");
         fs::create_dir_all(&workspace_root)?;
-        self.materialize_repository(repo_url, &repository_root)?;
-
-        let analysis = analyze_repository(&repository_root)?;
-        let artifact = self.build_or_reuse(&analysis)?;
-        let provider = self.provider_for(&analysis)?;
-        let instance = provider.execute(&artifact)?;
-
-        let workspace = Workspace {
+        let mut workspace = Workspace {
             id: id.clone(),
             repo_url: repo_url.to_string(),
             root: workspace_root,
-            state: if instance.healthy {
-                WorkspaceState::Running
-            } else {
-                WorkspaceState::Starting
-            },
-            framework: analysis.framework,
-            ports: analysis.execution_plan.ports.clone(),
+            state: WorkspaceState::Created,
+            framework: Framework::Unknown,
+            ports: vec![],
             network_policy: NetworkPolicy {
                 allow_outbound: false,
                 allowed_hosts: vec![],
@@ -332,25 +390,77 @@ impl WasmWorkspace for WorkspaceManager {
                 max_cpu_millis: 1000,
             },
         };
+        let mut logs = vec![];
 
-        let logs = vec![
-            format!("cloned repository: {repo_url}"),
-            format!("detected framework: {:?}", analysis.framework),
-            format!("executed command: {}", analysis.execution_plan.run_command),
-        ];
-
-        self.workspaces
-            .lock()
-            .expect("workspace lock poisoned")
-            .insert(
-                id,
+        {
+            let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+            workspaces.insert(
+                id.clone(),
                 WorkspaceRecord {
                     workspace: workspace.clone(),
-                    logs,
+                    logs: vec!["workspace created".to_string()],
+                    execution_context: None,
+                    process_handle: None,
                 },
             );
+        }
 
-        Ok(workspace)
+        let launch_result = (|| -> Result<(ExecutionContext, ProcessHandle)> {
+            Self::transition_state(&mut workspace, WorkspaceState::Materializing)?;
+            self.materialize_repository(repo_url, &repository_root)?;
+            logs.push(format!("materialized repository: {repo_url}"));
+
+            Self::transition_state(&mut workspace, WorkspaceState::Analyzing)?;
+            let analysis = analyze_repository(&repository_root)?;
+            logs.push(format!("detected framework: {:?}", analysis.framework));
+
+            Self::transition_state(&mut workspace, WorkspaceState::Planning)?;
+            let mut ctx = ExecutionContext {
+                workspace_id: id.clone(),
+                repo_path: repository_root.to_string_lossy().to_string(),
+                analysis: analysis.clone(),
+                execution_plan: analysis.execution_plan.clone(),
+                resources: workspace.resource_quotas.clone(),
+                network: workspace.network_policy.clone(),
+            };
+            logs.push(format!(
+                "planned execution command: {}",
+                ctx.execution_plan.run_command
+            ));
+
+            Self::transition_state(&mut workspace, WorkspaceState::Starting)?;
+            let handle = self.execution_engine.start(&mut ctx)?;
+            logs.push(format!("started process: {}", handle.pid_hint));
+
+            Self::transition_state(&mut workspace, WorkspaceState::Running)?;
+            workspace.framework = ctx.analysis.framework;
+            workspace.ports = ctx.execution_plan.ports.clone();
+            workspace.network_policy = ctx.network.clone();
+            workspace.resource_quotas = ctx.resources.clone();
+
+            Ok((ctx, handle))
+        })();
+
+        let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+        let record = workspaces
+            .get_mut(&id)
+            .ok_or_else(|| RuntimeError::WorkspaceMissing(id.clone()))?;
+
+        match launch_result {
+            Ok((ctx, handle)) => {
+                record.workspace = workspace.clone();
+                record.logs.extend(logs);
+                record.execution_context = Some(ctx);
+                record.process_handle = Some(handle);
+                Ok(workspace)
+            }
+            Err(err) => {
+                record.workspace.state = WorkspaceState::Failed;
+                record.logs.extend(logs);
+                record.logs.push(format!("workspace failed: {err}"));
+                Err(err)
+            }
+        }
     }
 
     fn stop(&self, id: &str) -> Result<()> {
@@ -358,8 +468,12 @@ impl WasmWorkspace for WorkspaceManager {
         let record = workspaces
             .get_mut(id)
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
-
-        record.workspace.state = WorkspaceState::Stopped;
+        Self::transition_state(&mut record.workspace, WorkspaceState::Stopping)?;
+        if let (Some(ctx), Some(handle)) = (&record.execution_context, &record.process_handle) {
+            self.execution_engine.stop(ctx, handle)?;
+        }
+        record.process_handle = None;
+        Self::transition_state(&mut record.workspace, WorkspaceState::Stopped)?;
         record.logs.push("workspace stopped".to_string());
         Ok(())
     }
@@ -369,8 +483,15 @@ impl WasmWorkspace for WorkspaceManager {
         let record = workspaces
             .get_mut(id)
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
-
-        record.workspace.state = WorkspaceState::Running;
+        Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
+        let mut execution_context = record
+            .execution_context
+            .clone()
+            .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?;
+        let handle = self.execution_engine.start(&mut execution_context)?;
+        Self::transition_state(&mut record.workspace, WorkspaceState::Running)?;
+        record.execution_context = Some(execution_context);
+        record.process_handle = Some(handle);
         record.logs.push("workspace restarted".to_string());
         Ok(())
     }
@@ -638,10 +759,10 @@ struct NodeRuntimeProvider;
 struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
 
-impl RuntimeProvider for NodeRuntimeProvider {
-    fn can_run(&self, repo: &RepositoryAnalysis) -> bool {
+impl ExecutionProvider for NodeRuntimeProvider {
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
         matches!(
-            repo.framework,
+            ctx.analysis.framework,
             Framework::Node
                 | Framework::Vite
                 | Framework::React
@@ -651,58 +772,116 @@ impl RuntimeProvider for NodeRuntimeProvider {
         )
     }
 
-    fn build(&self, repo: &RepositoryAnalysis) -> Result<BuildArtifact> {
-        Ok(BuildArtifact {
-            id: format!("artifact-{}", repo.execution_plan.cache_key),
-            entrypoint: repo.execution_plan.run_command.clone(),
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("node:{}", ctx.execution_plan.cache_key),
         })
     }
 
-    fn execute(&self, artifact: &BuildArtifact) -> Result<RuntimeInstance> {
-        Ok(RuntimeInstance {
-            pid_hint: format!("node:{}", artifact.id),
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
             healthy: true,
+            message: "healthy".to_string(),
         })
     }
 }
 
-impl RuntimeProvider for RustRuntimeProvider {
-    fn can_run(&self, repo: &RepositoryAnalysis) -> bool {
-        repo.framework == Framework::Rust
+impl ExecutionProvider for RustRuntimeProvider {
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.analysis.framework == Framework::Rust
     }
 
-    fn build(&self, repo: &RepositoryAnalysis) -> Result<BuildArtifact> {
-        Ok(BuildArtifact {
-            id: format!("artifact-{}", repo.execution_plan.cache_key),
-            entrypoint: repo.execution_plan.run_command.clone(),
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("rust:{}", ctx.execution_plan.cache_key),
         })
     }
 
-    fn execute(&self, artifact: &BuildArtifact) -> Result<RuntimeInstance> {
-        Ok(RuntimeInstance {
-            pid_hint: format!("rust:{}", artifact.id),
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
             healthy: true,
+            message: "healthy".to_string(),
         })
     }
 }
 
-impl RuntimeProvider for StaticRuntimeProvider {
-    fn can_run(&self, repo: &RepositoryAnalysis) -> bool {
-        repo.framework == Framework::StaticWeb
+impl ExecutionProvider for StaticRuntimeProvider {
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.analysis.framework == Framework::StaticWeb
     }
 
-    fn build(&self, repo: &RepositoryAnalysis) -> Result<BuildArtifact> {
-        Ok(BuildArtifact {
-            id: format!("artifact-{}", repo.execution_plan.cache_key),
-            entrypoint: repo.execution_plan.run_command.clone(),
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("static:{}", ctx.execution_plan.cache_key),
         })
     }
 
-    fn execute(&self, artifact: &BuildArtifact) -> Result<RuntimeInstance> {
-        Ok(RuntimeInstance {
-            pid_hint: format!("static:{}", artifact.id),
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
             healthy: true,
+            message: "healthy".to_string(),
         })
+    }
+}
+
+fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
+    match from {
+        WorkspaceState::Created => to == WorkspaceState::Materializing,
+        WorkspaceState::Materializing => {
+            matches!(to, WorkspaceState::Analyzing | WorkspaceState::Failed)
+        }
+        WorkspaceState::Analyzing => {
+            matches!(to, WorkspaceState::Planning | WorkspaceState::Failed)
+        }
+        WorkspaceState::Planning => matches!(to, WorkspaceState::Starting | WorkspaceState::Failed),
+        WorkspaceState::Starting => matches!(to, WorkspaceState::Running | WorkspaceState::Failed),
+        WorkspaceState::Running => {
+            matches!(
+                to,
+                WorkspaceState::Paused | WorkspaceState::Stopping | WorkspaceState::Failed
+            )
+        }
+        WorkspaceState::Paused => {
+            matches!(
+                to,
+                WorkspaceState::Running | WorkspaceState::Stopping | WorkspaceState::Failed
+            )
+        }
+        WorkspaceState::Failed => {
+            matches!(
+                to,
+                WorkspaceState::Starting | WorkspaceState::Stopping | WorkspaceState::Destroyed
+            )
+        }
+        WorkspaceState::Stopping => matches!(to, WorkspaceState::Stopped | WorkspaceState::Failed),
+        WorkspaceState::Stopped => {
+            matches!(to, WorkspaceState::Starting | WorkspaceState::Destroyed)
+        }
+        WorkspaceState::Destroyed => false,
     }
 }
 
@@ -866,6 +1045,87 @@ mod tests {
         let logs = manager.logs(&workspace.id).expect("workspace logs");
         assert!(logs.iter().any(|line| line.contains("workspace stopped")));
         assert!(logs.iter().any(|line| line.contains("workspace restarted")));
+    }
+
+    #[test]
+    fn stop_requires_running_or_paused_state() {
+        let runtime_root = temp_dir("runtime-root-stop-guard");
+        let local_repo = temp_dir("local-repo-stop-guard");
+        fs::write(
+            local_repo.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .expect("write Cargo.toml");
+
+        let manager = WorkspaceManager::new(&runtime_root);
+        let workspace = manager
+            .launch(local_repo.to_string_lossy().as_ref())
+            .expect("launch workspace");
+
+        manager.stop(&workspace.id).expect("first stop succeeds");
+        let err = manager
+            .stop(&workspace.id)
+            .expect_err("second stop must fail");
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidTransition {
+                from: WorkspaceState::Stopped,
+                to: WorkspaceState::Stopping,
+            },
+        ));
+    }
+
+    #[test]
+    fn state_machine_allows_and_rejects_expected_transitions() {
+        assert!(can_transition(
+            WorkspaceState::Created,
+            WorkspaceState::Materializing
+        ));
+        assert!(can_transition(
+            WorkspaceState::Materializing,
+            WorkspaceState::Analyzing
+        ));
+        assert!(can_transition(
+            WorkspaceState::Analyzing,
+            WorkspaceState::Planning
+        ));
+        assert!(can_transition(
+            WorkspaceState::Planning,
+            WorkspaceState::Starting
+        ));
+        assert!(can_transition(
+            WorkspaceState::Starting,
+            WorkspaceState::Running
+        ));
+        assert!(can_transition(
+            WorkspaceState::Paused,
+            WorkspaceState::Running
+        ));
+        assert!(can_transition(
+            WorkspaceState::Failed,
+            WorkspaceState::Starting
+        ));
+        assert!(can_transition(
+            WorkspaceState::Stopped,
+            WorkspaceState::Destroyed
+        ));
+
+        assert!(!can_transition(
+            WorkspaceState::Created,
+            WorkspaceState::Running
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Running,
+            WorkspaceState::Created
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Stopped,
+            WorkspaceState::Stopping
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Destroyed,
+            WorkspaceState::Created
+        ));
     }
 
     #[test]
