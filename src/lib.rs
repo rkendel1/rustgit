@@ -16,6 +16,8 @@ const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
+const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
+    "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -614,6 +616,7 @@ pub struct WorkerNode {
 pub struct NodeLease {
     pub node_id: String,
     pub worker_id: String,
+    /// Unix epoch timestamp in seconds after which this lease is invalid.
     pub expires_at: u64,
 }
 
@@ -623,8 +626,10 @@ pub struct WorkerQueue {
 }
 
 impl WorkerQueue {
-    fn enqueue(&mut self, node_id: String) {
-        self.queued_nodes.push(node_id);
+    pub fn enqueue(&mut self, node_id: String) {
+        if !self.queued_nodes.iter().any(|queued| queued == &node_id) {
+            self.queued_nodes.push(node_id);
+        }
     }
 }
 
@@ -678,14 +683,14 @@ impl DistributedArtifactStore {
     pub fn store(&self, artifact: ExecutionArtifact) {
         self.artifacts
             .lock()
-            .expect("distributed artifact store lock poisoned")
+            .expect(DISTRIBUTED_ARTIFACT_STORE_POISONED)
             .insert(artifact.key.clone(), artifact);
     }
 
     pub fn fetch(&self, key: &str) -> Option<ExecutionArtifact> {
         self.artifacts
             .lock()
-            .expect("distributed artifact store lock poisoned")
+            .expect(DISTRIBUTED_ARTIFACT_STORE_POISONED)
             .get(key)
             .cloned()
     }
@@ -773,6 +778,7 @@ impl DistributedScheduler {
             .iter()
             .map(|worker| (worker.id.clone(), 0usize))
             .collect();
+        // A zero-second lease expires immediately and allows duplicate execution.
         let lease_ttl = config.lease_ttl_secs.max(1);
 
         while let Some(node_id) = ready.iter().next().cloned() {
@@ -802,11 +808,10 @@ impl DistributedScheduler {
                 .filter(|worker| worker_is_usable(worker))
                 .filter(|worker| worker_supports_mode(worker, node.execution_mode))
                 .filter(|worker| worker_has_labels(worker, &required_labels))
-                .min_by_key(|worker| {
-                    (
-                        assignment_counts.get(&worker.id).copied().unwrap_or(usize::MAX),
-                        worker.id.clone(),
-                    )
+                .min_by(|a, b| {
+                    let a_count = assignment_counts.get(&a.id).copied().unwrap_or(0);
+                    let b_count = assignment_counts.get(&b.id).copied().unwrap_or(0);
+                    a_count.cmp(&b_count).then_with(|| a.id.cmp(&b.id))
                 });
 
             let Some(worker) = selected else {
