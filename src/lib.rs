@@ -9,6 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
+const WASM_FULL_CPU_LIMIT_UNITS: u32 = 1_000;
+const WASM_PARTIAL_MEMORY_LIMIT_MB: u64 = 256;
+const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
+const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
+const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 #[derive(Debug)]
@@ -223,6 +231,12 @@ pub enum ExecutionMode {
     Hybrid,
 }
 
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::Native
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionTarget {
     Wasm(WasmRuntimeSpec),
@@ -266,8 +280,8 @@ impl ExecutionRouter {
             WasmCompatibility::Full => WasmRuntimeSpec {
                 enabled: true,
                 wasi: true,
-                memory_limit_mb: 512,
-                cpu_limit_units: 1_000,
+                memory_limit_mb: WASM_FULL_MEMORY_LIMIT_MB,
+                cpu_limit_units: WASM_FULL_CPU_LIMIT_UNITS,
                 allowed_syscalls: vec![
                     "fd_read".to_string(),
                     "fd_write".to_string(),
@@ -278,8 +292,8 @@ impl ExecutionRouter {
             WasmCompatibility::Partial => WasmRuntimeSpec {
                 enabled: true,
                 wasi: true,
-                memory_limit_mb: 256,
-                cpu_limit_units: 750,
+                memory_limit_mb: WASM_PARTIAL_MEMORY_LIMIT_MB,
+                cpu_limit_units: WASM_PARTIAL_CPU_LIMIT_UNITS,
                 allowed_syscalls: vec![
                     "fd_read".to_string(),
                     "fd_write".to_string(),
@@ -399,7 +413,7 @@ impl ExecutionGraph {
                     .find(|node| node.id == id)
                     .map(|node| execution_mode_name(node.execution_mode))
                     .unwrap_or("native");
-                format!("{id}@{mode}")
+                format!("{id}{CACHE_KEY_NODE_MODE_SEPARATOR}{mode}")
             })
             .collect::<Vec<_>>();
         let mut edges = self
@@ -489,6 +503,12 @@ pub enum ArtifactType {
     BuildOutput,
     TestResult,
     WasmModule,
+}
+
+impl Default for ArtifactType {
+    fn default() -> Self {
+        Self::BuildOutput
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -651,6 +671,7 @@ pub struct ExecutionContext {
     pub repo_path: String,
     pub analysis: RepositoryAnalysis,
     pub execution_graph: ExecutionGraph,
+    pub wasm_sandbox: Option<WasmSandbox>,
     pub resources: ResourceQuotas,
     pub network: NetworkPolicy,
 }
@@ -960,6 +981,7 @@ impl WasmWorkspace for WorkspaceManager {
                 repo_path: repository_root.to_string_lossy().to_string(),
                 analysis: analysis.clone(),
                 execution_graph: analysis.execution_graph.clone(),
+                wasm_sandbox: None,
                 resources: workspace.resource_quotas.clone(),
                 network: workspace.network_policy.clone(),
             };
@@ -2038,7 +2060,7 @@ impl ExecutionProvider for WasmExecutionProvider {
                 ExecutionTarget::Native | ExecutionTarget::Static => None,
             }
         }) {
-            let _sandbox = wasm_sandbox_for(&spec, &ctx.repo_path);
+            ctx.wasm_sandbox = Some(wasm_sandbox_for(&spec, &ctx.repo_path));
         }
         Ok(())
     }
@@ -2212,11 +2234,8 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
 
 fn wasm_sandbox_for(spec: &WasmRuntimeSpec, repo_path: &str) -> WasmSandbox {
     WasmSandbox {
-        memory_limit: spec
-            .memory_limit_mb
-            .saturating_mul(1024)
-            .saturating_mul(1024),
-        time_limit_ms: u64::from(spec.cpu_limit_units).saturating_mul(10),
+        memory_limit: spec.memory_limit_mb.saturating_mul(BYTES_PER_MB),
+        time_limit_ms: u64::from(spec.cpu_limit_units).saturating_mul(CPU_UNIT_TO_TIME_LIMIT_MS),
         filesystem_scope: vec![repo_path.to_string()],
     }
 }
