@@ -1067,13 +1067,11 @@ pub struct MonacoEditor {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TerminalSession {
     pub worker_id: Option<String>,
-    pub history: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UIExecutionNode {
     pub id: String,
-    pub state: Option<GraphEventType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1093,9 +1091,6 @@ impl ExecutionGraphView {
     pub fn apply_graph_event(&mut self, event: &GraphEvent) {
         self.live_states
             .insert(event.node_id.clone(), event.event_type);
-        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == event.node_id) {
-            node.state = Some(event.event_type);
-        }
     }
 }
 
@@ -1126,7 +1121,6 @@ impl BrowserIDE {
     }
 
     pub fn append_log(&mut self, event: WorkerEvent) {
-        self.terminal.history.push(event.message.clone());
         self.log_stream.entries.push(event);
     }
 }
@@ -3649,7 +3643,6 @@ mod tests {
         let mut graph_view = ExecutionGraphView {
             nodes: vec![UIExecutionNode {
                 id: "test".to_string(),
-                state: None,
             }],
             ..ExecutionGraphView::default()
         };
@@ -3665,7 +3658,6 @@ mod tests {
             graph_view.live_states.get("test"),
             Some(&GraphEventType::NodeCompleted)
         );
-        assert_eq!(graph_view.nodes[0].state, Some(GraphEventType::NodeCompleted));
     }
 
     #[test]
@@ -3681,7 +3673,6 @@ mod tests {
             message: "node build started".to_string(),
             timestamp: 100,
         });
-        assert_eq!(ide.terminal.history, vec!["node build started".to_string()]);
         assert_eq!(ide.log_stream.entries.len(), 1);
     }
 }
