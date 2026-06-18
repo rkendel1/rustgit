@@ -16,6 +16,8 @@ const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
+const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
+    "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -577,6 +579,376 @@ impl ArtifactStore {
 
     fn path_for(&self, key: &str) -> PathBuf {
         self.root.join(format!("{key}.json"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerStatus {
+    Ready,
+    Busy,
+    Unhealthy,
+    Offline,
+}
+
+impl Default for WorkerStatus {
+    fn default() -> Self {
+        Self::Ready
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerCapabilities {
+    pub wasm: bool,
+    pub native: bool,
+    pub cpu_cores: u32,
+    pub memory_mb: u64,
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerNode {
+    pub id: String,
+    pub capabilities: WorkerCapabilities,
+    pub status: WorkerStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLease {
+    pub node_id: String,
+    pub worker_id: String,
+    /// Unix epoch timestamp in seconds after which this lease is invalid.
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerQueue {
+    pub queued_nodes: Vec<String>,
+}
+
+impl WorkerQueue {
+    pub fn enqueue(&mut self, node_id: String) {
+        if !self.queued_nodes.iter().any(|queued| queued == &node_id) {
+            self.queued_nodes.push(node_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GraphPartition {
+    pub worker_id: String,
+    pub nodes: Vec<ExecutionNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeAssignment {
+    pub node_id: String,
+    pub worker_id: String,
+    pub sequence: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionPlan {
+    pub ordered_nodes: Vec<String>,
+    pub assignments: Vec<NodeAssignment>,
+    pub leases: HashMap<String, NodeLease>,
+    pub worker_queues: HashMap<String, WorkerQueue>,
+    pub partitions: Vec<GraphPartition>,
+    pub unscheduled_nodes: Vec<String>,
+}
+
+impl ExecutionPlan {
+    pub fn mark_worker_failed(&mut self, worker_id: &str) -> Vec<String> {
+        let mut failed_nodes = Vec::new();
+        self.leases.retain(|node_id, lease| {
+            let keep = lease.worker_id != worker_id;
+            if !keep {
+                failed_nodes.push(node_id.clone());
+            }
+            keep
+        });
+        if let Some(queue) = self.worker_queues.get_mut(worker_id) {
+            queue.queued_nodes.clear();
+        }
+        failed_nodes.sort();
+        failed_nodes
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DistributedArtifactStore {
+    artifacts: Arc<Mutex<HashMap<String, ExecutionArtifact>>>,
+}
+
+impl DistributedArtifactStore {
+    pub fn store(&self, artifact: ExecutionArtifact) {
+        self.artifacts
+            .lock()
+            .expect(DISTRIBUTED_ARTIFACT_STORE_POISONED)
+            .insert(artifact.key.clone(), artifact);
+    }
+
+    pub fn fetch(&self, key: &str) -> Option<ExecutionArtifact> {
+        self.artifacts
+            .lock()
+            .expect(DISTRIBUTED_ARTIFACT_STORE_POISONED)
+            .get(key)
+            .cloned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributedExecutionConfig {
+    pub required_worker_labels: HashMap<String, Vec<String>>,
+    pub required_artifacts: HashMap<String, Vec<String>>,
+    pub lease_ttl_secs: u64,
+}
+
+impl Default for DistributedExecutionConfig {
+    fn default() -> Self {
+        Self {
+            required_worker_labels: HashMap::new(),
+            required_artifacts: HashMap::new(),
+            lease_ttl_secs: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DistributedScheduler;
+
+impl DistributedScheduler {
+    pub fn schedule(graph: ExecutionGraph, workers: Vec<WorkerNode>) -> ExecutionPlan {
+        Self::default().schedule_with_context(
+            graph,
+            workers,
+            &DistributedArtifactStore::default(),
+            &DistributedExecutionConfig::default(),
+            current_unix_epoch_secs(),
+        )
+    }
+
+    pub fn schedule_with_context(
+        &self,
+        graph: ExecutionGraph,
+        workers: Vec<WorkerNode>,
+        artifact_store: &DistributedArtifactStore,
+        config: &DistributedExecutionConfig,
+        now: u64,
+    ) -> ExecutionPlan {
+        let node_lookup: HashMap<String, ExecutionNode> = graph
+            .nodes
+            .iter()
+            .cloned()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        let mut indegree: HashMap<String, usize> = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), 0usize))
+            .collect();
+        let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+
+        for edge in &graph.edges {
+            if let Some(count) = indegree.get_mut(&edge.to) {
+                *count += 1;
+            }
+            adjacency
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+        }
+        for next in adjacency.values_mut() {
+            next.sort();
+        }
+
+        let mut ready: BTreeSet<String> = indegree
+            .iter()
+            .filter_map(|(node_id, degree)| (*degree == 0).then_some(node_id.clone()))
+            .collect();
+        let mut completed: HashSet<String> = HashSet::new();
+        let mut unscheduled_nodes = Vec::new();
+        let mut ordered_nodes = Vec::new();
+        let mut assignments = Vec::new();
+        let mut leases = HashMap::new();
+        let mut worker_queues: HashMap<String, WorkerQueue> = workers
+            .iter()
+            .map(|worker| (worker.id.clone(), WorkerQueue::default()))
+            .collect();
+        let mut assignment_counts: HashMap<String, usize> = workers
+            .iter()
+            .map(|worker| (worker.id.clone(), 0usize))
+            .collect();
+        // A zero-second lease expires immediately and allows duplicate execution.
+        let lease_ttl = config.lease_ttl_secs.max(1);
+
+        while let Some(node_id) = ready.iter().next().cloned() {
+            ready.remove(&node_id);
+            ordered_nodes.push(node_id.clone());
+            let Some(node) = node_lookup.get(&node_id) else {
+                continue;
+            };
+
+            let supports_artifacts = config
+                .required_artifacts
+                .get(&node_id)
+                .map(|required| required.iter().all(|key| artifact_store.fetch(key).is_some()))
+                .unwrap_or(true);
+            if !supports_artifacts {
+                unscheduled_nodes.push(node_id.clone());
+                continue;
+            }
+
+            let required_labels = config
+                .required_worker_labels
+                .get(&node_id)
+                .cloned()
+                .unwrap_or_default();
+            let selected = workers
+                .iter()
+                .filter(|worker| worker_is_usable(worker))
+                .filter(|worker| worker_supports_mode(worker, node.execution_mode))
+                .filter(|worker| worker_has_labels(worker, &required_labels))
+                .min_by(|a, b| {
+                    let a_count = assignment_counts.get(&a.id).copied().unwrap_or(0);
+                    let b_count = assignment_counts.get(&b.id).copied().unwrap_or(0);
+                    a_count.cmp(&b_count).then_with(|| a.id.cmp(&b.id))
+                });
+
+            let Some(worker) = selected else {
+                unscheduled_nodes.push(node_id.clone());
+                continue;
+            };
+
+            let sequence = assignments.len();
+            assignments.push(NodeAssignment {
+                node_id: node_id.clone(),
+                worker_id: worker.id.clone(),
+                sequence,
+            });
+            leases.insert(
+                node_id.clone(),
+                NodeLease {
+                    node_id: node_id.clone(),
+                    worker_id: worker.id.clone(),
+                    expires_at: now.saturating_add(lease_ttl),
+                },
+            );
+            if let Some(queue) = worker_queues.get_mut(&worker.id) {
+                queue.enqueue(node_id.clone());
+            }
+            *assignment_counts.entry(worker.id.clone()).or_insert(0) += 1;
+            completed.insert(node_id.clone());
+
+            if let Some(next_nodes) = adjacency.get(&node_id) {
+                for next in next_nodes {
+                    if let Some(degree) = indegree.get_mut(next) {
+                        *degree = degree.saturating_sub(1);
+                        if *degree == 0 {
+                            ready.insert(next.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for node_id in node_lookup.keys() {
+            if !completed.contains(node_id) && !unscheduled_nodes.contains(node_id) {
+                unscheduled_nodes.push(node_id.clone());
+            }
+        }
+        unscheduled_nodes.sort();
+        unscheduled_nodes.dedup();
+
+        let mut by_worker: HashMap<String, Vec<ExecutionNode>> = HashMap::new();
+        for assignment in &assignments {
+            if let Some(node) = node_lookup.get(&assignment.node_id) {
+                by_worker
+                    .entry(assignment.worker_id.clone())
+                    .or_default()
+                    .push(node.clone());
+            }
+        }
+        let mut worker_ids = by_worker.keys().cloned().collect::<Vec<_>>();
+        worker_ids.sort();
+        let partitions = worker_ids
+            .into_iter()
+            .map(|worker_id| GraphPartition {
+                worker_id: worker_id.clone(),
+                nodes: by_worker.remove(&worker_id).unwrap_or_default(),
+            })
+            .collect();
+
+        ExecutionPlan {
+            ordered_nodes,
+            assignments,
+            leases,
+            worker_queues,
+            partitions,
+            unscheduled_nodes,
+        }
+    }
+}
+
+fn worker_is_usable(worker: &WorkerNode) -> bool {
+    matches!(worker.status, WorkerStatus::Ready | WorkerStatus::Busy)
+}
+
+fn worker_supports_mode(worker: &WorkerNode, mode: ExecutionMode) -> bool {
+    match mode {
+        ExecutionMode::Native => worker.capabilities.native,
+        ExecutionMode::Wasm => worker.capabilities.wasm,
+        ExecutionMode::Hybrid => worker.capabilities.native || worker.capabilities.wasm,
+    }
+}
+
+fn worker_has_labels(worker: &WorkerNode, labels: &[String]) -> bool {
+    labels
+        .iter()
+        .all(|label| worker.capabilities.labels.iter().any(|worker_label| worker_label == label))
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionCoordinator {
+    pub scheduler: DistributedScheduler,
+    pub workers: Vec<WorkerNode>,
+    pub artifact_store: DistributedArtifactStore,
+}
+
+impl ExecutionCoordinator {
+    pub fn new(workers: Vec<WorkerNode>, artifact_store: DistributedArtifactStore) -> Self {
+        Self {
+            scheduler: DistributedScheduler,
+            workers,
+            artifact_store,
+        }
+    }
+
+    pub fn plan(
+        &self,
+        graph: ExecutionGraph,
+        config: &DistributedExecutionConfig,
+        now: u64,
+    ) -> ExecutionPlan {
+        self.scheduler.schedule_with_context(
+            graph,
+            self.workers.clone(),
+            &self.artifact_store,
+            config,
+            now,
+        )
+    }
+
+    pub fn recover_failed_worker(
+        &mut self,
+        graph: ExecutionGraph,
+        failed_worker_id: &str,
+        config: &DistributedExecutionConfig,
+        now: u64,
+    ) -> ExecutionPlan {
+        if let Some(worker) = self.workers.iter_mut().find(|worker| worker.id == failed_worker_id) {
+            worker.status = WorkerStatus::Offline;
+        }
+        self.plan(graph, config, now)
     }
 }
 
@@ -2421,6 +2793,13 @@ fn collect_files(
     Ok(())
 }
 
+fn current_unix_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2789,6 +3168,205 @@ mod tests {
 
         assert!(store.exists("cache-key"));
         assert_eq!(store.get("cache-key"), Some(artifact));
+    }
+
+    #[test]
+    fn distributed_scheduler_respects_dependency_capability_and_label_constraints() {
+        let graph = ExecutionGraph {
+            nodes: vec![
+                ExecutionNode {
+                    id: "build".to_string(),
+                    node_type: ExecutionNodeType::Build,
+                    command: Some("cargo build".to_string()),
+                    execution_mode: ExecutionMode::Native,
+                    inputs: vec!["Cargo.toml".to_string()],
+                    outputs: vec!["target".to_string()],
+                    cache_key: None,
+                },
+                ExecutionNode {
+                    id: "wasm-test".to_string(),
+                    node_type: ExecutionNodeType::Test,
+                    command: Some("wasm-test-runner".to_string()),
+                    execution_mode: ExecutionMode::Wasm,
+                    inputs: vec!["target".to_string()],
+                    outputs: vec!["report".to_string()],
+                    cache_key: None,
+                },
+            ],
+            edges: vec![ExecutionEdge {
+                from: "build".to_string(),
+                to: "wasm-test".to_string(),
+            }],
+        };
+
+        let workers = vec![
+            WorkerNode {
+                id: "native-a".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: false,
+                    native: true,
+                    cpu_cores: 8,
+                    memory_mb: 8192,
+                    labels: vec!["high-cpu".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+            WorkerNode {
+                id: "wasm-b".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: false,
+                    cpu_cores: 4,
+                    memory_mb: 4096,
+                    labels: vec!["wasm".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+        ];
+
+        let artifact_store = DistributedArtifactStore::default();
+        artifact_store.store(ExecutionArtifact {
+            key: "build-out".to_string(),
+            node_id: "build".to_string(),
+            artifact_type: ArtifactType::BuildOutput,
+            path: "/tmp/build".to_string(),
+            created_at: 1,
+        });
+
+        let mut config = DistributedExecutionConfig::default();
+        config
+            .required_worker_labels
+            .insert("wasm-test".to_string(), vec!["wasm".to_string()]);
+        config
+            .required_artifacts
+            .insert("wasm-test".to_string(), vec!["build-out".to_string()]);
+        config.lease_ttl_secs = 30;
+
+        let plan = DistributedScheduler.schedule_with_context(
+            graph,
+            workers,
+            &artifact_store,
+            &config,
+            100,
+        );
+
+        assert_eq!(plan.ordered_nodes, vec!["build", "wasm-test"]);
+        assert!(plan.unscheduled_nodes.is_empty());
+        assert_eq!(plan.assignments.len(), 2);
+        assert_eq!(plan.assignments[0].node_id, "build");
+        assert_eq!(plan.assignments[0].worker_id, "native-a");
+        assert_eq!(plan.assignments[1].node_id, "wasm-test");
+        assert_eq!(plan.assignments[1].worker_id, "wasm-b");
+        assert_eq!(
+            plan.leases.get("wasm-test").map(|lease| lease.expires_at),
+            Some(130)
+        );
+    }
+
+    #[test]
+    fn distributed_scheduler_blocks_nodes_when_required_artifacts_are_missing() {
+        let graph = ExecutionGraph {
+            nodes: vec![
+                ExecutionNode {
+                    id: "build".to_string(),
+                    node_type: ExecutionNodeType::Build,
+                    command: Some("cargo build".to_string()),
+                    execution_mode: ExecutionMode::Native,
+                    inputs: vec!["Cargo.toml".to_string()],
+                    outputs: vec!["target".to_string()],
+                    cache_key: None,
+                },
+                ExecutionNode {
+                    id: "test".to_string(),
+                    node_type: ExecutionNodeType::Test,
+                    command: Some("cargo test".to_string()),
+                    execution_mode: ExecutionMode::Native,
+                    inputs: vec!["target".to_string()],
+                    outputs: vec!["report".to_string()],
+                    cache_key: None,
+                },
+            ],
+            edges: vec![ExecutionEdge {
+                from: "build".to_string(),
+                to: "test".to_string(),
+            }],
+        };
+        let workers = vec![WorkerNode {
+            id: "native-a".to_string(),
+            capabilities: WorkerCapabilities {
+                wasm: false,
+                native: true,
+                cpu_cores: 8,
+                memory_mb: 8192,
+                labels: vec![],
+            },
+            status: WorkerStatus::Ready,
+        }];
+        let artifact_store = DistributedArtifactStore::default();
+        let mut config = DistributedExecutionConfig::default();
+        config
+            .required_artifacts
+            .insert("test".to_string(), vec!["missing-build-out".to_string()]);
+
+        let plan = DistributedScheduler.schedule_with_context(
+            graph,
+            workers,
+            &artifact_store,
+            &config,
+            10,
+        );
+
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].node_id, "build");
+        assert_eq!(plan.unscheduled_nodes, vec!["test"]);
+    }
+
+    #[test]
+    fn execution_coordinator_reassigns_work_when_worker_goes_offline() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "wasm-build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("wasm-pack build".to_string()),
+                execution_mode: ExecutionMode::Wasm,
+                inputs: vec!["src".to_string()],
+                outputs: vec!["pkg".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        };
+        let workers = vec![
+            WorkerNode {
+                id: "worker-a".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: false,
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    labels: vec!["wasm".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+            WorkerNode {
+                id: "worker-b".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: false,
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    labels: vec!["wasm".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+        ];
+        let mut coordinator = ExecutionCoordinator::new(workers, DistributedArtifactStore::default());
+        let config = DistributedExecutionConfig::default();
+
+        let initial = coordinator.plan(graph.clone(), &config, 50);
+        assert_eq!(initial.assignments[0].worker_id, "worker-a");
+
+        let recovered = coordinator.recover_failed_worker(graph, "worker-a", &config, 55);
+        assert_eq!(recovered.assignments[0].worker_id, "worker-b");
     }
 
     #[test]
