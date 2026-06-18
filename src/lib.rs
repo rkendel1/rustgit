@@ -791,13 +791,43 @@ impl BuildPlanner {
     pub fn build_graph(analysis: &RepositoryAnalysis) -> ExecutionGraph {
         let framework = analysis.framework;
         let scripts = &analysis.build_intelligence.scripts;
+        let package_manager = analysis
+            .build_intelligence
+            .package_manager
+            .as_deref()
+            .unwrap_or("npm");
 
         let js_script = |name: &str, fallback: &str| -> String {
             if scripts.contains_key(name) {
-                format!("npm run {name}")
+                match package_manager {
+                    "pnpm" => format!("pnpm run {name}"),
+                    "yarn" => format!("yarn {name}"),
+                    _ => format!("npm run {name}"),
+                }
             } else {
                 fallback.to_string()
             }
+        };
+
+        let js_install = match package_manager {
+            "pnpm" => "pnpm install --frozen-lockfile".to_string(),
+            "yarn" => "yarn install --frozen-lockfile".to_string(),
+            _ => "npm ci".to_string(),
+        };
+        let js_build_fallback = match package_manager {
+            "pnpm" => "pnpm run build".to_string(),
+            "yarn" => "yarn build".to_string(),
+            _ => "npm run build".to_string(),
+        };
+        let js_dev_fallback = match package_manager {
+            "pnpm" => "pnpm run dev -- --host 0.0.0.0".to_string(),
+            "yarn" => "yarn dev --host 0.0.0.0".to_string(),
+            _ => "npm run dev -- --host 0.0.0.0".to_string(),
+        };
+        let js_test_fallback = match package_manager {
+            "pnpm" => "pnpm run test".to_string(),
+            "yarn" => "yarn test".to_string(),
+            _ => "npm test".to_string(),
         };
 
         match framework {
@@ -810,7 +840,7 @@ impl BuildPlanner {
                 let install = ExecutionNode {
                     id: "install".to_string(),
                     node_type: ExecutionNodeType::InstallDependencies,
-                    command: Some("npm ci".to_string()),
+                    command: Some(js_install),
                     inputs: vec![
                         "package.json".to_string(),
                         "package-lock.json|yarn.lock|pnpm-lock.yaml".to_string(),
@@ -820,7 +850,7 @@ impl BuildPlanner {
                 let build = ExecutionNode {
                     id: "build".to_string(),
                     node_type: ExecutionNodeType::Build,
-                    command: Some(js_script("build", "npm run build")),
+                    command: Some(js_script("build", &js_build_fallback)),
                     inputs: vec!["node_modules".to_string()],
                     outputs: vec![if framework == Framework::NextJs {
                         ".next".to_string()
@@ -831,14 +861,14 @@ impl BuildPlanner {
                 let dev = ExecutionNode {
                     id: "dev".to_string(),
                     node_type: ExecutionNodeType::DevServer,
-                    command: Some(js_script("dev", "npm run dev -- --host 0.0.0.0")),
+                    command: Some(js_script("dev", &js_dev_fallback)),
                     inputs: build.outputs.clone(),
                     outputs: vec!["http://0.0.0.0:3000/".to_string()],
                 };
                 let test = ExecutionNode {
                     id: "test".to_string(),
                     node_type: ExecutionNodeType::Test,
-                    command: Some(js_script("test", "npm test")),
+                    command: Some(js_script("test", &js_test_fallback)),
                     inputs: vec!["node_modules".to_string()],
                     outputs: vec!["test-report".to_string()],
                 };
@@ -1459,6 +1489,38 @@ mod tests {
         assert_eq!(
             graph.primary_run_command().as_deref(),
             Some("npm run dev")
+        );
+    }
+
+    #[test]
+    fn js_graph_uses_detected_package_manager_commands() {
+        let repo = temp_dir("js-pnpm-graph");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"vite":"5.0.0"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'")
+            .expect("write pnpm lockfile");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let graph = &analysis.execution_graph;
+        assert_eq!(analysis.build_intelligence.package_manager.as_deref(), Some("pnpm"));
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "install")
+                .and_then(|node| node.command.as_deref()),
+            Some("pnpm install --frozen-lockfile")
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "build")
+                .and_then(|node| node.command.as_deref()),
+            Some("pnpm run build")
         );
     }
 
