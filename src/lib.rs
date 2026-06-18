@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -105,6 +105,7 @@ pub struct ExecutionNode {
     pub command: Option<String>,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +226,21 @@ impl ExecutionGraph {
         normalized.extend(edges);
         hash_key(&normalized.join("|"))
     }
+
+    pub fn compute_cache_keys(&self) -> HashMap<String, String> {
+        self.nodes
+            .iter()
+            .map(|node| (node.id.clone(), CacheKeyEngine::compute_node_key(node, self)))
+            .collect()
+    }
+
+    pub fn with_cache_keys(mut self) -> Self {
+        let keys = self.compute_cache_keys();
+        for node in &mut self.nodes {
+            node.cache_key = keys.get(&node.id).cloned();
+        }
+        self
+    }
 }
 
 pub type FrameworkType = Framework;
@@ -252,6 +268,120 @@ pub struct RepositoryAnalysis {
 pub struct BuildArtifact {
     pub id: String,
     pub entrypoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionArtifact {
+    pub key: String,
+    pub node_id: String,
+    pub path: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactStore {
+    root: PathBuf,
+}
+
+impl ArtifactStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        if let Err(err) = fs::create_dir_all(&root) {
+            eprintln!(
+                "failed to create artifact store root {}: {err}; check directory permissions and disk space",
+                root.display()
+            );
+        }
+        Self { root }
+    }
+
+    pub fn get(&self, key: &str) -> Option<ExecutionArtifact> {
+        let path = self.path_for(key);
+        let content = fs::read_to_string(path).ok()?;
+        let value = serde_json::from_str::<Value>(&content).ok()?;
+        Some(ExecutionArtifact {
+            key: value.get("key")?.as_str()?.to_string(),
+            node_id: value.get("node_id")?.as_str()?.to_string(),
+            path: value.get("path")?.as_str()?.to_string(),
+            created_at: value.get("created_at")?.as_u64()?,
+        })
+    }
+
+    pub fn put(&self, artifact: ExecutionArtifact) {
+        let path = self.path_for(&artifact.key);
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "failed to create artifact parent directory {}: {err}; artifact caching will be skipped for this execution",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        let payload = json!({
+            "key": artifact.key,
+            "node_id": artifact.node_id,
+            "path": artifact.path,
+            "created_at": artifact.created_at,
+        });
+        if let Err(err) = fs::write(&path, payload.to_string()) {
+            eprintln!(
+                "failed to write artifact metadata {}: {err}; this node output will not be cached and future runs may miss cache reuse",
+                path.display()
+            );
+        }
+    }
+
+    pub fn exists(&self, key: &str) -> bool {
+        self.path_for(key).exists()
+    }
+
+    fn path_for(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{key}.json"))
+    }
+}
+
+pub struct CacheKeyEngine;
+
+impl CacheKeyEngine {
+    /// Computes a deterministic cache key for one node by hashing:
+    /// node type, command, immediate graph position, graph/repository hash,
+    /// and an environment fingerprint stable for a given runtime configuration.
+    pub fn compute_node_key(node: &ExecutionNode, graph: &ExecutionGraph) -> String {
+        let mut incoming = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.to == node.id)
+            .map(|edge| edge.from.clone())
+            .collect::<Vec<_>>();
+        incoming.sort();
+
+        let mut outgoing = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == node.id)
+            .map(|edge| edge.to.clone())
+            .collect::<Vec<_>>();
+        outgoing.sort();
+
+        let repo_hash = graph.cache_key();
+        let env_hash = hash_key(&format!(
+            "{}|{}|{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            // Optional cache namespace partitioning (for example dev/staging/prod).
+            std::env::var("RUSTGIT_RUNTIME_ENV").unwrap_or_default()
+        ));
+
+        hash_key(&format!(
+            "{}|{}|{}|{}|{}",
+            node_type_name(node.node_type),
+            node.command.as_deref().unwrap_or_default(),
+            format!("in:{}|out:{}", incoming.join(","), outgoing.join(",")),
+            repo_hash,
+            env_hash
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +466,7 @@ struct WorkspaceRecord {
 
 pub struct ExecutionEngine {
     providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>,
+    artifact_store: ArtifactStore,
 }
 
 pub struct WorkspaceManager {
@@ -347,8 +478,14 @@ pub struct WorkspaceManager {
 }
 
 impl ExecutionEngine {
-    pub fn new(providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>) -> Self {
-        Self { providers }
+    pub fn new(
+        providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>,
+        artifact_store: ArtifactStore,
+    ) -> Self {
+        Self {
+            providers,
+            artifact_store,
+        }
     }
 
     fn provider_for(
@@ -368,6 +505,7 @@ impl ExecutionEngine {
     }
 
     pub fn start(&self, ctx: &mut ExecutionContext) -> Result<ProcessHandle> {
+        self.prime_artifacts(ctx)?;
         let provider = self.provider_for(ctx)?;
         provider.prepare(ctx)?;
         let handle = provider.start(ctx)?;
@@ -386,6 +524,36 @@ impl ExecutionEngine {
                 ))),
             }
         }
+    }
+
+    /// Ensures each node has artifact metadata recorded unless a matching cache key already exists.
+    fn prime_artifacts(&self, ctx: &ExecutionContext) -> Result<()> {
+        let keys = ctx.execution_graph.compute_cache_keys();
+        // ArtifactStore persists metadata under the runtime root; this path tracks
+        // workspace-local node output locations referenced by those metadata records.
+        let artifacts_root = Path::new(&ctx.repo_path).join(".rustgit").join("artifacts");
+        fs::create_dir_all(&artifacts_root)?;
+
+        for node in &ctx.execution_graph.nodes {
+            let Some(key) = keys.get(&node.id) else {
+                continue;
+            };
+            if self.artifact_store.exists(key) {
+                continue;
+            }
+            let artifact_path = artifacts_root.join(&node.id);
+            fs::create_dir_all(&artifact_path)?;
+            self.artifact_store.put(ExecutionArtifact {
+                key: key.clone(),
+                node_id: node.id.clone(),
+                path: artifact_path.to_string_lossy().to_string(),
+                created_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+        }
+        Ok(())
     }
 
     pub fn stop(&self, ctx: &ExecutionContext, handle: &ProcessHandle) -> Result<()> {
@@ -411,9 +579,11 @@ impl WorkspaceManager {
             Box::new(StaticRuntimeProvider),
         ];
 
+        let artifact_store = ArtifactStore::new(normalized_root.join("artifacts"));
+
         Self {
             root: normalized_root,
-            execution_engine: ExecutionEngine::new(providers),
+            execution_engine: ExecutionEngine::new(providers, artifact_store),
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             repository_cache: Arc::new(Mutex::new(HashMap::new())),
             sequence: AtomicU64::new(0),
@@ -787,7 +957,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         build_intelligence,
         execution_graph: ExecutionGraph::default(),
     };
-    analysis.execution_graph = BuildPlanner::build_graph(&analysis);
+    analysis.execution_graph = BuildPlanner::build_graph(&analysis).with_cache_keys();
 
     Ok(analysis)
 }
@@ -851,6 +1021,7 @@ impl BuildPlanner {
                         "package-lock.json|yarn.lock|pnpm-lock.yaml".to_string(),
                     ],
                     outputs: vec!["node_modules".to_string()],
+                    cache_key: None,
                 };
                 let build = ExecutionNode {
                     id: "build".to_string(),
@@ -862,6 +1033,7 @@ impl BuildPlanner {
                     } else {
                         "dist".to_string()
                     }],
+                    cache_key: None,
                 };
                 let dev = ExecutionNode {
                     id: "dev".to_string(),
@@ -869,6 +1041,7 @@ impl BuildPlanner {
                     command: Some(js_script("dev", &js_dev_fallback)),
                     inputs: build.outputs.clone(),
                     outputs: vec!["http://0.0.0.0:3000/".to_string()],
+                    cache_key: None,
                 };
                 let test = ExecutionNode {
                     id: "test".to_string(),
@@ -876,6 +1049,7 @@ impl BuildPlanner {
                     command: Some(js_script("test", &js_test_fallback)),
                     inputs: vec!["node_modules".to_string()],
                     outputs: vec!["test-report".to_string()],
+                    cache_key: None,
                 };
                 ExecutionGraph {
                     nodes: vec![install, build, dev, test],
@@ -903,6 +1077,7 @@ impl BuildPlanner {
                         command: Some("cargo build".to_string()),
                         inputs: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
                         outputs: vec!["target".to_string()],
+                        cache_key: None,
                     },
                     ExecutionNode {
                         id: "dev".to_string(),
@@ -910,6 +1085,7 @@ impl BuildPlanner {
                         command: Some("cargo run".to_string()),
                         inputs: vec!["target".to_string()],
                         outputs: vec!["http://0.0.0.0:8080/".to_string()],
+                        cache_key: None,
                     },
                     ExecutionNode {
                         id: "test".to_string(),
@@ -917,6 +1093,7 @@ impl BuildPlanner {
                         command: Some("cargo test".to_string()),
                         inputs: vec!["target".to_string()],
                         outputs: vec!["test-report".to_string()],
+                        cache_key: None,
                     },
                 ],
                 edges: vec![
@@ -938,6 +1115,7 @@ impl BuildPlanner {
                         command: Some("go build ./...".to_string()),
                         inputs: vec!["go.mod".to_string(), "go.sum".to_string()],
                         outputs: vec!["go-build-cache".to_string()],
+                        cache_key: None,
                     },
                     ExecutionNode {
                         id: "dev".to_string(),
@@ -945,6 +1123,7 @@ impl BuildPlanner {
                         command: Some("go run .".to_string()),
                         inputs: vec!["go-build-cache".to_string()],
                         outputs: vec!["http://0.0.0.0:8080/".to_string()],
+                        cache_key: None,
                     },
                     ExecutionNode {
                         id: "test".to_string(),
@@ -952,6 +1131,7 @@ impl BuildPlanner {
                         command: Some("go test ./...".to_string()),
                         inputs: vec!["go-build-cache".to_string()],
                         outputs: vec!["test-report".to_string()],
+                        cache_key: None,
                     },
                 ],
                 edges: vec![
@@ -973,6 +1153,7 @@ impl BuildPlanner {
                         command: Some("python -m pip install -r requirements.txt".to_string()),
                         inputs: vec!["requirements.txt|pyproject.toml".to_string()],
                         outputs: vec!["site-packages".to_string()],
+                        cache_key: None,
                     },
                     ExecutionNode {
                         id: "dev".to_string(),
@@ -980,6 +1161,7 @@ impl BuildPlanner {
                         command: Some("python -m app".to_string()),
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["http://0.0.0.0:8000/".to_string()],
+                        cache_key: None,
                     },
                     ExecutionNode {
                         id: "test".to_string(),
@@ -987,6 +1169,7 @@ impl BuildPlanner {
                         command: Some("python -m pytest".to_string()),
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["test-report".to_string()],
+                        cache_key: None,
                     },
                 ],
                 edges: vec![
@@ -1007,6 +1190,7 @@ impl BuildPlanner {
                     command: Some("serve .".to_string()),
                     inputs: vec!["index.html".to_string()],
                     outputs: vec!["http://0.0.0.0:4173/".to_string()],
+                    cache_key: None,
                 }],
                 edges: vec![],
             },
@@ -1225,6 +1409,17 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
 
 fn looks_like_local_path(repo_url: &str) -> bool {
     repo_url.starts_with('/') || repo_url.starts_with("./") || repo_url.starts_with("../")
+}
+
+fn node_type_name(node_type: ExecutionNodeType) -> &'static str {
+    match node_type {
+        ExecutionNodeType::InstallDependencies => "install-dependencies",
+        ExecutionNodeType::Build => "build",
+        ExecutionNodeType::DevServer => "dev-server",
+        ExecutionNodeType::Test => "test",
+        ExecutionNodeType::StaticServe => "static-serve",
+        ExecutionNodeType::CustomCommand => "custom-command",
+    }
 }
 
 /// Generates a stable cache key using the standard FNV-1a 64-bit basis and prime constants.
@@ -1461,6 +1656,7 @@ mod tests {
             graph.primary_run_command().as_deref(),
             Some("npm run dev")
         );
+        assert!(graph.nodes.iter().all(|node| node.cache_key.is_some()));
     }
 
     #[test]
@@ -1614,5 +1810,42 @@ mod tests {
         fs.restore(&snapshot).expect("restore snapshot");
         let bytes = fs.read("src/main.rs").expect("read restored file");
         assert_eq!(bytes, b"fn main() {}");
+    }
+
+    #[test]
+    fn cache_key_engine_changes_with_command() {
+        let mut graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        };
+        let first = graph.compute_cache_keys();
+        graph.nodes[0].command = Some("cargo build --release".to_string());
+        let second = graph.compute_cache_keys();
+
+        assert_ne!(first.get("build"), second.get("build"));
+    }
+
+    #[test]
+    fn artifact_store_round_trips_execution_artifact() {
+        let root = temp_dir("artifact-store");
+        let store = ArtifactStore::new(root.clone());
+        let artifact = ExecutionArtifact {
+            key: "cache-key".to_string(),
+            node_id: "build".to_string(),
+            path: root.join("build-output").to_string_lossy().to_string(),
+            created_at: 42,
+        };
+
+        store.put(artifact.clone());
+
+        assert!(store.exists("cache-key"));
+        assert_eq!(store.get("cache-key"), Some(artifact));
     }
 }
