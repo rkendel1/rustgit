@@ -932,14 +932,30 @@ pub struct RepositoryRegistry;
 static REPOSITORY_REGISTRY: OnceLock<Mutex<RepositoryRegistryState>> = OnceLock::new();
 
 impl RepositoryRegistry {
-    pub fn get_or_compute(repo_url: &str) -> ExecutionProfile {
-        let root = Path::new(repo_url);
+    pub fn get_or_compute(repo_reference: &str) -> ExecutionProfile {
+        let root = Path::new(repo_reference);
         if !root.exists() {
-            return Self::default_profile(repo_url);
+            return Self::default_profile(repo_reference);
         }
 
         let snapshot = collect_repository_snapshot(root);
         let (framework, language, package_content) = infer_framework_and_language(root);
+        Self::compute_and_cache_profile(
+            repo_reference,
+            snapshot,
+            framework,
+            language,
+            &package_content,
+        )
+    }
+
+    fn compute_and_cache_profile(
+        repo_reference: &str,
+        snapshot: HashMap<String, String>,
+        framework: Framework,
+        language: Language,
+        package_content: &str,
+    ) -> ExecutionProfile {
         let fingerprint = build_repository_fingerprint(&snapshot, framework, language);
 
         let mut state = REPOSITORY_REGISTRY
@@ -947,39 +963,45 @@ impl RepositoryRegistry {
             .lock()
             .expect("repository registry lock poisoned");
 
-        if let Some(existing) = state.profiles.get(repo_url) {
+        if let Some(existing) = state.profiles.get(repo_reference) {
             if existing.fingerprint == fingerprint {
                 return existing.clone();
             }
         }
 
         let classification = classify_repository(framework, &snapshot, &package_content);
+        let runtime_affinity = runtime_affinity_for_classification(&classification);
+        let recommended_graph_strategy = graph_strategy_for_classification(classification.class);
         let profile = ExecutionProfile {
             fingerprint,
-            classification: classification.clone(),
-            recommended_graph_strategy: graph_strategy_for_classification(classification.class),
-            runtime_affinity: runtime_affinity_for_classification(&classification),
+            classification,
+            recommended_graph_strategy,
+            runtime_affinity,
         };
 
         let delta = state
             .snapshots
-            .get(repo_url)
+            .get(repo_reference)
             .map(|previous| diff_repo_snapshots(previous, &snapshot))
             .unwrap_or_default();
-        state.snapshots.insert(repo_url.to_string(), snapshot);
-        state.deltas.insert(repo_url.to_string(), delta);
-        state.profiles.insert(repo_url.to_string(), profile.clone());
+        state
+            .snapshots
+            .insert(repo_reference.to_string(), snapshot);
+        state.deltas.insert(repo_reference.to_string(), delta);
+        state
+            .profiles
+            .insert(repo_reference.to_string(), profile.clone());
 
         profile
     }
 
-    pub fn latest_delta(repo_url: &str) -> Option<RepoDelta> {
+    pub fn latest_delta(repo_reference: &str) -> Option<RepoDelta> {
         REPOSITORY_REGISTRY
             .get_or_init(|| Mutex::new(RepositoryRegistryState::default()))
             .lock()
             .expect("repository registry lock poisoned")
             .deltas
-            .get(repo_url)
+            .get(repo_reference)
             .cloned()
     }
 
@@ -1223,10 +1245,9 @@ fn language_signature(snapshot: &HashMap<String, String>, primary: Language) -> 
     if snapshot.keys().any(|path| path.ends_with(".go")) {
         langs.push("Go".to_string());
     }
-    if snapshot
-        .keys()
-        .any(|path| path.ends_with(".py") || path.ends_with("pyproject.toml"))
-    {
+    if snapshot.keys().any(|path| {
+        path.ends_with(".py") || path_has_filename(path, "pyproject.toml")
+    }) {
         langs.push("Python".to_string());
     }
     if snapshot.keys().any(|path| path.ends_with(".js")) {
@@ -1277,7 +1298,10 @@ fn classify_repository(
         }
         if snapshot
             .keys()
-            .any(|path| path.ends_with("requirements.txt") || path.ends_with("pyproject.toml"))
+            .any(|path| {
+                path_has_filename(path, "requirements.txt")
+                    || path_has_filename(path, "pyproject.toml")
+            })
         {
             secondary_runtimes.push(RuntimeType::Python);
         }
@@ -1354,6 +1378,14 @@ fn runtime_for_framework(framework: Framework) -> RuntimeType {
         Framework::StaticWeb => RuntimeType::Static,
         Framework::Unknown => RuntimeType::Unknown,
     }
+}
+
+fn path_has_filename(path: &str, expected_file_name: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == expected_file_name)
+        .unwrap_or(false)
 }
 
 fn diff_repo_snapshots(
@@ -1466,7 +1498,15 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         scripts,
     };
 
-    let execution_profile = RepositoryRegistry::get_or_compute(&root.to_string_lossy());
+    let repo_reference = root.to_string_lossy().to_string();
+    let snapshot = collect_repository_snapshot(root);
+    let execution_profile = RepositoryRegistry::compute_and_cache_profile(
+        &repo_reference,
+        snapshot,
+        framework,
+        language,
+        &package_content,
+    );
     let mut analysis = RepositoryAnalysis {
         root: root.to_path_buf(),
         framework,
