@@ -224,6 +224,7 @@ impl ExecutionEngine {
         if health.healthy {
             Ok(handle)
         } else {
+            let _ = provider.stop(&handle);
             Err(RuntimeError::CommandFailed(format!(
                 "provider reported unhealthy process: {}",
                 health.message
@@ -462,10 +463,12 @@ impl WasmWorkspace for WorkspaceManager {
             .get_mut(id)
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
         Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
-        let mut execution_context = record
-            .execution_context
-            .clone()
-            .ok_or_else(|| RuntimeError::CommandFailed("missing execution context".to_string()))?;
+        let mut execution_context = record.execution_context.clone().ok_or_else(|| {
+            RuntimeError::CommandFailed(
+                "execution context not available; workspace may not have launched successfully"
+                    .to_string(),
+            )
+        })?;
         let handle = self.execution_engine.start(&mut execution_context)?;
         Self::transition_state(&mut record.workspace, WorkspaceState::Running)?;
         record.execution_context = Some(execution_context);
@@ -1048,8 +1051,8 @@ mod tests {
             err,
             RuntimeError::InvalidTransition {
                 from: WorkspaceState::Stopped,
-                to: WorkspaceState::Stopping
-            }
+                to: WorkspaceState::Stopping,
+            },
         ));
     }
 
