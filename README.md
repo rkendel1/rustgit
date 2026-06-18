@@ -6,7 +6,7 @@ A Rust foundation for a Gitpod-compatible WebAssembly workspace runtime.
 
 - Repository lifecycle primitives (clone/materialize, analyze, execution planning, caching)
 - Workspace runtime API (`WasmWorkspace`) with launch/stop/restart/logs/filesystem/ports
-- Provider model (`RuntimeProvider`) for Node/static/Rust runtime backends
+- Execution router + provider model (`ExecutionRouter`, `ExecutionProvider`) for WASM/native/static substrates
 - Virtual filesystem with snapshot + restore
 - Network policy and resource quota structures for sandbox controls
 - REST API route surface definition (`RestApiSpec`)

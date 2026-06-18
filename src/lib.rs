@@ -1,3 +1,4 @@
+use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -7,7 +8,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde_json::{json, Value};
+
+const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
+const WASM_FULL_CPU_LIMIT_UNITS: u32 = 1_000;
+const WASM_PARTIAL_MEMORY_LIMIT_MB: u64 = 256;
+const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
+const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
+const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
+const BYTES_PER_MB: u64 = 1024 * 1024;
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -128,12 +136,36 @@ pub struct RuntimeAffinity {
     pub fallback_providers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmCompatibility {
+    Full,
+    Partial,
+    NotSupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmRuntimeSpec {
+    pub enabled: bool,
+    pub wasi: bool,
+    pub memory_limit_mb: u64,
+    pub cpu_limit_units: u32,
+    pub allowed_syscalls: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmSandbox {
+    pub memory_limit: u64,
+    pub time_limit_ms: u64,
+    pub filesystem_scope: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionProfile {
     pub fingerprint: RepositoryFingerprint,
     pub classification: RepositoryClassification,
     pub recommended_graph_strategy: GraphStrategy,
     pub runtime_affinity: RuntimeAffinity,
+    pub wasm_compatibility: WasmCompatibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -170,6 +202,7 @@ pub struct ExecutionNode {
     pub id: String,
     pub node_type: ExecutionNodeType,
     pub command: Option<String>,
+    pub execution_mode: ExecutionMode,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub cache_key: Option<String>,
@@ -189,6 +222,93 @@ pub enum ExecutionNodeType {
     Test,
     StaticServe,
     CustomCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Native,
+    Wasm,
+    Hybrid,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::Native
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionTarget {
+    Wasm(WasmRuntimeSpec),
+    Native,
+    Static,
+}
+
+pub struct ExecutionRouter;
+
+impl ExecutionRouter {
+    pub fn route(node: &ExecutionNode, profile: &ExecutionProfile) -> ExecutionTarget {
+        match node.execution_mode {
+            ExecutionMode::Native => {
+                if node.node_type == ExecutionNodeType::StaticServe
+                    && profile.wasm_compatibility == WasmCompatibility::NotSupported
+                {
+                    ExecutionTarget::Static
+                } else {
+                    ExecutionTarget::Native
+                }
+            }
+            ExecutionMode::Wasm => match profile.wasm_compatibility {
+                WasmCompatibility::Full | WasmCompatibility::Partial => {
+                    ExecutionTarget::Wasm(Self::runtime_spec_for(profile.wasm_compatibility))
+                }
+                WasmCompatibility::NotSupported => ExecutionTarget::Native,
+            },
+            ExecutionMode::Hybrid => match profile.wasm_compatibility {
+                WasmCompatibility::Full => {
+                    ExecutionTarget::Wasm(Self::runtime_spec_for(profile.wasm_compatibility))
+                }
+                WasmCompatibility::Partial | WasmCompatibility::NotSupported => {
+                    ExecutionTarget::Native
+                }
+            },
+        }
+    }
+
+    fn runtime_spec_for(compatibility: WasmCompatibility) -> WasmRuntimeSpec {
+        match compatibility {
+            WasmCompatibility::Full => WasmRuntimeSpec {
+                enabled: true,
+                wasi: true,
+                memory_limit_mb: WASM_FULL_MEMORY_LIMIT_MB,
+                cpu_limit_units: WASM_FULL_CPU_LIMIT_UNITS,
+                allowed_syscalls: vec![
+                    "fd_read".to_string(),
+                    "fd_write".to_string(),
+                    "clock_time_get".to_string(),
+                    "random_get".to_string(),
+                ],
+            },
+            WasmCompatibility::Partial => WasmRuntimeSpec {
+                enabled: true,
+                wasi: true,
+                memory_limit_mb: WASM_PARTIAL_MEMORY_LIMIT_MB,
+                cpu_limit_units: WASM_PARTIAL_CPU_LIMIT_UNITS,
+                allowed_syscalls: vec![
+                    "fd_read".to_string(),
+                    "fd_write".to_string(),
+                    "clock_time_get".to_string(),
+                ],
+            },
+            WasmCompatibility::NotSupported => WasmRuntimeSpec {
+                enabled: false,
+                wasi: false,
+                memory_limit_mb: 0,
+                cpu_limit_units: 0,
+                allowed_syscalls: vec![],
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -283,7 +403,19 @@ impl ExecutionGraph {
     }
 
     pub fn cache_key(&self) -> String {
-        let mut normalized = self.ordered_node_ids();
+        let mut normalized = self
+            .ordered_node_ids()
+            .into_iter()
+            .map(|id| {
+                let mode = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .map(|node| execution_mode_name(node.execution_mode))
+                    .unwrap_or("native");
+                format!("{id}{CACHE_KEY_NODE_MODE_SEPARATOR}{mode}")
+            })
+            .collect::<Vec<_>>();
         let mut edges = self
             .edges
             .iter()
@@ -360,8 +492,23 @@ pub struct BuildArtifact {
 pub struct ExecutionArtifact {
     pub key: String,
     pub node_id: String,
+    pub artifact_type: ArtifactType,
     pub path: String,
     pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactType {
+    FileSystemSnapshot,
+    BuildOutput,
+    TestResult,
+    WasmModule,
+}
+
+impl Default for ArtifactType {
+    fn default() -> Self {
+        Self::BuildOutput
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +535,11 @@ impl ArtifactStore {
         Some(ExecutionArtifact {
             key: value.get("key")?.as_str()?.to_string(),
             node_id: value.get("node_id")?.as_str()?.to_string(),
+            artifact_type: value
+                .get("artifact_type")
+                .and_then(Value::as_str)
+                .and_then(ArtifactType::from_str)
+                .unwrap_or(ArtifactType::BuildOutput),
             path: value.get("path")?.as_str()?.to_string(),
             created_at: value.get("created_at")?.as_u64()?,
         })
@@ -407,6 +559,7 @@ impl ArtifactStore {
         let payload = json!({
             "key": artifact.key,
             "node_id": artifact.node_id,
+            "artifact_type": artifact.artifact_type.as_str(),
             "path": artifact.path,
             "created_at": artifact.created_at,
         });
@@ -466,8 +619,9 @@ impl CacheKeyEngine {
         ));
 
         hash_key(&format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             node_type_name(node.node_type),
+            execution_mode_name(node.execution_mode),
             node.command.as_deref().unwrap_or_default(),
             format!("in:{}|out:{}", incoming.join(","), outgoing.join(",")),
             repo_hash,
@@ -517,6 +671,7 @@ pub struct ExecutionContext {
     pub repo_path: String,
     pub analysis: RepositoryAnalysis,
     pub execution_graph: ExecutionGraph,
+    pub wasm_sandbox: Option<WasmSandbox>,
     pub resources: ResourceQuotas,
     pub network: NetworkPolicy,
 }
@@ -539,6 +694,8 @@ pub trait ExecutionProvider {
     /// Reports process health after startup and during monitoring.
     fn health(&self, handle: &ProcessHandle) -> Result<HealthStatus>;
 }
+
+pub struct WasmExecutionProvider;
 
 pub trait WasmWorkspace {
     fn launch(&self, repo_url: &str) -> Result<Workspace>;
@@ -635,9 +792,15 @@ impl ExecutionEngine {
             }
             let artifact_path = artifacts_root.join(&node.id);
             fs::create_dir_all(&artifact_path)?;
+            let artifact_type = match ExecutionRouter::route(node, &ctx.analysis.execution_profile)
+            {
+                ExecutionTarget::Wasm(_) => ArtifactType::WasmModule,
+                ExecutionTarget::Native | ExecutionTarget::Static => ArtifactType::BuildOutput,
+            };
             self.artifact_store.put(ExecutionArtifact {
                 key: key.clone(),
                 node_id: node.id.clone(),
+                artifact_type,
                 path: artifact_path.to_string_lossy().to_string(),
                 created_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -666,6 +829,7 @@ impl WorkspaceManager {
         };
 
         let providers: Vec<Box<dyn ExecutionProvider + Send + Sync>> = vec![
+            Box::new(WasmExecutionProvider),
             Box::new(NodeRuntimeProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
@@ -817,6 +981,7 @@ impl WasmWorkspace for WorkspaceManager {
                 repo_path: repository_root.to_string_lossy().to_string(),
                 analysis: analysis.clone(),
                 execution_graph: analysis.execution_graph.clone(),
+                wasm_sandbox: None,
                 resources: workspace.resource_quotas.clone(),
                 network: workspace.network_policy.clone(),
             };
@@ -972,11 +1137,13 @@ impl RepositoryRegistry {
         let classification = classify_repository(framework, &snapshot, &package_content);
         let runtime_affinity = runtime_affinity_for_classification(&classification);
         let recommended_graph_strategy = graph_strategy_for_classification(classification.class);
+        let wasm_compatibility = wasm_compatibility_for_classification(&classification);
         let profile = ExecutionProfile {
             fingerprint,
             classification,
             recommended_graph_strategy,
             runtime_affinity,
+            wasm_compatibility,
         };
 
         let delta = state
@@ -984,9 +1151,7 @@ impl RepositoryRegistry {
             .get(repo_reference)
             .map(|previous| diff_repo_snapshots(previous, &snapshot))
             .unwrap_or_default();
-        state
-            .snapshots
-            .insert(repo_reference.to_string(), snapshot);
+        state.snapshots.insert(repo_reference.to_string(), snapshot);
         state.deltas.insert(repo_reference.to_string(), delta);
         state
             .profiles
@@ -1024,6 +1189,7 @@ impl RepositoryRegistry {
             classification: classification.clone(),
             recommended_graph_strategy: graph_strategy_for_classification(classification.class),
             runtime_affinity: runtime_affinity_for_classification(&classification),
+            wasm_compatibility: wasm_compatibility_for_classification(&classification),
         }
     }
 }
@@ -1160,11 +1326,7 @@ fn should_ignore_path(relative: &str, patterns: &[String]) -> bool {
             }
             continue;
         }
-        if relative == normalized
-            || relative
-                .split('/')
-                .any(|segment| segment == normalized)
-        {
+        if relative == normalized || relative.split('/').any(|segment| segment == normalized) {
             return true;
         }
     }
@@ -1245,15 +1407,19 @@ fn language_signature(snapshot: &HashMap<String, String>, primary: Language) -> 
     if snapshot.keys().any(|path| path.ends_with(".go")) {
         langs.push("Go".to_string());
     }
-    if snapshot.keys().any(|path| {
-        path.ends_with(".py") || path_has_filename(path, "pyproject.toml")
-    }) {
+    if snapshot
+        .keys()
+        .any(|path| path.ends_with(".py") || path_has_filename(path, "pyproject.toml"))
+    {
         langs.push("Python".to_string());
     }
     if snapshot.keys().any(|path| path.ends_with(".js")) {
         langs.push("JavaScript".to_string());
     }
-    if snapshot.keys().any(|path| path.ends_with(".ts") || path.ends_with(".tsx")) {
+    if snapshot
+        .keys()
+        .any(|path| path.ends_with(".ts") || path.ends_with(".tsx"))
+    {
         langs.push("TypeScript".to_string());
     }
     langs.sort();
@@ -1279,9 +1445,11 @@ fn classify_repository(
     } else {
         match framework {
             Framework::NextJs => (RepoClass::FullStackNode, 0.95),
-            Framework::Node | Framework::React | Framework::Vue | Framework::Svelte | Framework::Vite => {
-                (RepoClass::NodeApp, 0.9)
-            }
+            Framework::Node
+            | Framework::React
+            | Framework::Vue
+            | Framework::Svelte
+            | Framework::Vite => (RepoClass::NodeApp, 0.9),
             Framework::Rust => (RepoClass::RustBinary, 0.92),
             Framework::Python => (RepoClass::PythonApp, 0.9),
             Framework::StaticWeb => (RepoClass::StaticSite, 0.88),
@@ -1296,13 +1464,9 @@ fn classify_repository(
         if snapshot.keys().any(|path| path.ends_with("Cargo.toml")) {
             secondary_runtimes.push(RuntimeType::Rust);
         }
-        if snapshot
-            .keys()
-            .any(|path| {
-                path_has_filename(path, "requirements.txt")
-                    || path_has_filename(path, "pyproject.toml")
-            })
-        {
+        if snapshot.keys().any(|path| {
+            path_has_filename(path, "requirements.txt") || path_has_filename(path, "pyproject.toml")
+        }) {
             secondary_runtimes.push(RuntimeType::Python);
         }
         if snapshot.keys().any(|path| path.ends_with("go.mod")) {
@@ -1335,15 +1499,23 @@ fn graph_strategy_for_classification(class: RepoClass) -> GraphStrategy {
     }
 }
 
-fn runtime_affinity_for_classification(classification: &RepositoryClassification) -> RuntimeAffinity {
+fn runtime_affinity_for_classification(
+    classification: &RepositoryClassification,
+) -> RuntimeAffinity {
     match classification.primary_runtime {
         RuntimeType::Node => RuntimeAffinity {
             preferred_provider: "NodeRuntimeProvider".to_string(),
-            fallback_providers: vec!["StaticRuntimeProvider".to_string()],
+            fallback_providers: vec![
+                "WasmExecutionProvider".to_string(),
+                "StaticRuntimeProvider".to_string(),
+            ],
         },
         RuntimeType::Rust => RuntimeAffinity {
             preferred_provider: "RustRuntimeProvider".to_string(),
-            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+            fallback_providers: vec![
+                "WasmExecutionProvider".to_string(),
+                "NodeRuntimeProvider".to_string(),
+            ],
         },
         RuntimeType::Python => RuntimeAffinity {
             preferred_provider: "PythonExecutionProvider".to_string(),
@@ -1354,13 +1526,26 @@ fn runtime_affinity_for_classification(classification: &RepositoryClassification
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
         },
         RuntimeType::Static => RuntimeAffinity {
-            preferred_provider: "StaticRuntimeProvider".to_string(),
-            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+            preferred_provider: "WasmExecutionProvider".to_string(),
+            fallback_providers: vec!["StaticRuntimeProvider".to_string()],
         },
         RuntimeType::Unknown => RuntimeAffinity {
             preferred_provider: "NodeRuntimeProvider".to_string(),
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
         },
+    }
+}
+
+fn wasm_compatibility_for_classification(
+    classification: &RepositoryClassification,
+) -> WasmCompatibility {
+    match classification.class {
+        RepoClass::StaticSite => WasmCompatibility::Full,
+        RepoClass::NodeApp
+        | RepoClass::FullStackNode
+        | RepoClass::RustBinary
+        | RepoClass::Monorepo => WasmCompatibility::Partial,
+        RepoClass::PythonApp | RepoClass::Unknown => WasmCompatibility::NotSupported,
     }
 }
 
@@ -1518,8 +1703,8 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         build_intelligence,
         execution_graph: ExecutionGraph::default(),
     };
-    analysis.execution_graph = BuildPlanner::build_graph(&analysis)
-        .with_cache_keys_for(Some(&analysis.fingerprint));
+    analysis.execution_graph =
+        BuildPlanner::build_graph(&analysis).with_cache_keys_for(Some(&analysis.fingerprint));
 
     Ok(analysis)
 }
@@ -1578,6 +1763,7 @@ impl BuildPlanner {
                     id: "install".to_string(),
                     node_type: ExecutionNodeType::InstallDependencies,
                     command: Some(js_install),
+                    execution_mode: ExecutionMode::Native,
                     inputs: vec![
                         "package.json".to_string(),
                         "package-lock.json|yarn.lock|pnpm-lock.yaml".to_string(),
@@ -1589,6 +1775,7 @@ impl BuildPlanner {
                     id: "build".to_string(),
                     node_type: ExecutionNodeType::Build,
                     command: Some(js_script("build", &js_build_fallback)),
+                    execution_mode: ExecutionMode::Native,
                     inputs: vec!["node_modules".to_string()],
                     outputs: vec![if framework == Framework::NextJs {
                         ".next".to_string()
@@ -1601,6 +1788,7 @@ impl BuildPlanner {
                     id: "dev".to_string(),
                     node_type: ExecutionNodeType::DevServer,
                     command: Some(js_script("dev", &js_dev_fallback)),
+                    execution_mode: ExecutionMode::Native,
                     inputs: build.outputs.clone(),
                     outputs: vec!["http://0.0.0.0:3000/".to_string()],
                     cache_key: None,
@@ -1609,6 +1797,7 @@ impl BuildPlanner {
                     id: "test".to_string(),
                     node_type: ExecutionNodeType::Test,
                     command: Some(js_script("test", &js_test_fallback)),
+                    execution_mode: ExecutionMode::Hybrid,
                     inputs: vec!["node_modules".to_string()],
                     outputs: vec!["test-report".to_string()],
                     cache_key: None,
@@ -1637,6 +1826,7 @@ impl BuildPlanner {
                         id: "build".to_string(),
                         node_type: ExecutionNodeType::Build,
                         command: Some("cargo build".to_string()),
+                        execution_mode: ExecutionMode::Native,
                         inputs: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
                         outputs: vec!["target".to_string()],
                         cache_key: None,
@@ -1645,6 +1835,7 @@ impl BuildPlanner {
                         id: "dev".to_string(),
                         node_type: ExecutionNodeType::DevServer,
                         command: Some("cargo run".to_string()),
+                        execution_mode: ExecutionMode::Native,
                         inputs: vec!["target".to_string()],
                         outputs: vec!["http://0.0.0.0:8080/".to_string()],
                         cache_key: None,
@@ -1653,6 +1844,7 @@ impl BuildPlanner {
                         id: "test".to_string(),
                         node_type: ExecutionNodeType::Test,
                         command: Some("cargo test".to_string()),
+                        execution_mode: ExecutionMode::Hybrid,
                         inputs: vec!["target".to_string()],
                         outputs: vec!["test-report".to_string()],
                         cache_key: None,
@@ -1675,6 +1867,7 @@ impl BuildPlanner {
                         id: "build".to_string(),
                         node_type: ExecutionNodeType::Build,
                         command: Some("go build ./...".to_string()),
+                        execution_mode: ExecutionMode::Native,
                         inputs: vec!["go.mod".to_string(), "go.sum".to_string()],
                         outputs: vec!["go-build-cache".to_string()],
                         cache_key: None,
@@ -1683,6 +1876,7 @@ impl BuildPlanner {
                         id: "dev".to_string(),
                         node_type: ExecutionNodeType::DevServer,
                         command: Some("go run .".to_string()),
+                        execution_mode: ExecutionMode::Native,
                         inputs: vec!["go-build-cache".to_string()],
                         outputs: vec!["http://0.0.0.0:8080/".to_string()],
                         cache_key: None,
@@ -1691,6 +1885,7 @@ impl BuildPlanner {
                         id: "test".to_string(),
                         node_type: ExecutionNodeType::Test,
                         command: Some("go test ./...".to_string()),
+                        execution_mode: ExecutionMode::Hybrid,
                         inputs: vec!["go-build-cache".to_string()],
                         outputs: vec!["test-report".to_string()],
                         cache_key: None,
@@ -1713,6 +1908,7 @@ impl BuildPlanner {
                         id: "install".to_string(),
                         node_type: ExecutionNodeType::InstallDependencies,
                         command: Some("python -m pip install -r requirements.txt".to_string()),
+                        execution_mode: ExecutionMode::Native,
                         inputs: vec!["requirements.txt|pyproject.toml".to_string()],
                         outputs: vec!["site-packages".to_string()],
                         cache_key: None,
@@ -1721,6 +1917,7 @@ impl BuildPlanner {
                         id: "dev".to_string(),
                         node_type: ExecutionNodeType::DevServer,
                         command: Some("python -m app".to_string()),
+                        execution_mode: ExecutionMode::Native,
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["http://0.0.0.0:8000/".to_string()],
                         cache_key: None,
@@ -1729,6 +1926,7 @@ impl BuildPlanner {
                         id: "test".to_string(),
                         node_type: ExecutionNodeType::Test,
                         command: Some("python -m pytest".to_string()),
+                        execution_mode: ExecutionMode::Hybrid,
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["test-report".to_string()],
                         cache_key: None,
@@ -1750,6 +1948,7 @@ impl BuildPlanner {
                     id: "serve".to_string(),
                     node_type: ExecutionNodeType::StaticServe,
                     command: Some("serve .".to_string()),
+                    execution_mode: ExecutionMode::Wasm,
                     inputs: vec!["index.html".to_string()],
                     outputs: vec!["http://0.0.0.0:4173/".to_string()],
                     cache_key: None,
@@ -1842,6 +2041,47 @@ impl Default for RestApiSpec {
 struct NodeRuntimeProvider;
 struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
+
+impl ExecutionProvider for WasmExecutionProvider {
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        !ctx.execution_graph.nodes.is_empty()
+            && ctx.execution_graph.nodes.iter().all(|node| {
+                matches!(
+                    ExecutionRouter::route(node, &ctx.analysis.execution_profile),
+                    ExecutionTarget::Wasm(_)
+                )
+            })
+    }
+
+    fn prepare(&self, ctx: &mut ExecutionContext) -> Result<()> {
+        if let Some(spec) = ctx.execution_graph.nodes.iter().find_map(|node| {
+            match ExecutionRouter::route(node, &ctx.analysis.execution_profile) {
+                ExecutionTarget::Wasm(spec) => Some(spec),
+                ExecutionTarget::Native | ExecutionTarget::Static => None,
+            }
+        }) {
+            ctx.wasm_sandbox = Some(wasm_sandbox_for(&spec, &ctx.repo_path));
+        }
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("wasm:{}", ctx.execution_graph.cache_key()),
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
+    }
+}
 
 impl ExecutionProvider for NodeRuntimeProvider {
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
@@ -1981,6 +2221,43 @@ fn node_type_name(node_type: ExecutionNodeType) -> &'static str {
         ExecutionNodeType::Test => "test",
         ExecutionNodeType::StaticServe => "static-serve",
         ExecutionNodeType::CustomCommand => "custom-command",
+    }
+}
+
+fn execution_mode_name(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Native => "native",
+        ExecutionMode::Wasm => "wasm",
+        ExecutionMode::Hybrid => "hybrid",
+    }
+}
+
+fn wasm_sandbox_for(spec: &WasmRuntimeSpec, repo_path: &str) -> WasmSandbox {
+    WasmSandbox {
+        memory_limit: spec.memory_limit_mb.saturating_mul(BYTES_PER_MB),
+        time_limit_ms: u64::from(spec.cpu_limit_units).saturating_mul(CPU_UNIT_TO_TIME_LIMIT_MS),
+        filesystem_scope: vec![repo_path.to_string()],
+    }
+}
+
+impl ArtifactType {
+    fn as_str(self) -> &'static str {
+        match self {
+            ArtifactType::FileSystemSnapshot => "filesystem-snapshot",
+            ArtifactType::BuildOutput => "build-output",
+            ArtifactType::TestResult => "test-result",
+            ArtifactType::WasmModule => "wasm-module",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "filesystem-snapshot" => Some(Self::FileSystemSnapshot),
+            "build-output" => Some(Self::BuildOutput),
+            "test-result" => Some(Self::TestResult),
+            "wasm-module" => Some(Self::WasmModule),
+            _ => None,
+        }
     }
 }
 
@@ -2223,10 +2500,7 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.from == "test" && edge.to == "dev"));
-        assert_eq!(
-            graph.primary_run_command().as_deref(),
-            Some("npm run dev")
-        );
+        assert_eq!(graph.primary_run_command().as_deref(), Some("npm run dev"));
         assert!(graph.nodes.iter().all(|node| node.cache_key.is_some()));
     }
 
@@ -2243,7 +2517,10 @@ mod tests {
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
         let graph = &analysis.execution_graph;
-        assert_eq!(analysis.build_intelligence.package_manager.as_deref(), Some("pnpm"));
+        assert_eq!(
+            analysis.build_intelligence.package_manager.as_deref(),
+            Some("pnpm")
+        );
         assert_eq!(
             graph
                 .nodes
@@ -2390,6 +2667,7 @@ mod tests {
                 id: "build".to_string(),
                 node_type: ExecutionNodeType::Build,
                 command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
@@ -2410,6 +2688,7 @@ mod tests {
                 id: "build".to_string(),
                 node_type: ExecutionNodeType::Build,
                 command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
@@ -2482,8 +2761,15 @@ mod tests {
         assert!(!analysis.fingerprint.repo_hash.is_empty());
         assert_eq!(analysis.classification.class, RepoClass::NodeApp);
         assert_eq!(
-            analysis.execution_profile.runtime_affinity.preferred_provider,
+            analysis
+                .execution_profile
+                .runtime_affinity
+                .preferred_provider,
             "NodeRuntimeProvider"
+        );
+        assert_eq!(
+            analysis.execution_profile.wasm_compatibility,
+            WasmCompatibility::Partial
         );
     }
 
@@ -2494,6 +2780,7 @@ mod tests {
         let artifact = ExecutionArtifact {
             key: "cache-key".to_string(),
             node_id: "build".to_string(),
+            artifact_type: ArtifactType::BuildOutput,
             path: root.join("build-output").to_string_lossy().to_string(),
             created_at: 42,
         };
@@ -2502,5 +2789,68 @@ mod tests {
 
         assert!(store.exists("cache-key"));
         assert_eq!(store.get("cache-key"), Some(artifact));
+    }
+
+    #[test]
+    fn static_site_routes_to_wasm_target() {
+        let profile = ExecutionProfile {
+            fingerprint: RepositoryFingerprint {
+                repo_hash: "repo".to_string(),
+                lockfile_hash: None,
+                dependency_hash: None,
+                language_signature: "Unknown".to_string(),
+                framework_signature: Some("StaticWeb".to_string()),
+            },
+            classification: RepositoryClassification {
+                class: RepoClass::StaticSite,
+                confidence: 0.9,
+                primary_runtime: RuntimeType::Static,
+                secondary_runtimes: vec![],
+            },
+            recommended_graph_strategy: GraphStrategy::Linear,
+            runtime_affinity: RuntimeAffinity {
+                preferred_provider: "WasmExecutionProvider".to_string(),
+                fallback_providers: vec!["StaticRuntimeProvider".to_string()],
+            },
+            wasm_compatibility: WasmCompatibility::Full,
+        };
+        let node = ExecutionNode {
+            id: "serve".to_string(),
+            node_type: ExecutionNodeType::StaticServe,
+            command: Some("serve .".to_string()),
+            execution_mode: ExecutionMode::Wasm,
+            inputs: vec![],
+            outputs: vec![],
+            cache_key: None,
+        };
+
+        match ExecutionRouter::route(&node, &profile) {
+            ExecutionTarget::Wasm(spec) => {
+                assert!(spec.enabled);
+                assert!(spec.wasi);
+            }
+            other => panic!("expected wasm routing target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_key_engine_changes_with_execution_mode() {
+        let mut graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        };
+
+        let first = graph.compute_cache_keys();
+        graph.nodes[0].execution_mode = ExecutionMode::Wasm;
+        let second = graph.compute_cache_keys();
+        assert_ne!(first.get("build"), second.get("build"));
     }
 }
