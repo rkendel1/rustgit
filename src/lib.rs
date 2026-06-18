@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde_json::Value;
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -215,9 +216,13 @@ impl ExecutionGraph {
 
     pub fn cache_key(&self) -> String {
         let mut normalized = self.ordered_node_ids();
-        for edge in &self.edges {
-            normalized.push(format!("{}->{}", edge.from, edge.to));
-        }
+        let mut edges = self
+            .edges
+            .iter()
+            .map(|edge| format!("{}->{}", edge.from, edge.to))
+            .collect::<Vec<_>>();
+        edges.sort();
+        normalized.extend(edges);
         hash_key(&normalized.join("|"))
     }
 }
@@ -1331,58 +1336,24 @@ fn dependency_in_object(content: &str, object_key: &str, dependency: &str) -> bo
 }
 
 fn parse_package_scripts(content: &str) -> HashMap<String, String> {
-    parse_package_object_entries(content, "scripts")
-}
-
-fn parse_package_object_entries(content: &str, object_key: &str) -> HashMap<String, String> {
-    let mut entries = HashMap::new();
-    let key = format!("\"{object_key}\"");
-
-    let Some(mut index) = content.find(&key) else {
-        return entries;
+    let Ok(package_json) = serde_json::from_str::<Value>(content) else {
+        return HashMap::new();
     };
-    index += key.len();
 
-    let Some(open_brace_offset) = content[index..].find('{') else {
-        return entries;
-    };
-    let mut cursor = index + open_brace_offset + 1;
-    let mut depth: usize = 1;
-
-    while cursor < content.len() && depth > 0 {
-        let ch = content.as_bytes()[cursor] as char;
-        if ch == '{' {
-            depth += 1;
-        } else if ch == '}' {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                break;
-            }
-        }
-        cursor += 1;
-    }
-
-    if depth != 0 || cursor <= index + open_brace_offset + 1 {
-        return entries;
-    }
-
-    let block = &content[(index + open_brace_offset + 1)..cursor];
-    for chunk in block.split(',') {
-        let mut kv = chunk.splitn(2, ':');
-        let Some(raw_key) = kv.next() else {
-            continue;
-        };
-        let Some(raw_value) = kv.next() else {
-            continue;
-        };
-        let parsed_key = raw_key.trim().trim_matches('"');
-        let parsed_value = raw_value.trim().trim_matches('"');
-        if !parsed_key.is_empty() && !parsed_value.is_empty() {
-            entries.insert(parsed_key.to_string(), parsed_value.to_string());
-        }
-    }
-
-    entries
+    package_json
+        .get("scripts")
+        .and_then(Value::as_object)
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter_map(|(name, command)| {
+                    command
+                        .as_str()
+                        .map(|command| (name.clone(), command.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn collect_files(
