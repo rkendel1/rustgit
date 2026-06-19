@@ -30,6 +30,8 @@ const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
+const LOCAL_AGENT_LOCK_POISONED: &str =
+    "LocalAgentProvider: failed to acquire agent lock due to panic in another thread";
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -877,7 +879,14 @@ impl ExecutionRouter {
             .iter()
             .skip(1)
             .filter_map(|provider_id| self.provider_by_id(provider_id))
-            .map(|provider| provider.runtime())
+            .map(|provider| {
+                let runtime = provider.runtime();
+                if runtime == RuntimeType::Unknown {
+                    ctx.analysis.classification.primary_runtime
+                } else {
+                    runtime
+                }
+            })
             .collect::<Vec<_>>();
 
         let reason = if selected_provider_id == affinity.preferred_provider {
@@ -892,9 +901,17 @@ impl ExecutionRouter {
             )
         };
         let execution_id = Self::derive_execution_id_from_workspace(&ctx.workspace_id);
+        let selected_runtime = {
+            let runtime = provider.runtime();
+            if runtime == RuntimeType::Unknown {
+                ctx.analysis.classification.primary_runtime
+            } else {
+                runtime
+            }
+        };
 
         Ok(RuntimeSelection {
-            runtime: provider.runtime(),
+            runtime: selected_runtime,
             provider_id: selected_provider_id,
             reason,
             fallback_chain,
@@ -1407,6 +1424,214 @@ pub struct WorkerCapabilities {
     pub cpu_cores: u32,
     pub memory_mb: u64,
     pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentIdentity {
+    pub agent_id: String,
+    pub device_fingerprint: String,
+    pub public_key: String,
+    pub trusted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    pub cpu: u32,
+    pub memory: String,
+    pub runtimes: Vec<String>,
+    pub supports_wasm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Installed,
+    Registered,
+    Idle,
+    AssignedExecution,
+    Running,
+    Reporting,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentHeartbeat {
+    pub agent_id: String,
+    pub cpu_usage: f32,
+    pub memory_usage: f32,
+    pub active_executions: u32,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentCore {
+    pub identity_manager: IdentityManager,
+    pub capability_reporter: CapabilityReporter,
+    pub execution_runner: ExecutionRunner,
+    pub process_supervisor: ProcessSupervisor,
+    pub port_manager: PortManager,
+    pub tunnel_client: TunnelClient,
+    pub heartbeat_client: HeartbeatClient,
+    pub secure_channel_client: SecureChannelClient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityManager;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapabilityReporter;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionRunner;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProcessSupervisor;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PortManager;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TunnelClient;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeartbeatClient;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SecureChannelClient;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedExecutionGraph {
+    pub graph: ExecutionGraph,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributedExecutionAgent {
+    pub core: AgentCore,
+    pub identity: AgentIdentity,
+    pub capabilities: Option<AgentCapabilities>,
+    pub status: AgentStatus,
+    pub active_executions: u32,
+}
+
+impl DistributedExecutionAgent {
+    pub fn new(identity: AgentIdentity) -> Self {
+        Self {
+            core: AgentCore::default(),
+            identity,
+            capabilities: None,
+            status: AgentStatus::Installed,
+            active_executions: 0,
+        }
+    }
+
+    pub fn register(&mut self, capabilities: AgentCapabilities) -> WorkerNode {
+        self.capabilities = Some(capabilities.clone());
+        self.status = AgentStatus::Registered;
+        let worker = WorkerNode {
+            id: self.identity.agent_id.clone(),
+            capabilities: WorkerCapabilities {
+                wasm: capabilities.supports_wasm,
+                native: true,
+                cpu_cores: capabilities.cpu,
+                memory_mb: parse_agent_memory_to_mb(&capabilities.memory),
+                labels: vec![
+                    "dea".to_string(),
+                    format!("fingerprint:{}", self.identity.device_fingerprint),
+                ],
+            },
+            status: if self.identity.trusted {
+                WorkerStatus::Ready
+            } else {
+                WorkerStatus::Unhealthy
+            },
+        };
+        self.status = AgentStatus::Idle;
+        worker
+    }
+
+    pub fn sign_graph(&self, graph: &ExecutionGraph) -> String {
+        let payload = format!(
+            "{}:{}:{}:{}",
+            self.identity.agent_id,
+            self.identity.device_fingerprint,
+            graph.cache_key(),
+            graph.nodes.len()
+        );
+        hash_key(&format!("{}:{payload}", self.identity.public_key))
+    }
+
+    pub fn verify_graph(&self, signed_graph: &SignedExecutionGraph) -> bool {
+        self.sign_graph(&signed_graph.graph) == signed_graph.signature
+    }
+
+    pub fn can_execute(&self, ctx: &ExecutionContext) -> bool {
+        if !self.identity.trusted
+            || matches!(self.status, AgentStatus::Installed | AgentStatus::Offline)
+            || ctx.execution_graph.nodes.is_empty()
+        {
+            return false;
+        }
+        let Some(capabilities) = &self.capabilities else {
+            return false;
+        };
+        let runtime = runtime_for_framework(ctx.analysis.framework);
+        let target_runtime = if runtime == RuntimeType::Unknown {
+            ctx.analysis.classification.primary_runtime
+        } else {
+            runtime
+        };
+        let runtime_name = runtime_type_to_agent_label(target_runtime);
+        if target_runtime == RuntimeType::Wasm && capabilities.supports_wasm {
+            return true;
+        }
+        capabilities
+            .runtimes
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(runtime_name))
+    }
+
+    pub fn assign_execution(&mut self, signed_graph: &SignedExecutionGraph) -> Result<()> {
+        if !self.verify_graph(signed_graph) {
+            return Err(RuntimeError::CommandFailed(
+                format!(
+                    "distributed execution agent `{}` rejected unsigned execution graph",
+                    self.identity.agent_id
+                ),
+            ));
+        }
+        self.status = AgentStatus::AssignedExecution;
+        self.active_executions = self.active_executions.saturating_add(1);
+        self.status = AgentStatus::Running;
+        Ok(())
+    }
+
+    pub fn complete_execution(&mut self) {
+        self.active_executions = self.active_executions.saturating_sub(1);
+        self.status = if self.active_executions == 0 {
+            AgentStatus::Idle
+        } else {
+            AgentStatus::Running
+        };
+    }
+
+    pub fn heartbeat(&self, cpu_usage: f32, memory_usage: f32) -> AgentHeartbeat {
+        AgentHeartbeat {
+            agent_id: self.identity.agent_id.clone(),
+            cpu_usage,
+            memory_usage,
+            active_executions: self.active_executions,
+            status: self.status,
+        }
+    }
+
+    pub fn stable_workspace_url(&self, workspace_id: &str) -> String {
+        let normalized_workspace_id = workspace_id
+            .trim()
+            .strip_prefix("workspace-")
+            .unwrap_or(workspace_id);
+        let sanitized = ExecutionRouter::sanitized_workspace_id(normalized_workspace_id);
+        format!("https://workspace-{sanitized}.ddockit.dev")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3039,6 +3264,7 @@ impl WorkspaceManager {
 
         let providers: Vec<Box<dyn ExecutionProvider + Send + Sync>> = vec![
             Box::new(WasmExecutionProvider),
+            Box::new(LocalAgentProvider::default_agent()),
             Box::new(NodeRuntimeProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
@@ -4617,6 +4843,39 @@ impl Default for RestApiSpec {
 struct NodeRuntimeProvider;
 struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
+struct LocalAgentProvider {
+    agent: Arc<Mutex<DistributedExecutionAgent>>,
+}
+
+impl LocalAgentProvider {
+    fn new(agent: DistributedExecutionAgent) -> Self {
+        Self {
+            agent: Arc::new(Mutex::new(agent)),
+        }
+    }
+
+    fn default_agent() -> Self {
+        let mut agent = DistributedExecutionAgent::new(AgentIdentity {
+            agent_id: "dea-local-default".to_string(),
+            device_fingerprint: "local-device".to_string(),
+            public_key: "local-public-key".to_string(),
+            trusted: true,
+        });
+        agent.register(AgentCapabilities {
+            cpu: 8,
+            memory: "16GB".to_string(),
+            runtimes: vec![
+                "node".to_string(),
+                "rust".to_string(),
+                "go".to_string(),
+                "python".to_string(),
+                "static".to_string(),
+            ],
+            supports_wasm: false,
+        });
+        Self::new(agent)
+    }
+}
 
 impl ExecutionProvider for WasmExecutionProvider {
     fn id(&self) -> &'static str {
@@ -4798,6 +5057,93 @@ impl ExecutionProvider for NodeRuntimeProvider {
         Ok(HealthStatus {
             healthy: true,
             message: "healthy".to_string(),
+        })
+    }
+}
+
+impl ExecutionProvider for LocalAgentProvider {
+    fn id(&self) -> &'static str {
+        "LocalAgentProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalMachine
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Unknown
+    }
+
+    fn capability(&self) -> ProviderCapability {
+        let agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
+        let capabilities = agent.capabilities.clone().unwrap_or(AgentCapabilities {
+            cpu: 0,
+            memory: "0MB".to_string(),
+            runtimes: vec![],
+            supports_wasm: false,
+        });
+        let mut supported_runtimes = capabilities
+            .runtimes
+            .iter()
+            .filter_map(|runtime| match runtime.to_ascii_lowercase().as_str() {
+                "node" => Some(RuntimeType::Node),
+                "wasm" => Some(RuntimeType::Wasm),
+                "rust" => Some(RuntimeType::Rust),
+                "go" => Some(RuntimeType::Go),
+                "python" => Some(RuntimeType::Python),
+                "static" => Some(RuntimeType::Static),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if capabilities.supports_wasm && !supported_runtimes.contains(&RuntimeType::Wasm) {
+            supported_runtimes.push(RuntimeType::Wasm);
+        }
+        ProviderCapability {
+            tier: ExecutionTier::LocalMachine,
+            latency_score: 5,
+            cost_score: 1,
+            reliability_score: if agent.identity.trusted { 35 } else { 10 },
+            supported_runtimes,
+        }
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        let agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
+        agent.can_execute(ctx)
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        let mut agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
+        let graph = SignedExecutionGraph {
+            graph: ctx.execution_graph.clone(),
+            signature: agent.sign_graph(&ctx.execution_graph),
+        };
+        agent.assign_execution(&graph)?;
+        Ok(ProcessHandle {
+            pid_hint: format!("dea:{}:{}", agent.identity.agent_id, ctx.workspace_id),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        let mut agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
+        agent.complete_execution();
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        let agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
+        Ok(HealthStatus {
+            healthy: agent.identity.trusted,
+            message: if agent.identity.trusted {
+                "healthy".to_string()
+            } else {
+                "untrusted agent".to_string()
+            },
         })
     }
 }
@@ -5133,6 +5479,45 @@ fn hash_bytes(input: &[u8]) -> String {
         state = state.wrapping_mul(1099511628211);
     }
     format!("{state:x}")
+}
+
+fn runtime_type_to_agent_label(runtime: RuntimeType) -> &'static str {
+    match runtime {
+        RuntimeType::Node => "node",
+        RuntimeType::Wasm => "wasm",
+        RuntimeType::Rust => "rust",
+        RuntimeType::Go => "go",
+        RuntimeType::Python => "python",
+        RuntimeType::Static => "static",
+        RuntimeType::Unknown => "unknown",
+    }
+}
+
+fn parse_agent_memory_to_mb(memory: &str) -> u64 {
+    let mut digits = String::new();
+    let mut unit = String::new();
+    for ch in memory.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            digits.push(ch);
+        } else if !ch.is_whitespace() {
+            unit.push(ch.to_ascii_lowercase());
+        }
+    }
+    let Some(value) = digits.parse::<f64>().ok() else {
+        eprintln!("unable to parse agent memory declaration `{memory}`");
+        return 0;
+    };
+    let multiplier = match unit.as_str() {
+        "tb" | "tib" => 1024.0 * 1024.0,
+        "gb" | "gib" => 1024.0,
+        "mb" | "mib" | "" => 1.0,
+        "kb" | "kib" => 1.0 / 1024.0,
+        _ => {
+            eprintln!("unsupported agent memory unit `{unit}` from declaration `{memory}`");
+            return 0;
+        }
+    };
+    (value * multiplier).round().max(0.0) as u64
 }
 
 fn ports_for_framework(framework: Framework) -> Vec<PortInfo> {
@@ -7597,6 +7982,152 @@ mod tests {
 
         assert_eq!(workers.detect_failed_workers(116), vec!["worker-a"]);
         assert_eq!(leases.expire_for_worker("worker-a", 116), vec!["a1b2"]);
+    }
+
+    #[test]
+    fn distributed_execution_agent_registers_and_reports_heartbeat() {
+        let mut agent = DistributedExecutionAgent::new(AgentIdentity {
+            agent_id: "agent-1".to_string(),
+            device_fingerprint: "device-123".to_string(),
+            public_key: "pk-agent-1".to_string(),
+            trusted: true,
+        });
+        let worker = agent.register(AgentCapabilities {
+            cpu: 8,
+            memory: "32GB".to_string(),
+            runtimes: vec!["node".to_string(), "python".to_string(), "rust".to_string()],
+            supports_wasm: true,
+        });
+
+        assert_eq!(worker.id, "agent-1");
+        assert_eq!(worker.status, WorkerStatus::Ready);
+        assert_eq!(worker.capabilities.cpu_cores, 8);
+        assert_eq!(worker.capabilities.memory_mb, 32 * 1024);
+        assert!(worker.capabilities.wasm);
+        assert_eq!(agent.status, AgentStatus::Idle);
+
+        let heartbeat = agent.heartbeat(12.5, 46.0);
+        assert_eq!(heartbeat.agent_id, "agent-1");
+        assert_eq!(heartbeat.active_executions, 0);
+        assert_eq!(heartbeat.status, AgentStatus::Idle);
+        assert_eq!(
+            agent.stable_workspace_url("workspace-abc"),
+            "https://workspace-abc.ddockit.dev"
+        );
+    }
+
+    #[test]
+    fn distributed_execution_agent_requires_signed_execution_graphs() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("npm run build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["package.json".to_string()],
+                outputs: vec!["dist".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let mut agent = DistributedExecutionAgent::new(AgentIdentity {
+            agent_id: "agent-2".to_string(),
+            device_fingerprint: "device-abc".to_string(),
+            public_key: "pk-agent-2".to_string(),
+            trusted: true,
+        });
+        agent.register(AgentCapabilities {
+            cpu: 4,
+            memory: "8GB".to_string(),
+            runtimes: vec!["node".to_string()],
+            supports_wasm: false,
+        });
+
+        let signed = SignedExecutionGraph {
+            graph: graph.clone(),
+            signature: agent.sign_graph(&graph),
+        };
+        assert!(agent.assign_execution(&signed).is_ok());
+        assert_eq!(agent.status, AgentStatus::Running);
+        assert_eq!(agent.active_executions, 1);
+
+        let invalid = SignedExecutionGraph {
+            graph,
+            signature: "bad-signature".to_string(),
+        };
+        let err = agent
+            .assign_execution(&invalid)
+            .expect_err("unsigned graph should fail verification");
+        assert!(matches!(
+            err,
+            RuntimeError::CommandFailed(message)
+                if message.contains("rejected unsigned execution graph")
+        ));
+    }
+
+    #[test]
+    fn local_agent_provider_participates_in_escalation_and_fails_over() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let mut analysis =
+            test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Rust);
+        analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+            preferred_provider: "LocalAgentProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        };
+        let ctx = ExecutionContext {
+            workspace_id: "ws-local-agent-failover".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            analysis,
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+        let mut unavailable_agent = DistributedExecutionAgent::new(AgentIdentity {
+            agent_id: "agent-offline".to_string(),
+            device_fingerprint: "device-offline".to_string(),
+            public_key: "pk-offline".to_string(),
+            trusted: false,
+        });
+        unavailable_agent.register(AgentCapabilities {
+            cpu: 4,
+            memory: "8GB".to_string(),
+            runtimes: vec!["rust".to_string()],
+            supports_wasm: false,
+        });
+        let router = ExecutionRouter::new(vec![
+            Box::new(LocalAgentProvider::new(unavailable_agent)),
+            Box::new(RustRuntimeProvider),
+            Box::new(StaticRuntimeProvider),
+        ]);
+
+        let selection = router.select(&ctx).expect("failover should select rust");
+        assert_eq!(selection.provider_id, "RustRuntimeProvider");
+        assert_eq!(selection.selected_tier, ExecutionTier::ExternalProvider);
+        assert!(selection.escalation_trace.iter().any(|step| {
+            step.tier == ExecutionTier::LocalMachine
+                && step.provider_id.is_none()
+                && step.result == "no available provider"
+        }));
     }
 
     #[test]
