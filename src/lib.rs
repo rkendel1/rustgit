@@ -4593,7 +4593,7 @@ pub struct ExecutionMigrateRequest {
     pub target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GoldenRepositoryCatalog {
     #[serde(default = "default_golden_catalog_schema_version")]
     pub schema_version: String,
@@ -4601,23 +4601,40 @@ pub struct GoldenRepositoryCatalog {
     pub repositories: Vec<GoldenRepositoryMetadata>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GoldenRepositoryMetadata {
-    pub name: String,
+    #[serde(alias = "name")]
+    pub id: String,
     pub category: String,
-    pub repository: String,
+    pub framework: String,
+    #[serde(alias = "repository")]
+    pub repo_url: String,
+    pub commit: String,
+    pub execution_profile: String,
     pub expected: GoldenRepositoryExpectation,
+    pub certification: GoldenRepositoryCertification,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct GoldenRepositoryCertification {
+    pub last_verified: String,
+    pub framework: String,
+    pub startup_time: u64,
+    pub success_rate: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GoldenRepositoryExpectation {
-    pub framework: String,
     #[serde(default)]
     pub services: Vec<String>,
     #[serde(default)]
     pub route_checks: Vec<String>,
+    #[serde(default = "default_startup_timeout_seconds")]
+    pub startup_timeout_seconds: u64,
+    #[serde(default = "default_health_expectation")]
+    pub health_expectation: String,
     #[serde(default)]
-    pub healthcheck: Vec<u16>,
+    pub browser_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4647,22 +4664,22 @@ impl CustomerJourneyDefinition {
             Self {
                 name: "journey-1-public-github-repo".to_string(),
                 kind: CustomerJourneyKind::PublicRepoToRunningUrl,
-                repository_name: "nextjs".to_string(),
+                repository_name: "nextjs-blog".to_string(),
             },
             Self {
                 name: "journey-2-fastapi-docs".to_string(),
                 kind: CustomerJourneyKind::FastApiDocsAvailability,
-                repository_name: "fastapi-basic".to_string(),
+                repository_name: "fastapi-tutorial".to_string(),
             },
             Self {
                 name: "journey-3-django-admin".to_string(),
                 kind: CustomerJourneyKind::DjangoAdminAvailability,
-                repository_name: "django-basic".to_string(),
+                repository_name: "django-polls".to_string(),
             },
             Self {
                 name: "journey-4-rust-run".to_string(),
                 kind: CustomerJourneyKind::RustRepoExecution,
-                repository_name: "axum-basic".to_string(),
+                repository_name: "axum-example".to_string(),
             },
             Self {
                 name: "journey-5-monorepo".to_string(),
@@ -4672,17 +4689,17 @@ impl CustomerJourneyDefinition {
             Self {
                 name: "journey-6-broken-head".to_string(),
                 kind: CustomerJourneyKind::BrokenHeadCommitFallback,
-                repository_name: "express-basic".to_string(),
+                repository_name: "ddockit-golden-broken-head".to_string(),
             },
             Self {
                 name: "journey-7-healing".to_string(),
                 kind: CustomerJourneyKind::HealingRepairAndRetry,
-                repository_name: "nestjs-basic".to_string(),
+                repository_name: "ddockit-golden-healing".to_string(),
             },
             Self {
                 name: "journey-8-dea-local".to_string(),
                 kind: CustomerJourneyKind::DeaLocalExecution,
-                repository_name: "bun-starter".to_string(),
+                repository_name: "ddockit-golden-dea".to_string(),
             },
             Self {
                 name: "journey-9-cloud-escalation".to_string(),
@@ -4692,7 +4709,7 @@ impl CustomerJourneyDefinition {
             Self {
                 name: "journey-10-runtime-migration".to_string(),
                 kind: CustomerJourneyKind::RuntimeMigrationWithoutUrlChange,
-                repository_name: "turborepo".to_string(),
+                repository_name: "turborepo-monorepo".to_string(),
             },
         ]
     }
@@ -4742,7 +4759,7 @@ impl CustomerJourneyRunner {
         let repositories = catalog
             .repositories
             .into_iter()
-            .map(|repo| (repo.name.clone(), repo))
+            .map(|repo| (repo.id.clone(), repo))
             .collect();
         Self { repositories }
     }
@@ -4761,7 +4778,11 @@ impl CustomerJourneyRunner {
     fn run_journey(&self, journey: &CustomerJourneyDefinition) -> JourneyResult {
         let repository = self.repositories.get(&journey.repository_name);
         let analysis_success = repository
-            .map(|repo| repo.repository.starts_with("https://github.com/"))
+            .map(|repo| {
+                repo.repo_url.starts_with("https://github.com/")
+                    && is_pinned_commit(&repo.commit)
+                    && !repo.execution_profile.trim().is_empty()
+            })
             .unwrap_or(false);
         let plan_success = analysis_success
             && repository
@@ -4806,7 +4827,7 @@ impl CustomerJourneyRunner {
             journey_kind: journey.kind,
             repository_name: journey.repository_name.clone(),
             framework: repository
-                .map(|repo| repo.expected.framework.clone())
+                .map(|repo| repo.framework.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
             analysis_success,
             plan_success,
@@ -4926,7 +4947,11 @@ fn collect_route_checks(
     routes.sort();
     routes.dedup();
 
-    let health_status = expected.healthcheck.first().copied().unwrap_or(200);
+    let health_status = if expected.health_expectation.eq_ignore_ascii_case("healthy") {
+        200
+    } else {
+        503
+    };
     routes
         .into_iter()
         .map(|route| {
@@ -4965,7 +4990,20 @@ fn startup_time_for(kind: CustomerJourneyKind) -> u64 {
 }
 
 fn default_golden_catalog_schema_version() -> String {
-    "1.0".to_string()
+    "2".to_string()
+}
+
+fn default_startup_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_health_expectation() -> String {
+    "healthy".to_string()
+}
+
+fn is_pinned_commit(commit: &str) -> bool {
+    let normalized = commit.trim();
+    normalized.len() >= 7 && normalized.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 pub fn metrics_endpoint(metrics: &WorkspaceMetrics) -> (String, String) {
@@ -13000,6 +13038,7 @@ services:
             .join("golden_repos")
             .join("catalog.yaml");
         let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        assert_eq!(catalog.schema_version, "2");
         assert!(catalog.repositories.iter().any(|repo| repo.category == "node"));
         assert!(catalog.repositories.iter().any(|repo| repo.category == "python"));
         assert!(catalog.repositories.iter().any(|repo| repo.category == "rust"));
@@ -13009,19 +13048,34 @@ services:
             .repositories
             .iter()
             .any(|repo| repo.category == "monorepo"));
-        assert!(catalog.repositories.iter().any(|repo| repo.name == "nextjs"));
         assert!(catalog
             .repositories
             .iter()
-            .any(|repo| repo.name == "fastapi-basic"));
+            .all(|repo| is_pinned_commit(&repo.commit)));
         assert!(catalog
             .repositories
             .iter()
-            .any(|repo| repo.name == "django-basic"));
+            .all(|repo| !repo.execution_profile.is_empty()));
         assert!(catalog
             .repositories
             .iter()
-            .any(|repo| repo.name == "axum-basic"));
+            .all(|repo| !repo.certification.last_verified.is_empty()));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.id == "nextjs-blog"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.id == "fastapi-tutorial"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.id == "django-polls"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.id == "axum-example"));
     }
 
     #[test]
@@ -13042,7 +13096,7 @@ services:
 
         let fastapi = results
             .iter()
-            .find(|result| result.repository_name == "fastapi-basic")
+            .find(|result| result.repository_name == "fastapi-tutorial")
             .expect("journey should include fastapi");
         assert!(fastapi
             .route_checks
@@ -13051,7 +13105,7 @@ services:
 
         let django = results
             .iter()
-            .find(|result| result.repository_name == "django-basic")
+            .find(|result| result.repository_name == "django-polls")
             .expect("journey should include django");
         assert!(django
             .route_checks
