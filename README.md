@@ -32,6 +32,22 @@ Surface UI contracts are rendered through a shared Surface Rendering System (SRS
 - Shared component registry for contract-to-component mapping
 - Unified renderer output for Portal shell and GitHub overlay shell
 
+## README badge execution + healing loop
+
+The API surface now includes a badge-driven execution seed flow:
+
+- `GET /badge/{owner}/{repo}.svg` — dynamic runtime status badge (ready / needs setup / broken / healed / not tested)
+- `GET /badge/healed/{owner}/{repo}.svg` — healed badge variant
+- `GET /seed/{owner}/{repo}` — badge click bootstrap into anonymous execution + analyze/plan/start pipeline
+
+Example badge embed:
+
+```html
+<a href="https://trythissoftware.com/seed/{owner}/{repo}">
+  <img src="https://cdn.trythissoftware.com/badge/{owner}/{repo}.svg" />
+</a>
+```
+
 ## Quick start
 
 ```bash
