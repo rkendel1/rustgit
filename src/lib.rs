@@ -26,6 +26,7 @@ const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
+const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 
@@ -1115,6 +1116,78 @@ pub struct WorkerNode {
     pub status: WorkerStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerRegistry {
+    pub workers: HashMap<String, WorkerNode>,
+    pub heartbeats: HashMap<String, u64>,
+    pub heartbeat_timeout_secs: u64,
+}
+
+impl WorkerRegistry {
+    pub fn new(heartbeat_timeout_secs: u64) -> Self {
+        Self {
+            workers: HashMap::new(),
+            heartbeats: HashMap::new(),
+            heartbeat_timeout_secs: heartbeat_timeout_secs.max(MIN_COORDINATION_TIMEOUT_SECS),
+        }
+    }
+
+    pub fn from_workers(workers: Vec<WorkerNode>, heartbeat_timeout_secs: u64, now: u64) -> Self {
+        let mut registry = Self::new(heartbeat_timeout_secs);
+        for worker in workers {
+            registry.register_worker(worker, now);
+        }
+        registry
+    }
+
+    pub fn register_worker(&mut self, worker: WorkerNode, now: u64) {
+        let worker_id = worker.id.clone();
+        self.workers.insert(worker_id.clone(), worker);
+        self.heartbeats.insert(worker_id, now);
+    }
+
+    pub fn record_heartbeat(&mut self, worker_id: &str, now: u64) -> bool {
+        let Some(worker) = self.workers.get_mut(worker_id) else {
+            return false;
+        };
+        if matches!(worker.status, WorkerStatus::Offline | WorkerStatus::Unhealthy) {
+            worker.status = WorkerStatus::Ready;
+        }
+        self.heartbeats.insert(worker_id.to_string(), now);
+        true
+    }
+
+    pub fn detect_failed_workers(&mut self, now: u64) -> Vec<String> {
+        let mut failed_workers = Vec::new();
+        for worker in self.workers.values_mut() {
+            if matches!(worker.status, WorkerStatus::Offline) {
+                continue;
+            }
+            let last_heartbeat = self.heartbeats.get(&worker.id).copied().unwrap_or(0);
+            if now.saturating_sub(last_heartbeat) > self.heartbeat_timeout_secs {
+                worker.status = WorkerStatus::Offline;
+                failed_workers.push(worker.id.clone());
+            }
+        }
+        failed_workers.sort();
+        failed_workers
+    }
+
+    pub fn mark_worker_offline(&mut self, worker_id: &str) -> bool {
+        let Some(worker) = self.workers.get_mut(worker_id) else {
+            return false;
+        };
+        worker.status = WorkerStatus::Offline;
+        true
+    }
+
+    pub fn snapshot_workers(&self) -> Vec<WorkerNode> {
+        let mut workers = self.workers.values().cloned().collect::<Vec<_>>();
+        workers.sort_by(|a, b| a.id.cmp(&b.id));
+        workers
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeLease {
     pub node_id: String,
@@ -1174,6 +1247,100 @@ impl ExecutionPlan {
         }
         failed_nodes.sort();
         failed_nodes
+    }
+
+    pub fn reassign_stale_assignments(
+        &mut self,
+        workers: &[WorkerNode],
+        lease_ttl_secs: u64,
+        now: u64,
+    ) -> Vec<String> {
+        let mut stale_nodes = self
+            .leases
+            .iter()
+            .filter_map(|(node_id, lease)| (lease.expires_at <= now).then_some(node_id.clone()))
+            .collect::<Vec<_>>();
+        stale_nodes.sort();
+        self.reassign_nodes(stale_nodes, workers, lease_ttl_secs, now)
+    }
+
+    pub fn reassign_failed_worker(
+        &mut self,
+        failed_worker_id: &str,
+        workers: &[WorkerNode],
+        lease_ttl_secs: u64,
+        now: u64,
+    ) -> Vec<String> {
+        let mut failed_nodes = self
+            .leases
+            .iter()
+            .filter_map(|(node_id, lease)| {
+                (lease.worker_id == failed_worker_id).then_some(node_id.clone())
+            })
+            .collect::<Vec<_>>();
+        failed_nodes.sort();
+        if let Some(queue) = self.worker_queues.get_mut(failed_worker_id) {
+            queue.queued_nodes.clear();
+        }
+        self.reassign_nodes(failed_nodes, workers, lease_ttl_secs, now)
+    }
+
+    fn reassign_nodes(
+        &mut self,
+        node_ids: Vec<String>,
+        workers: &[WorkerNode],
+        lease_ttl_secs: u64,
+        now: u64,
+    ) -> Vec<String> {
+        let mut candidates = workers
+            .iter()
+            .filter(|worker| worker_is_usable(worker))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut reassigned = Vec::new();
+        let ttl = lease_ttl_secs.max(MIN_COORDINATION_TIMEOUT_SECS);
+        for node_id in node_ids {
+            let Some(existing_lease) = self.leases.get(&node_id).cloned() else {
+                continue;
+            };
+            let selected = candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.id != existing_lease.worker_id);
+            let Some(worker) = selected else {
+                continue;
+            };
+
+            if let Some(queue) = self.worker_queues.get_mut(&existing_lease.worker_id) {
+                queue.queued_nodes.retain(|queued| queued != &node_id);
+            }
+            self.worker_queues
+                .entry(worker.id.clone())
+                .or_default()
+                .enqueue(node_id.clone());
+
+            if let Some(assignment) = self
+                .assignments
+                .iter_mut()
+                .find(|assignment| assignment.node_id == node_id)
+            {
+                assignment.worker_id = worker.id.clone();
+            }
+
+            self.leases.insert(
+                node_id.clone(),
+                NodeLease {
+                    node_id: node_id.clone(),
+                    worker_id: worker.id.clone(),
+                    expires_at: now.saturating_add(ttl),
+                },
+            );
+            reassigned.push(node_id);
+        }
+
+        reassigned.sort();
+        reassigned
     }
 }
 
@@ -1422,14 +1589,21 @@ fn worker_has_labels(worker: &WorkerNode, labels: &[String]) -> bool {
 pub struct ExecutionCoordinator {
     pub scheduler: DistributedScheduler,
     pub workers: Vec<WorkerNode>,
+    pub worker_registry: WorkerRegistry,
     pub artifact_store: DistributedArtifactStore,
 }
 
 impl ExecutionCoordinator {
     pub fn new(workers: Vec<WorkerNode>, artifact_store: DistributedArtifactStore) -> Self {
+        let worker_registry = WorkerRegistry::from_workers(
+            workers.clone(),
+            DistributedExecutionConfig::default().lease_ttl_secs,
+            current_unix_epoch_secs(),
+        );
         Self {
             scheduler: DistributedScheduler,
             workers,
+            worker_registry,
             artifact_store,
         }
     }
@@ -1440,11 +1614,51 @@ impl ExecutionCoordinator {
         config: &DistributedExecutionConfig,
         now: u64,
     ) -> ExecutionPlan {
+        let workers = if self.worker_registry.workers.is_empty() {
+            self.workers.clone()
+        } else {
+            self.worker_registry.snapshot_workers()
+        };
         self.scheduler.schedule_with_context(
             graph,
-            self.workers.clone(),
+            workers,
             &self.artifact_store,
             config,
+            now,
+        )
+    }
+
+    pub fn register_worker(&mut self, worker: WorkerNode, now: u64) {
+        self.worker_registry.register_worker(worker, now);
+        self.sync_workers_from_registry();
+    }
+
+    pub fn heartbeat(&mut self, worker_id: &str, now: u64) -> bool {
+        let updated = self.worker_registry.record_heartbeat(worker_id, now);
+        if updated {
+            self.sync_workers_from_registry();
+        }
+        updated
+    }
+
+    pub fn detect_failed_workers(&mut self, now: u64) -> Vec<String> {
+        let failed = self.worker_registry.detect_failed_workers(now);
+        if !failed.is_empty() {
+            self.sync_workers_from_registry();
+        }
+        failed
+    }
+
+    pub fn reassign_stale_assignments(
+        &mut self,
+        plan: &mut ExecutionPlan,
+        config: &DistributedExecutionConfig,
+        now: u64,
+    ) -> Vec<String> {
+        self.detect_failed_workers(now);
+        plan.reassign_stale_assignments(
+            &self.worker_registry.snapshot_workers(),
+            config.lease_ttl_secs,
             now,
         )
     }
@@ -1456,14 +1670,13 @@ impl ExecutionCoordinator {
         config: &DistributedExecutionConfig,
         now: u64,
     ) -> ExecutionPlan {
-        if let Some(worker) = self
-            .workers
-            .iter_mut()
-            .find(|worker| worker.id == failed_worker_id)
-        {
-            worker.status = WorkerStatus::Offline;
-        }
+        self.worker_registry.mark_worker_offline(failed_worker_id);
+        self.sync_workers_from_registry();
         self.plan(graph, config, now)
+    }
+
+    fn sync_workers_from_registry(&mut self) {
+        self.workers = self.worker_registry.snapshot_workers();
     }
 }
 
@@ -4334,6 +4547,115 @@ mod tests {
     }
 
     #[test]
+    fn worker_registry_tracks_heartbeats_and_detects_stale_workers() {
+        let worker = WorkerNode {
+            id: "worker-a".to_string(),
+            capabilities: WorkerCapabilities {
+                wasm: true,
+                native: true,
+                cpu_cores: 4,
+                memory_mb: 4096,
+                labels: vec![],
+            },
+            status: WorkerStatus::Ready,
+        };
+        let mut registry = WorkerRegistry::from_workers(vec![worker], 5, 100);
+
+        assert!(registry.detect_failed_workers(104).is_empty());
+        assert_eq!(registry.detect_failed_workers(106), vec!["worker-a"]);
+        assert_eq!(
+            registry
+                .workers
+                .get("worker-a")
+                .map(|worker| worker.status.clone()),
+            Some(WorkerStatus::Offline)
+        );
+
+        assert!(registry.record_heartbeat("worker-a", 107));
+        assert_eq!(
+            registry
+                .workers
+                .get("worker-a")
+                .map(|worker| worker.status.clone()),
+            Some(WorkerStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn execution_plan_reassigns_expired_leases_to_active_workers() {
+        let mut plan = ExecutionPlan {
+            assignments: vec![NodeAssignment {
+                node_id: "node-a".to_string(),
+                worker_id: "worker-a".to_string(),
+                sequence: 0,
+            }],
+            leases: HashMap::from([(
+                "node-a".to_string(),
+                NodeLease {
+                    node_id: "node-a".to_string(),
+                    worker_id: "worker-a".to_string(),
+                    expires_at: 10,
+                },
+            )]),
+            worker_queues: HashMap::from([
+                (
+                    "worker-a".to_string(),
+                    WorkerQueue {
+                        queued_nodes: vec!["node-a".to_string()],
+                    },
+                ),
+                ("worker-b".to_string(), WorkerQueue::default()),
+            ]),
+            ..ExecutionPlan::default()
+        };
+
+        let workers = vec![
+            WorkerNode {
+                id: "worker-a".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: true,
+                    cpu_cores: 4,
+                    memory_mb: 4096,
+                    labels: vec![],
+                },
+                status: WorkerStatus::Ready,
+            },
+            WorkerNode {
+                id: "worker-b".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: true,
+                    cpu_cores: 4,
+                    memory_mb: 4096,
+                    labels: vec![],
+                },
+                status: WorkerStatus::Ready,
+            },
+        ];
+
+        let reassigned = plan.reassign_stale_assignments(&workers, 30, 10);
+        assert_eq!(reassigned, vec!["node-a"]);
+        assert_eq!(
+            plan.leases.get("node-a").map(|lease| lease.worker_id.as_str()),
+            Some("worker-b")
+        );
+        assert_eq!(plan.assignments[0].worker_id, "worker-b");
+        assert!(plan
+            .worker_queues
+            .get("worker-a")
+            .is_some_and(|queue| queue.queued_nodes.is_empty()));
+        assert_eq!(
+            plan.worker_queues
+                .get("worker-b")
+                .map(|queue| queue.queued_nodes.clone()),
+            Some(vec!["node-a".to_string()])
+        );
+
+        assert!(plan.reassign_stale_assignments(&workers, 30, 39).is_empty());
+    }
+
+    #[test]
     fn execution_coordinator_reassigns_work_when_worker_goes_offline() {
         let graph = ExecutionGraph {
             nodes: vec![ExecutionNode {
@@ -4380,6 +4702,73 @@ mod tests {
 
         let recovered = coordinator.recover_failed_worker(graph, "worker-a", &config, 55);
         assert_eq!(recovered.assignments[0].worker_id, "worker-b");
+    }
+
+    #[test]
+    fn execution_coordinator_detects_worker_failure_and_reassigns_current_lease() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "wasm-build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("wasm-pack build".to_string()),
+                execution_mode: ExecutionMode::Wasm,
+                inputs: vec!["src".to_string()],
+                outputs: vec!["pkg".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        };
+        let workers = vec![
+            WorkerNode {
+                id: "worker-a".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: false,
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    labels: vec!["wasm".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+            WorkerNode {
+                id: "worker-b".to_string(),
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: false,
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    labels: vec!["wasm".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+        ];
+        let mut coordinator =
+            ExecutionCoordinator::new(workers, DistributedArtifactStore::default());
+        coordinator.worker_registry.heartbeat_timeout_secs = 5;
+        assert!(coordinator.heartbeat("worker-a", 100));
+        assert!(coordinator.heartbeat("worker-b", 100));
+
+        let mut config = DistributedExecutionConfig::default();
+        config.lease_ttl_secs = 5;
+        let mut plan = coordinator.plan(graph, &config, 100);
+
+        assert!(coordinator.heartbeat("worker-b", 104));
+        assert!(coordinator.detect_failed_workers(105).is_empty());
+        assert_eq!(coordinator.detect_failed_workers(106), vec!["worker-a"]);
+
+        let reassigned = plan.reassign_failed_worker(
+            "worker-a",
+            &coordinator.worker_registry.snapshot_workers(),
+            config.lease_ttl_secs,
+            106,
+        );
+        assert_eq!(reassigned, vec!["wasm-build"]);
+        assert_eq!(
+            plan.leases
+                .get("wasm-build")
+                .map(|lease| lease.worker_id.as_str()),
+            Some("worker-b")
+        );
     }
 
     #[test]

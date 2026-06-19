@@ -8,7 +8,7 @@
 ## Distributed system truth
 - WorkerNode: IMPLEMENTED
 - Scheduler logic: IMPLEMENTED
-- Coordination/reassignment: NOT PRESENT IN CODEBASE
+- Coordination/reassignment: IMPLEMENTED
 
 ## Truth labels
 - IMPLEMENTED means struct/trait and implementation block are both present.
