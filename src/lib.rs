@@ -5958,7 +5958,7 @@ fn provider_name(provider: AuthProvider) -> &'static str {
     }
 }
 
-fn oauth_org_slug(seed: &str) -> String {
+fn oauth_org_slug(seed: &str, unique_hint: &str) -> String {
     let mut slug = String::with_capacity(seed.len());
     let mut previous_dash = false;
     for ch in seed.chars() {
@@ -5972,7 +5972,8 @@ fn oauth_org_slug(seed: &str) -> String {
     }
     let trimmed = slug.trim_matches('-');
     if trimmed.is_empty() {
-        "org".to_string()
+        let suffix = &hash_key(unique_hint)[..8];
+        format!("org-{suffix}")
     } else {
         trimmed.to_string()
     }
@@ -5998,7 +5999,7 @@ pub fn github_oauth_callback_endpoint(request: &GithubOAuthCallbackRequest) -> (
         .unwrap_or_else(|| format!("user-gh-{}", hash_key(&request.github_id.to_string())));
     let user_created = request.existing_user_id.is_none();
     let org_name = format!("{}-org", request.github_login);
-    let org_slug = oauth_org_slug(&org_name);
+    let org_slug = oauth_org_slug(&org_name, &request.github_id.to_string());
     let org_id = request.existing_org_id.clone().unwrap_or_else(|| {
         format!(
             "org-{}",
@@ -6079,14 +6080,18 @@ pub fn google_oauth_callback_endpoint(request: &GoogleOAuthCallbackRequest) -> (
         .clone()
         .unwrap_or_else(|| format!("user-goog-{}", hash_key(&request.google_sub)));
     let user_created = request.existing_user_id.is_none();
-    let email_prefix = request.google_email.split('@').next().unwrap_or_default();
+    let email_prefix = request
+        .google_email
+        .split_once('@')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(request.google_email.as_str());
     let org_prefix = if email_prefix.is_empty() {
         request.google_name.as_str()
     } else {
         email_prefix
     };
     let org_name = format!("{org_prefix}-org");
-    let org_slug = oauth_org_slug(&org_name);
+    let org_slug = oauth_org_slug(&org_name, &request.google_sub);
     let org_id = request.existing_org_id.clone().unwrap_or_else(|| {
         format!(
             "org-{}",
