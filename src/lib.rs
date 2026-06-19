@@ -761,12 +761,12 @@ impl ExecutionRouter {
         format!("ddockit://workspace/{safe_workspace_id}/trace")
     }
 
-    fn execution_id_from_workspace(workspace_id: &str) -> ExecutionId {
+    fn derive_execution_id_from_workspace(workspace_id: &str) -> ExecutionId {
         Self::sanitized_workspace_id(workspace_id)
     }
 
     fn execution_trace_url(workspace_id: &str) -> String {
-        let execution_id = Self::execution_id_from_workspace(workspace_id);
+        let execution_id = Self::derive_execution_id_from_workspace(workspace_id);
         ExecutionIdentity::canonical_url_for(&execution_id)
     }
 
@@ -891,7 +891,7 @@ impl ExecutionRouter {
                 affinity.preferred_provider, selected_provider_id, selected_tier
             )
         };
-        let execution_id = Self::execution_id_from_workspace(&ctx.workspace_id);
+        let execution_id = Self::derive_execution_id_from_workspace(&ctx.workspace_id);
 
         Ok(RuntimeSelection {
             runtime: provider.runtime(),
@@ -2591,11 +2591,13 @@ impl ExecutionGateway {
         session_id: Option<&str>,
     ) -> Option<ExecutionRoute> {
         let requested_execution_id = parse_execution_id(canonical_request_url)?;
-        let execution_id = match session_id.and_then(|id| self.affinity_by_session.get(id)) {
-            Some(affinity) if affinity.execution_id == requested_execution_id => requested_execution_id,
-            Some(_) => return None,
-            None => requested_execution_id,
-        };
+        if matches!(
+            session_id.and_then(|id| self.affinity_by_session.get(id)),
+            Some(affinity) if affinity.execution_id != requested_execution_id
+        ) {
+            return None;
+        }
+        let execution_id = requested_execution_id;
         let identity = self.resolver.get(&execution_id)?;
         Some(ExecutionRoute {
             execution_id: identity.execution_id.clone(),
@@ -5874,8 +5876,7 @@ fn parse_execution_id(request_target: &str) -> Option<String> {
         .or_else(|| request_target.strip_prefix("e/"))?;
     let normalized = raw
         .split(['?', '#'])
-        .next()
-        .unwrap_or_default()
+        .next()?
         .trim_matches('/')
         .to_string();
     (!normalized.is_empty()).then_some(normalized)
