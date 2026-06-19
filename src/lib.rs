@@ -2232,7 +2232,7 @@ impl Default for WorkspaceMetrics {
 impl WorkspaceMetrics {
     pub fn render_prometheus(&self) -> String {
         format!(
-            "active_workspaces {}\nfailed_workspaces {}\nworkspace_restarts {}\nmigration_count {}\nrouter_latency {}\nworker_utilization {}\n",
+            "# HELP active_workspaces Number of active workspaces\n# TYPE active_workspaces gauge\nactive_workspaces {}\n# HELP failed_workspaces Number of failed workspaces\n# TYPE failed_workspaces gauge\nfailed_workspaces {}\n# HELP workspace_restarts Total workspace restarts\n# TYPE workspace_restarts counter\nworkspace_restarts {}\n# HELP migration_count Total workspace migrations\n# TYPE migration_count counter\nmigration_count {}\n# HELP router_latency Workspace router latency in milliseconds\n# TYPE router_latency gauge\nrouter_latency {}\n# HELP worker_utilization Worker utilization ratio\n# TYPE worker_utilization gauge\nworker_utilization {}\n",
             self.active_workspaces,
             self.failed_workspaces,
             self.workspace_restarts,
@@ -2271,11 +2271,9 @@ impl WorkspaceRouter {
         proxy: &WorkspaceProxy,
         request_target: &str,
     ) -> Option<WorkspaceRoute> {
-        let start = current_unix_epoch_micros();
         let workspace_id = parse_workspace_id(request_target)?;
         let workspace = registry.get(&workspace_id)?;
         let binding = proxy.resolve(&workspace_id)?;
-        let _latency = current_unix_epoch_micros().saturating_sub(start);
 
         Some(WorkspaceRoute {
             workspace_id: workspace_id.clone(),
@@ -2352,9 +2350,7 @@ impl WorkspaceRecoveryManager {
         let Some(record) = registry.get_mut(workspace_id) else {
             return false;
         };
-        let stable_url = record.assigned_url.clone();
         record.assigned_worker = Some(target_worker.to_string());
-        record.assigned_url = stable_url;
         record.updated_at = now;
         lease_registry.assign(workspace_id, target_worker, now, lease_ttl_secs);
         registry.set_state(workspace_id, WorkspaceState::Running, now.saturating_add(1))
@@ -2404,7 +2400,7 @@ impl CapacityScheduler {
     pub fn select_worker(&self, workers: &[WorkerCapacitySnapshot]) -> Option<WorkerId> {
         workers
             .iter()
-            .filter(|worker| worker.workspace_capacity <= self.max_workspaces_per_worker)
+            .filter(|worker| worker.workspace_capacity < self.max_workspaces_per_worker)
             .max_by(|a, b| {
                 self.score(a)
                     .cmp(&self.score(b))
@@ -2471,7 +2467,7 @@ pub trait WasmWorkspace {
     fn ports(&self, id: &str) -> Result<Vec<PortInfo>>;
 }
 
-struct ActiveWorkspaceRecord {
+struct LocalWorkspaceRecord {
     workspace: Workspace,
     logs: Vec<String>,
     execution_context: Option<ExecutionContext>,
@@ -2486,7 +2482,7 @@ pub struct ExecutionEngine {
 pub struct WorkspaceManager {
     root: PathBuf,
     execution_engine: ExecutionEngine,
-    workspaces: Arc<Mutex<HashMap<String, ActiveWorkspaceRecord>>>,
+    workspaces: Arc<Mutex<HashMap<String, LocalWorkspaceRecord>>>,
     repository_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
     sequence: AtomicU64,
 }
@@ -2710,7 +2706,7 @@ impl WasmWorkspace for WorkspaceManager {
             let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
             workspaces.insert(
                 id.clone(),
-                ActiveWorkspaceRecord {
+                LocalWorkspaceRecord {
                     workspace: workspace.clone(),
                     logs: vec!["workspace created".to_string()],
                     execution_context: None,
@@ -4438,7 +4434,6 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
                     | WorkspaceState::Degraded
                     | WorkspaceState::Restarting
                     | WorkspaceState::Migrating
-                    | WorkspaceState::Stopped
                     | WorkspaceState::Failed
             )
         }
@@ -4448,7 +4443,6 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
                 WorkspaceState::Running
                     | WorkspaceState::Restarting
                     | WorkspaceState::Migrating
-                    | WorkspaceState::Stopped
                     | WorkspaceState::Failed
             )
         }
@@ -5377,13 +5371,6 @@ fn current_unix_epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn current_unix_epoch_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
 }
 
 fn parse_workspace_id(request_target: &str) -> Option<String> {
