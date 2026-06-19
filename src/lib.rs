@@ -101,6 +101,7 @@ pub enum Language {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeType {
     Node,
+    Wasm,
     Rust,
     Go,
     Python,
@@ -148,6 +149,14 @@ pub struct RepositoryClassification {
 pub struct RuntimeAffinity {
     pub preferred_provider: String,
     pub fallback_providers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSelection {
+    pub runtime: RuntimeType,
+    pub provider_id: String,
+    pub reason: String,
+    pub fallback_chain: Vec<RuntimeType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,9 +539,115 @@ pub enum ExecutionTarget {
     Static,
 }
 
-pub struct ExecutionRouter;
+pub struct ExecutionRouter {
+    providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>,
+}
 
 impl ExecutionRouter {
+    pub fn new(providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>) -> Self {
+        Self { providers }
+    }
+
+    pub fn select(&self, ctx: &ExecutionContext) -> Result<RuntimeSelection> {
+        let affinity = &ctx.analysis.execution_profile.runtime_affinity;
+        let mut ordered_provider_ids = vec![affinity.preferred_provider.clone()];
+        ordered_provider_ids.extend(affinity.fallback_providers.iter().cloned());
+        let mut seen_provider_ids = ordered_provider_ids.iter().cloned().collect::<HashSet<_>>();
+        for provider in &self.providers {
+            let provider_id = provider.id().to_string();
+            if seen_provider_ids.insert(provider_id.clone()) {
+                ordered_provider_ids.push(provider_id);
+            }
+        }
+
+        let mut matched_provider_ids = Vec::new();
+        for provider_id in ordered_provider_ids {
+            let Some(provider) = self.provider_by_id(&provider_id) else {
+                continue;
+            };
+            if provider.can_handle(ctx) {
+                matched_provider_ids.push(provider.id().to_string());
+            }
+        }
+
+        let selected_provider_id = matched_provider_ids.first().cloned().ok_or_else(|| {
+            RuntimeError::UnsupportedRepository(format!(
+                "no execution provider matched for workspace {} with framework {:?}",
+                ctx.workspace_id, ctx.analysis.framework
+            ))
+        })?;
+
+        let provider = self.provider_by_id(&selected_provider_id).ok_or_else(|| {
+            RuntimeError::UnsupportedRepository(format!(
+                "selected execution provider `{selected_provider_id}` was not registered"
+            ))
+        })?;
+
+        let fallback_chain = matched_provider_ids
+            .iter()
+            .skip(1)
+            .filter_map(|provider_id| self.provider_by_id(provider_id))
+            .map(|provider| provider.runtime())
+            .collect::<Vec<_>>();
+
+        let reason = if selected_provider_id == affinity.preferred_provider {
+            format!(
+                "selected preferred runtime provider `{}` from runtime affinity",
+                selected_provider_id
+            )
+        } else {
+            format!(
+                "preferred provider `{}` unavailable; selected fallback provider `{}`",
+                affinity.preferred_provider, selected_provider_id
+            )
+        };
+
+        Ok(RuntimeSelection {
+            runtime: provider.runtime(),
+            provider_id: selected_provider_id,
+            reason,
+            fallback_chain,
+        })
+    }
+
+    pub fn dispatch_start(&self, ctx: &mut ExecutionContext) -> Result<ProcessHandle> {
+        let selection = self.select(ctx)?;
+        let provider = self.provider_by_id(&selection.provider_id).ok_or_else(|| {
+            RuntimeError::UnsupportedRepository(format!(
+                "selected execution provider `{}` was not registered",
+                selection.provider_id
+            ))
+        })?;
+        provider.prepare(ctx)?;
+        let handle = provider.start(ctx)?;
+        let health = provider.health(&handle)?;
+        if health.healthy {
+            Ok(handle)
+        } else {
+            match provider.stop(&handle) {
+                Ok(()) => Err(RuntimeError::CommandFailed(format!(
+                    "provider reported unhealthy process: {}",
+                    health.message
+                ))),
+                Err(stop_err) => Err(RuntimeError::CommandFailed(format!(
+                    "provider reported unhealthy process: {}; cleanup failed: {stop_err}",
+                    health.message
+                ))),
+            }
+        }
+    }
+
+    pub fn dispatch_stop(&self, ctx: &ExecutionContext, handle: &ProcessHandle) -> Result<()> {
+        let selection = self.select(ctx)?;
+        let provider = self.provider_by_id(&selection.provider_id).ok_or_else(|| {
+            RuntimeError::UnsupportedRepository(format!(
+                "selected execution provider `{}` was not registered",
+                selection.provider_id
+            ))
+        })?;
+        provider.stop(handle)
+    }
+
     pub fn route(node: &ExecutionNode, profile: &ExecutionProfile) -> ExecutionTarget {
         match node.execution_mode {
             ExecutionMode::Native => {
@@ -594,6 +709,13 @@ impl ExecutionRouter {
                 allowed_syscalls: vec![],
             },
         }
+    }
+
+    fn provider_by_id(&self, provider_id: &str) -> Option<&(dyn ExecutionProvider + Send + Sync)> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id() == provider_id)
+            .map(|provider| provider.as_ref())
     }
 }
 
@@ -1627,6 +1749,10 @@ pub struct BuildPlanner;
 /// Implementations are selected via `can_handle`, then called in the
 /// lifecycle order `prepare` -> `start` -> `health` (and eventually `stop`).
 pub trait ExecutionProvider {
+    /// Stable provider identifier used by runtime affinity and router selection.
+    fn id(&self) -> &'static str;
+    /// Runtime family owned by this provider.
+    fn runtime(&self) -> RuntimeType;
     /// Returns true when this provider owns runtime execution for `ctx`.
     fn can_handle(&self, ctx: &ExecutionContext) -> bool;
     /// Mutates provider-specific runtime details before start.
@@ -1658,7 +1784,7 @@ struct WorkspaceRecord {
 }
 
 pub struct ExecutionEngine {
-    providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>,
+    router: ExecutionRouter,
     artifact_store: ArtifactStore,
 }
 
@@ -1676,47 +1802,14 @@ impl ExecutionEngine {
         artifact_store: ArtifactStore,
     ) -> Self {
         Self {
-            providers,
+            router: ExecutionRouter::new(providers),
             artifact_store,
         }
     }
 
-    fn provider_for(
-        &self,
-        ctx: &ExecutionContext,
-    ) -> Result<&(dyn ExecutionProvider + Send + Sync)> {
-        self.providers
-            .iter()
-            .find(|provider| provider.can_handle(ctx))
-            .map(|provider| provider.as_ref())
-            .ok_or_else(|| {
-                RuntimeError::UnsupportedRepository(format!(
-                    "no execution provider matched for workspace {} with framework {:?}",
-                    ctx.workspace_id, ctx.analysis.framework
-                ))
-            })
-    }
-
     pub fn start(&self, ctx: &mut ExecutionContext) -> Result<ProcessHandle> {
         self.prime_artifacts(ctx)?;
-        let provider = self.provider_for(ctx)?;
-        provider.prepare(ctx)?;
-        let handle = provider.start(ctx)?;
-        let health = provider.health(&handle)?;
-        if health.healthy {
-            Ok(handle)
-        } else {
-            match provider.stop(&handle) {
-                Ok(()) => Err(RuntimeError::CommandFailed(format!(
-                    "provider reported unhealthy process: {}",
-                    health.message
-                ))),
-                Err(stop_err) => Err(RuntimeError::CommandFailed(format!(
-                    "provider reported unhealthy process: {}; cleanup failed: {stop_err}",
-                    health.message
-                ))),
-            }
-        }
+        self.router.dispatch_start(ctx)
     }
 
     /// Ensures each node has artifact metadata recorded unless a matching cache key already exists.
@@ -1778,8 +1871,7 @@ impl ExecutionEngine {
     }
 
     pub fn stop(&self, ctx: &ExecutionContext, handle: &ProcessHandle) -> Result<()> {
-        let provider = self.provider_for(ctx)?;
-        provider.stop(handle)
+        self.router.dispatch_stop(ctx, handle)
     }
 }
 
@@ -2476,6 +2568,10 @@ fn runtime_affinity_for_classification(
                 "StaticRuntimeProvider".to_string(),
             ],
         },
+        RuntimeType::Wasm => RuntimeAffinity {
+            preferred_provider: "WasmExecutionProvider".to_string(),
+            fallback_providers: vec!["StaticRuntimeProvider".to_string()],
+        },
         RuntimeType::Rust => RuntimeAffinity {
             preferred_provider: "RustRuntimeProvider".to_string(),
             fallback_providers: vec![
@@ -3023,6 +3119,14 @@ struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
 
 impl ExecutionProvider for WasmExecutionProvider {
+    fn id(&self) -> &'static str {
+        "WasmExecutionProvider"
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Wasm
+    }
+
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
         if ctx.execution_graph.nodes.is_empty() {
             return false;
@@ -3140,6 +3244,14 @@ impl ExecutionProvider for WasmExecutionProvider {
 }
 
 impl ExecutionProvider for NodeRuntimeProvider {
+    fn id(&self) -> &'static str {
+        "NodeRuntimeProvider"
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Node
+    }
+
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
         matches!(
             ctx.analysis.framework,
@@ -3175,6 +3287,14 @@ impl ExecutionProvider for NodeRuntimeProvider {
 }
 
 impl ExecutionProvider for RustRuntimeProvider {
+    fn id(&self) -> &'static str {
+        "RustRuntimeProvider"
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Rust
+    }
+
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
         ctx.analysis.framework == Framework::Rust
     }
@@ -3202,6 +3322,14 @@ impl ExecutionProvider for RustRuntimeProvider {
 }
 
 impl ExecutionProvider for StaticRuntimeProvider {
+    fn id(&self) -> &'static str {
+        "StaticRuntimeProvider"
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Static
+    }
+
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
         ctx.analysis.framework == Framework::StaticWeb
     }
@@ -4294,6 +4422,99 @@ mod tests {
             }
             other => panic!("expected wasm routing target, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execution_router_selects_preferred_runtime_provider() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "serve".to_string(),
+                node_type: ExecutionNodeType::StaticServe,
+                command: Some("serve .".to_string()),
+                execution_mode: ExecutionMode::Wasm,
+                inputs: vec![],
+                outputs: vec![],
+                cache_key: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-router-preferred".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+        let router = ExecutionRouter::new(vec![
+            Box::new(WasmExecutionProvider),
+            Box::new(NodeRuntimeProvider),
+            Box::new(RustRuntimeProvider),
+            Box::new(StaticRuntimeProvider),
+        ]);
+
+        let selection = router.select(&ctx).expect("select preferred provider");
+        assert_eq!(selection.provider_id, "WasmExecutionProvider");
+        assert_eq!(selection.runtime, RuntimeType::Wasm);
+    }
+
+    #[test]
+    fn execution_engine_uses_router_fallback_provider() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let mut analysis = test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Rust);
+        analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+            preferred_provider: "NodeRuntimeProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        };
+
+        let mut ctx = ExecutionContext {
+            workspace_id: "ws-router-fallback".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            analysis,
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let engine = ExecutionEngine::new(
+            vec![
+                Box::new(WasmExecutionProvider),
+                Box::new(NodeRuntimeProvider),
+                Box::new(RustRuntimeProvider),
+                Box::new(StaticRuntimeProvider),
+            ],
+            ArtifactStore::new(temp_dir("router-engine-artifacts")),
+        );
+
+        let handle = engine.start(&mut ctx).expect("engine should use fallback");
+        assert!(handle.pid_hint.starts_with("rust:"));
     }
 
     #[test]
