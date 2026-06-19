@@ -26,6 +26,7 @@ const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
+const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 
@@ -1127,7 +1128,7 @@ impl WorkerRegistry {
         Self {
             workers: HashMap::new(),
             heartbeats: HashMap::new(),
-            heartbeat_timeout_secs: heartbeat_timeout_secs.max(1),
+            heartbeat_timeout_secs: heartbeat_timeout_secs.max(MIN_COORDINATION_TIMEOUT_SECS),
         }
     }
 
@@ -1298,7 +1299,7 @@ impl ExecutionPlan {
         candidates.sort_by(|a, b| a.id.cmp(&b.id));
 
         let mut reassigned = Vec::new();
-        let ttl = lease_ttl_secs.max(1);
+        let ttl = lease_ttl_secs.max(MIN_COORDINATION_TIMEOUT_SECS);
         for node_id in node_ids {
             let Some(existing_lease) = self.leases.get(&node_id).cloned() else {
                 continue;
@@ -1306,8 +1307,7 @@ impl ExecutionPlan {
             let selected = candidates
                 .iter()
                 .copied()
-                .find(|candidate| candidate.id != existing_lease.worker_id)
-                .or_else(|| candidates.first().copied());
+                .find(|candidate| candidate.id != existing_lease.worker_id);
             let Some(worker) = selected else {
                 continue;
             };
@@ -1340,7 +1340,6 @@ impl ExecutionPlan {
         }
 
         reassigned.sort();
-        reassigned.dedup();
         reassigned
     }
 }
@@ -4652,6 +4651,8 @@ mod tests {
                 .map(|queue| queue.queued_nodes.clone()),
             Some(vec!["node-a".to_string()])
         );
+
+        assert!(plan.reassign_stale_assignments(&workers, 30, 39).is_empty());
     }
 
     #[test]
@@ -4752,6 +4753,7 @@ mod tests {
         let mut plan = coordinator.plan(graph, &config, 100);
 
         assert!(coordinator.heartbeat("worker-b", 104));
+        assert!(coordinator.detect_failed_workers(105).is_empty());
         assert_eq!(coordinator.detect_failed_workers(106), vec!["worker-a"]);
 
         let reassigned = plan.reassign_failed_worker(
