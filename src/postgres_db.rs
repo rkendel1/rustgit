@@ -260,6 +260,7 @@ impl ExecutionIntelligencePostgresStore {
             client.batch_execute(
                 "
                 DROP TABLE IF EXISTS commit_execution_results CASCADE;
+                DROP TABLE IF EXISTS audit_logs CASCADE;
                 DROP TABLE IF EXISTS journey_results CASCADE;
                 DROP TABLE IF EXISTS agents CASCADE;
                 DROP TABLE IF EXISTS workspace_runtime_bindings CASCADE;
@@ -275,6 +276,9 @@ impl ExecutionIntelligencePostgresStore {
                 DROP TABLE IF EXISTS fingerprints CASCADE;
                 DROP TABLE IF EXISTS commits CASCADE;
                 DROP TABLE IF EXISTS repositories CASCADE;
+                DROP TABLE IF EXISTS memberships CASCADE;
+                DROP TABLE IF EXISTS organizations CASCADE;
+                DROP TABLE IF EXISTS users CASCADE;
                 DROP TABLE IF EXISTS schema_migrations CASCADE;
                 ",
             )?;
@@ -351,14 +355,71 @@ impl ExecutionIntelligencePostgresStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_workspace(
+        &self,
+        workspace_id: &str,
+        org_id: &str,
+        repository_id: &str,
+        commit_hash: &str,
+        created_by: &str,
+        visibility: &str,
+        current_runtime: &str,
+        status: &str,
+        created_at: u64,
+        last_healthy_at: Option<u64>,
+    ) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            let last_healthy_at = Self::optional_epoch_to_pg(last_healthy_at);
+            client.execute(
+                "INSERT INTO workspaces (
+                    workspace_id, org_id, repository_id, commit_hash, created_by, visibility,
+                    current_runtime, status, created_at, last_healthy_at
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    to_timestamp($9::double precision),
+                    CASE WHEN $10 IS NULL THEN NULL ELSE to_timestamp($10::double precision) END
+                 )
+                 ON CONFLICT (workspace_id)
+                 DO UPDATE SET
+                    org_id = EXCLUDED.org_id,
+                    repository_id = EXCLUDED.repository_id,
+                    commit_hash = EXCLUDED.commit_hash,
+                    created_by = EXCLUDED.created_by,
+                    visibility = EXCLUDED.visibility,
+                    current_runtime = EXCLUDED.current_runtime,
+                    status = EXCLUDED.status,
+                    created_at = EXCLUDED.created_at,
+                    last_healthy_at = EXCLUDED.last_healthy_at",
+                &[
+                    &workspace_id,
+                    &org_id,
+                    &repository_id,
+                    &commit_hash,
+                    &created_by,
+                    &visibility,
+                    &current_runtime,
+                    &status,
+                    &(created_at as f64),
+                    &last_healthy_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn insert_execution(&self, record: &EidbExecutionRecord) -> PersistenceResult<()> {
         self.with_client(|client| {
             let completed_at = Self::optional_epoch_to_pg(record.completed_at);
             client.execute(
-                "INSERT INTO executions (execution_id, repository_id, commit_hash, started_at, completed_at, status, execution_tier)
-                 VALUES ($1, $2, $3, to_timestamp($4::double precision), CASE WHEN $5 IS NULL THEN NULL ELSE to_timestamp($5::double precision) END, $6, $7)
+                "INSERT INTO executions (execution_id, org_id, user_id, workspace_id, repository_id, commit_hash, started_at, completed_at, status, execution_tier)
+                 VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::double precision), CASE WHEN $8 IS NULL THEN NULL ELSE to_timestamp($8::double precision) END, $9, $10)
                  ON CONFLICT (execution_id)
                  DO UPDATE SET
+                    org_id = EXCLUDED.org_id,
+                    user_id = EXCLUDED.user_id,
+                    workspace_id = EXCLUDED.workspace_id,
                     repository_id = EXCLUDED.repository_id,
                     commit_hash = EXCLUDED.commit_hash,
                     started_at = EXCLUDED.started_at,
@@ -367,6 +428,9 @@ impl ExecutionIntelligencePostgresStore {
                     execution_tier = EXCLUDED.execution_tier",
                 &[
                     &record.execution_id,
+                    &record.org_id,
+                    &record.user_id,
+                    &record.workspace_id,
                     &record.repository_id,
                     &record.commit_hash,
                     &(record.started_at as f64),
@@ -609,7 +673,7 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
     ) -> PersistenceResult<Vec<EidbExecutionRecord>> {
         self.with_client(|client| {
             let rows = client.query(
-                "SELECT execution_id, repository_id, commit_hash,
+                "SELECT execution_id, org_id, user_id, workspace_id, repository_id, commit_hash,
                         EXTRACT(EPOCH FROM started_at)::BIGINT,
                         EXTRACT(EPOCH FROM completed_at)::BIGINT,
                         status, execution_tier
@@ -621,15 +685,18 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
 
             rows.into_iter()
                 .map(|row| {
-                    let completed_epoch: Option<i64> = row.get(4);
+                    let completed_epoch: Option<i64> = row.get(7);
                     Ok(EidbExecutionRecord {
                         execution_id: row.get(0),
-                        repository_id: row.get(1),
-                        commit_hash: row.get(2),
-                        started_at: Self::to_u64(row.get::<_, i64>(3))?,
+                        org_id: row.get(1),
+                        user_id: row.get(2),
+                        workspace_id: row.get(3),
+                        repository_id: row.get(4),
+                        commit_hash: row.get(5),
+                        started_at: Self::to_u64(row.get::<_, i64>(6))?,
                         completed_at: completed_epoch.map(Self::to_u64).transpose()?,
-                        status: row.get(5),
-                        execution_tier: row.get(6),
+                        status: row.get(8),
+                        execution_tier: row.get(9),
                     })
                 })
                 .collect()
@@ -666,7 +733,7 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
     fn execution(&self, execution_id: &str) -> PersistenceResult<Option<EidbExecutionRecord>> {
         self.with_client(|client| {
             let row = client.query_opt(
-                "SELECT execution_id, repository_id, commit_hash,
+                "SELECT execution_id, org_id, user_id, workspace_id, repository_id, commit_hash,
                         EXTRACT(EPOCH FROM started_at)::BIGINT,
                         EXTRACT(EPOCH FROM completed_at)::BIGINT,
                         status, execution_tier
@@ -676,15 +743,18 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
             )?;
 
             row.map(|row| {
-                let completed_epoch: Option<i64> = row.get(4);
+                let completed_epoch: Option<i64> = row.get(7);
                 Ok(EidbExecutionRecord {
                     execution_id: row.get(0),
-                    repository_id: row.get(1),
-                    commit_hash: row.get(2),
-                    started_at: Self::to_u64(row.get::<_, i64>(3))?,
+                    org_id: row.get(1),
+                    user_id: row.get(2),
+                    workspace_id: row.get(3),
+                    repository_id: row.get(4),
+                    commit_hash: row.get(5),
+                    started_at: Self::to_u64(row.get::<_, i64>(6))?,
                     completed_at: completed_epoch.map(Self::to_u64).transpose()?,
-                    status: row.get(5),
-                    execution_tier: row.get(6),
+                    status: row.get(8),
+                    execution_tier: row.get(9),
                 })
             })
             .transpose()
