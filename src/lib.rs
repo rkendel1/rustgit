@@ -16,6 +16,8 @@ const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
+const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
+const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 
@@ -949,6 +951,185 @@ impl ExecutionCoordinator {
             worker.status = WorkerStatus::Offline;
         }
         self.plan(graph, config, now)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSession {
+    pub session_id: String,
+    pub repo_id: String,
+    pub execution_graph_id: String,
+    pub coordinator_endpoint: String,
+    pub sync_state: WorkspaceSessionSyncState,
+    pub graph_events: VecDeque<GraphEvent>,
+    pub worker_events: VecDeque<WorkerEvent>,
+}
+
+impl WorkspaceSession {
+    pub fn new(
+        session_id: impl Into<String>,
+        repo_id: impl Into<String>,
+        execution_graph_id: impl Into<String>,
+        coordinator_endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            repo_id: repo_id.into(),
+            execution_graph_id: execution_graph_id.into(),
+            coordinator_endpoint: coordinator_endpoint.into(),
+            sync_state: WorkspaceSessionSyncState::Connecting,
+            graph_events: VecDeque::new(),
+            worker_events: VecDeque::new(),
+        }
+    }
+
+    pub fn record_graph_event(&mut self, event: GraphEvent) {
+        if self.graph_events.len() >= SESSION_GRAPH_EVENT_BUFFER_LIMIT {
+            self.graph_events.pop_front();
+        }
+        self.graph_events.push_back(event);
+    }
+
+    pub fn stream_for_node(&self, node_id: &str) -> Vec<GraphEvent> {
+        self.graph_events
+            .iter()
+            .filter(|event| event.node_id == node_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn record_worker_event(&mut self, event: WorkerEvent) {
+        if self.worker_events.len() >= SESSION_WORKER_EVENT_BUFFER_LIMIT {
+            self.worker_events.pop_front();
+        }
+        self.worker_events.push_back(event);
+    }
+
+    pub fn apply_control(&mut self, control: ExecutionControl) {
+        self.sync_state = match control {
+            ExecutionControl::Pause => WorkspaceSessionSyncState::Paused,
+            ExecutionControl::Resume => WorkspaceSessionSyncState::Live,
+            ExecutionControl::RetryNode { ref node_id } => {
+                self.record_graph_event(GraphEvent {
+                    node_id: node_id.clone(),
+                    event_type: GraphEventType::NodeQueued,
+                    timestamp: current_unix_epoch_secs(),
+                });
+                WorkspaceSessionSyncState::Live
+            }
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSessionSyncState {
+    Connecting,
+    Live,
+    Paused,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEvent {
+    pub node_id: String,
+    pub event_type: GraphEventType,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphEventType {
+    NodeQueued,
+    NodeStarted,
+    NodeCompleted,
+    NodeFailed,
+    NodeCached,
+    NodeRerouted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerEvent {
+    pub worker_id: String,
+    pub message: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionControl {
+    Pause,
+    Resume,
+    RetryNode { node_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileTree {
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MonacoEditor {
+    pub active_path: Option<String>,
+    pub content: String,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TerminalSession {
+    pub worker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UIExecutionNode {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UIExecutionEdge {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionGraphView {
+    pub nodes: Vec<UIExecutionNode>,
+    pub edges: Vec<UIExecutionEdge>,
+    pub live_states: HashMap<String, GraphEventType>,
+}
+
+impl ExecutionGraphView {
+    pub fn apply_graph_event(&mut self, event: &GraphEvent) {
+        self.live_states
+            .insert(event.node_id.clone(), event.event_type);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogStream {
+    pub entries: Vec<WorkerEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowserIDE {
+    pub file_tree: FileTree,
+    pub editor: MonacoEditor,
+    pub terminal: TerminalSession,
+    pub graph_view: ExecutionGraphView,
+    pub log_stream: LogStream,
+}
+
+impl BrowserIDE {
+    pub fn sync_file_content(&mut self, path: impl Into<String>, content: impl Into<String>) {
+        let path = path.into();
+        let content = content.into();
+        if !self.file_tree.files.iter().any(|file| file == &path) {
+            self.file_tree.files.push(path.clone());
+        }
+        self.editor.active_path = Some(path);
+        self.editor.content = content;
+        self.editor.dirty = false;
+    }
+
+    pub fn append_log(&mut self, event: WorkerEvent) {
+        self.log_stream.entries.push(event);
     }
 }
 
@@ -3430,5 +3611,114 @@ mod tests {
         graph.nodes[0].execution_mode = ExecutionMode::Wasm;
         let second = graph.compute_cache_keys();
         assert_ne!(first.get("build"), second.get("build"));
+    }
+
+    #[test]
+    fn workspace_session_tracks_graph_events_and_controls() {
+        let mut session = WorkspaceSession::new(
+            "session-1",
+            "repo-1",
+            "graph-1",
+            "http://coordinator:8080",
+        );
+        assert_eq!(session.sync_state, WorkspaceSessionSyncState::Connecting);
+
+        session.record_graph_event(GraphEvent {
+            node_id: "build".to_string(),
+            event_type: GraphEventType::NodeStarted,
+            timestamp: 10,
+        });
+        assert_eq!(session.stream_for_node("build").len(), 1);
+
+        session.apply_control(ExecutionControl::Pause);
+        assert_eq!(session.sync_state, WorkspaceSessionSyncState::Paused);
+
+        session.apply_control(ExecutionControl::RetryNode {
+            node_id: "build".to_string(),
+        });
+        assert_eq!(session.sync_state, WorkspaceSessionSyncState::Live);
+        assert_eq!(
+            session
+                .stream_for_node("build")
+                .last()
+                .map(|event| event.event_type),
+            Some(GraphEventType::NodeQueued)
+        );
+    }
+
+    #[test]
+    fn workspace_session_event_buffers_are_bounded() {
+        let mut session = WorkspaceSession::new(
+            "session-2",
+            "repo-2",
+            "graph-2",
+            "http://coordinator:8080",
+        );
+        for index in 0..=SESSION_GRAPH_EVENT_BUFFER_LIMIT {
+            session.record_graph_event(GraphEvent {
+                node_id: format!("node-{index}"),
+                event_type: GraphEventType::NodeStarted,
+                timestamp: index as u64,
+            });
+        }
+        for index in 0..=SESSION_WORKER_EVENT_BUFFER_LIMIT {
+            session.record_worker_event(WorkerEvent {
+                worker_id: "worker-1".to_string(),
+                message: format!("event-{index}"),
+                timestamp: index as u64,
+            });
+        }
+
+        assert_eq!(session.graph_events.len(), SESSION_GRAPH_EVENT_BUFFER_LIMIT);
+        assert_eq!(session.worker_events.len(), SESSION_WORKER_EVENT_BUFFER_LIMIT);
+        assert_eq!(
+            session.graph_events.front().map(|event| event.node_id.as_str()),
+            Some("node-1")
+        );
+        assert_eq!(
+            session
+                .worker_events
+                .front()
+                .map(|event| event.message.as_str()),
+            Some("event-1")
+        );
+    }
+
+    #[test]
+    fn execution_graph_view_applies_live_state_events() {
+        let mut graph_view = ExecutionGraphView {
+            nodes: vec![UIExecutionNode {
+                id: "test".to_string(),
+            }],
+            ..ExecutionGraphView::default()
+        };
+        let event = GraphEvent {
+            node_id: "test".to_string(),
+            event_type: GraphEventType::NodeCompleted,
+            timestamp: 25,
+        };
+
+        graph_view.apply_graph_event(&event);
+
+        assert_eq!(
+            graph_view.live_states.get("test"),
+            Some(&GraphEventType::NodeCompleted)
+        );
+    }
+
+    #[test]
+    fn browser_ide_syncs_files_and_streams_logs() {
+        let mut ide = BrowserIDE::default();
+        ide.sync_file_content("src/lib.rs", "pub fn sample() {}");
+        assert_eq!(ide.file_tree.files, vec!["src/lib.rs".to_string()]);
+        assert_eq!(ide.editor.active_path.as_deref(), Some("src/lib.rs"));
+        assert!(!ide.editor.dirty);
+
+        ide.append_log(WorkerEvent {
+            worker_id: "worker-1".to_string(),
+            message: "node build started".to_string(),
+            timestamp: 100,
+        });
+        assert_eq!(ide.log_stream.entries.len(), 1);
     }
 }
