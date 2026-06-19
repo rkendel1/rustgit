@@ -766,20 +766,19 @@ impl ExecutionRouter {
     }
 
     fn sanitized_workspace_id(workspace_id: &str) -> String {
-        let normalized = workspace_id
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        if normalized.is_empty() {
-            "unknown".to_string()
+        let mut encoded = String::with_capacity(workspace_id.len());
+        for byte in workspace_id.bytes() {
+            let ch = byte as char;
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                encoded.push(ch);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        if encoded.is_empty() {
+            "workspace-empty".to_string()
         } else {
-            normalized
+            encoded
         }
     }
 
@@ -856,9 +855,12 @@ impl ExecutionRouter {
                 ctx.workspace_id, ctx.analysis.framework, attempted
             ))
         })?;
-        let selected_tier = selected_tier.expect(
-            "internal error: selected_tier must be set when selected_provider_id is set",
-        );
+        let selected_tier = selected_tier.ok_or_else(|| {
+            RuntimeError::CommandFailed(format!(
+                "internal error: selected_tier missing for workspace {} provider {}",
+                ctx.workspace_id, selected_provider_id
+            ))
+        })?;
 
         let provider = self.provider_by_id(&selected_provider_id).ok_or_else(|| {
             RuntimeError::UnsupportedRepository(format!(
@@ -2704,22 +2706,10 @@ pub trait ExecutionProvider {
     fn prepare(&self, ctx: &mut ExecutionContext) -> Result<()>;
     /// Starts execution from an immutable execution contract.
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle>;
-    /// Starts execution by-value for escalation APIs.
-    fn start_request(&self, req: ExecutionContext) -> Result<ProcessHandle> {
-        self.start(&req)
-    }
     /// Stops a process started by this provider.
     fn stop(&self, handle: &ProcessHandle) -> Result<()>;
-    /// Stops a by-value execution handle.
-    fn stop_handle(&self, handle: ProcessHandle) -> Result<()> {
-        self.stop(&handle)
-    }
     /// Reports process health after startup and during monitoring.
     fn health(&self, handle: &ProcessHandle) -> Result<HealthStatus>;
-    /// Reports health of an execution handle.
-    fn health_status(&self, handle: &ProcessHandle) -> Result<HealthStatus> {
-        self.health(handle)
-    }
 }
 
 pub struct WasmExecutionProvider;
