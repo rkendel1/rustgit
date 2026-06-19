@@ -4600,7 +4600,7 @@ pub enum ProductSurface {
 }
 
 impl ProductSurface {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::GitHubOverlayExtension => "github_overlay_extension",
             Self::Portal => "portal",
@@ -5118,8 +5118,10 @@ pub fn surface_execution_start_endpoint(
     request: &ExecutionStartRequest,
 ) -> (String, String) {
     let (path, body) = executions_start_endpoint(request);
-    let mut payload: serde_json::Value =
-        serde_json::from_str(&body).expect("executions_start_endpoint emits valid JSON payload");
+    let mut payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(_) => return (path, body),
+    };
     if let Some(object) = payload.as_object_mut() {
         object.insert("surface".to_string(), json!(surface.as_str()));
         object.insert("entry_api".to_string(), json!("/api/v1/executions"));
@@ -5138,11 +5140,11 @@ pub fn detect_overlay_repository_context(url: &str) -> Option<OverlayRepositoryC
         Some("tree") => {
             let suffix = segments.collect::<Vec<_>>().join("/");
             if suffix.is_empty() {
-                "main".to_string()
-            } else {
-                suffix
+                return None;
             }
+            suffix
         }
+        // Overlay URL extraction falls back to main when GitHub does not include `/tree/<branch>`.
         _ => "main".to_string(),
     };
     Some(OverlayRepositoryContext {
@@ -5152,8 +5154,10 @@ pub fn detect_overlay_repository_context(url: &str) -> Option<OverlayRepositoryC
     })
 }
 
-pub fn extension_overlay_actions() -> [&'static str; 5] {
-    ["run", "instant_run", "analyze", "runtime", "commits"]
+const OVERLAY_EXTENSION_ACTIONS: &[&str] = &["run", "instant_run", "analyze", "runtime", "commits"];
+
+pub fn extension_overlay_actions() -> &'static [&'static str] {
+    OVERLAY_EXTENSION_ACTIONS
 }
 
 pub fn extension_overlay_actions_endpoint() -> (String, String) {
@@ -5168,16 +5172,18 @@ pub fn extension_overlay_actions_endpoint() -> (String, String) {
     )
 }
 
-pub fn portal_initial_navigation() -> [&'static str; 7] {
-    [
-        "dashboard",
-        "workspaces",
-        "repositories",
-        "executions",
-        "agents",
-        "analytics",
-        "settings",
-    ]
+const PORTAL_INITIAL_NAVIGATION: &[&str] = &[
+    "dashboard",
+    "workspaces",
+    "repositories",
+    "executions",
+    "agents",
+    "analytics",
+    "settings",
+];
+
+pub fn portal_initial_navigation() -> &'static [&'static str] {
+    PORTAL_INITIAL_NAVIGATION
 }
 
 pub fn portal_navigation_endpoint() -> (String, String) {
@@ -13518,6 +13524,8 @@ services:
             detect_overlay_repository_context("https://github.com/org/repo/tree/feature/ui")
                 .expect("github URL with nested branch should parse");
         assert_eq!(nested_branch_context.branch, "feature/ui");
+
+        assert!(detect_overlay_repository_context("https://github.com/org/repo/tree").is_none());
     }
 
     #[test]
