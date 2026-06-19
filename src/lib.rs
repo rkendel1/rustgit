@@ -1238,13 +1238,37 @@ pub struct ServiceDependency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkTopology {
+    pub network_id: String,
+    pub service_dns: HashMap<String, String>,
+    pub exposed_ports: HashMap<String, Vec<u16>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StartupOrder {
     pub stages: Vec<Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartupStrategy {
+    pub stages: Vec<Vec<String>>,
+    pub enforce_dependencies: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HealthPolicy {
+    pub service_checks: HashMap<String, Vec<ReadinessCheck>>,
+    pub require_healthy_dependencies: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationTopology {
+    pub topology_id: String,
     pub services: Vec<ServiceDefinition>,
+    pub edges: Vec<ServiceDependency>,
+    pub global_network: NetworkTopology,
+    pub startup_strategy: StartupStrategy,
+    pub health_policy: HealthPolicy,
     pub dependencies: Vec<ServiceDependency>,
     pub startup_order: StartupOrder,
 }
@@ -6132,7 +6156,12 @@ impl BuildPlanner {
         topology: &ApplicationTopology,
     ) -> ExecutionGraph {
         let mut nodes = vec![];
-        let mut edges = vec![];
+        let mut edges: Vec<ExecutionEdge> = vec![];
+        let mut add_edge = |from: String, to: String| {
+            if !edges.iter().any(|edge| edge.from == from && edge.to == to) {
+                edges.push(ExecutionEdge { from, to });
+            }
+        };
 
         let install_command = topology.services.iter().find_map(service_install_command);
         if let Some(command) = install_command {
@@ -6161,10 +6190,7 @@ impl BuildPlanner {
             cache_binding: None,
         });
         if nodes.iter().any(|node| node.id == "install") {
-            edges.push(ExecutionEdge {
-                from: "install".to_string(),
-                to: "shared-build".to_string(),
-            });
+            add_edge("install".to_string(), "shared-build".to_string());
         }
 
         for service in &topology.services {
@@ -6188,42 +6214,50 @@ impl BuildPlanner {
                 runtime: None,
                 cache_binding: None,
             });
-            edges.push(ExecutionEdge {
-                from: "shared-build".to_string(),
-                to: build_id.clone(),
-            });
+            add_edge("shared-build".to_string(), build_id.clone());
 
             let run_node_type = if matches!(role, ServiceRole::DataStore | ServiceRole::Queue) {
                 ExecutionNodeType::CustomCommand
             } else {
                 ExecutionNodeType::DevServer
             };
+            let mut outputs = service
+                .ports
+                .iter()
+                .map(|port| format!("tcp://0.0.0.0:{port}"))
+                .collect::<Vec<_>>();
+            if let Some(dns) = topology.global_network.service_dns.get(&service.id) {
+                outputs.push(format!("svc://{dns}"));
+            }
             nodes.push(ExecutionNode {
                 id: run_id.clone(),
                 node_type: run_node_type,
                 command: Some(service.start_command.clone()),
                 execution_mode: ExecutionMode::Native,
                 inputs: vec![format!("{}-build-output", service.id)],
-                outputs: service
-                    .ports
-                    .iter()
-                    .map(|port| format!("tcp://0.0.0.0:{port}"))
-                    .collect(),
+                outputs,
                 cache_key: None,
                 runtime: None,
                 cache_binding: None,
             });
-            edges.push(ExecutionEdge {
-                from: build_id,
-                to: run_id,
-            });
+            add_edge(build_id, run_id);
         }
 
-        for dependency in &topology.dependencies {
-            edges.push(ExecutionEdge {
-                from: format!("{}-run", dependency.depends_on),
-                to: format!("{}-run", dependency.service_id),
-            });
+        for dependency in &topology.edges {
+            add_edge(
+                format!("{}-run", dependency.depends_on),
+                format!("{}-run", dependency.service_id),
+            );
+        }
+
+        for stage_pair in topology.startup_strategy.stages.windows(2) {
+            if let [current_stage, next_stage] = stage_pair {
+                for current in current_stage {
+                    for next in next_stage {
+                        add_edge(format!("{current}-run"), format!("{next}-run"));
+                    }
+                }
+            }
         }
 
         ExecutionGraph { nodes, edges }
@@ -7529,8 +7563,24 @@ fn infer_application_topology(root: &Path) -> Option<ApplicationTopology> {
     services.sort_by(|left, right| left.id.cmp(&right.id));
     let dependencies = infer_service_dependencies(&services);
     let startup_order = compute_startup_order(&services, &dependencies);
+    let sorted_service_ids = services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
+    let topology_id = format!("mstr-{}", hash_key(&sorted_service_ids.join("|")));
+    let global_network = infer_network_topology(&services);
+    let startup_strategy = StartupStrategy {
+        stages: startup_order.stages.clone(),
+        enforce_dependencies: true,
+    };
+    let health_policy = infer_health_policy(&services);
     Some(ApplicationTopology {
+        topology_id,
         services,
+        edges: dependencies.clone(),
+        global_network,
+        startup_strategy,
+        health_policy,
         dependencies,
         startup_order,
     })
@@ -7847,6 +7897,40 @@ fn infer_service_dependencies(services: &[ServiceDefinition]) -> Vec<ServiceDepe
     }
 
     dependencies
+}
+
+fn infer_network_topology(services: &[ServiceDefinition]) -> NetworkTopology {
+    let mut service_dns = HashMap::new();
+    let mut exposed_ports = HashMap::new();
+    for service in services {
+        service_dns.insert(
+            service.id.clone(),
+            format!("{}.svc.local", service.id.replace('_', "-")),
+        );
+        exposed_ports.insert(service.id.clone(), service.ports.clone());
+    }
+
+    let mut service_ids = services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
+    service_ids.sort();
+    NetworkTopology {
+        network_id: format!("mstr-net-{}", hash_key(&service_ids.join("|"))),
+        service_dns,
+        exposed_ports,
+    }
+}
+
+fn infer_health_policy(services: &[ServiceDefinition]) -> HealthPolicy {
+    let mut service_checks = HashMap::new();
+    for service in services {
+        service_checks.insert(service.id.clone(), service.readiness_checks.clone());
+    }
+    HealthPolicy {
+        service_checks,
+        require_healthy_dependencies: true,
+    }
 }
 
 fn compute_startup_order(
@@ -8374,7 +8458,9 @@ mod tests {
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
         let topology = analysis.topology.expect("topology should exist");
+        assert!(topology.topology_id.starts_with("mstr-"));
         assert_eq!(topology.services.len(), 2);
+        assert_eq!(topology.edges, topology.dependencies);
         assert!(topology
             .dependencies
             .iter()
@@ -8393,6 +8479,24 @@ mod tests {
             .readiness_checks
             .iter()
             .any(|check| check == &ReadinessCheck::Http("/".to_string())));
+        assert_eq!(
+            topology.startup_strategy.stages,
+            topology.startup_order.stages
+        );
+        assert!(topology.startup_strategy.enforce_dependencies);
+        assert!(
+            topology
+                .global_network
+                .service_dns
+                .contains_key("apps-web")
+        );
+        assert!(
+            topology
+                .health_policy
+                .service_checks
+                .contains_key("apps-web")
+        );
+        assert!(topology.health_policy.require_healthy_dependencies);
         assert_eq!(analysis.fingerprint.spec_version, "1.0");
         assert_eq!(analysis.fingerprint.services.len(), 2);
         assert!(analysis
@@ -8440,6 +8544,15 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.from == "apps-api-run" && edge.to == "apps-web-run"));
+        let web_run = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "apps-web-run")
+            .expect("apps-web-run node");
+        assert!(web_run
+            .outputs
+            .iter()
+            .any(|output| output == "svc://apps-web.svc.local"));
     }
 
     #[test]
