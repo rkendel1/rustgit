@@ -1042,10 +1042,12 @@ impl CommitNavigator {
             .position(|node| node.commit_hash == head_commit)
             .unwrap_or_default();
         let upper_bound = std::cmp::min(
-            graph.commits.len().saturating_sub(1),
-            start_index.saturating_add(policy.max_depth),
+            graph.commits.len(),
+            start_index
+                .saturating_add(policy.max_depth)
+                .saturating_add(1),
         );
-        graph.commits[start_index..=upper_bound]
+        graph.commits[start_index..upper_bound]
             .iter()
             .find(|node| commit_is_runnable(node))
     }
@@ -1118,7 +1120,7 @@ fn commit_is_runnable(node: &CommitNode) -> bool {
 ///
 /// Accepted lengths cover short SHAs (7+) and long hexadecimal digests (up to 64).
 fn is_verified_commit_hash(commit_hash: &str) -> bool {
-    (7..=64).contains(&commit_hash.len())
+    ((7..=12).contains(&commit_hash.len()) || matches!(commit_hash.len(), 40 | 64))
         && commit_hash
             .chars()
             .all(|character| character.is_ascii_hexdigit())
@@ -4187,7 +4189,7 @@ pub fn list_repo_commits_endpoint(repo_id: &str, graph: &RepositoryTimeGraph) ->
                 json!({
                     "commit_hash": &commit.commit_hash,
                     "timestamp": commit.timestamp,
-                    "build_status": commit.build_status.map(build_status_label).unwrap_or("unknown"),
+                    "build_status": commit.build_status.map_or("unknown", build_status_label),
                 })
             }).collect::<Vec<_>>()
         })
@@ -8260,7 +8262,7 @@ fn execution_image_spec_material(spec: &ExecutionImageSpec) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "version={}|commit={}|language={}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}|commit_deterministic={}",
+        "version={}|commit={}|language={}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}|deterministic_build={}",
         spec.spec_version,
         spec.commit_hash.as_deref().unwrap_or(UNKNOWN_SIGNATURE),
         language_kind_label(spec.language),
