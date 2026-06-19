@@ -4593,6 +4593,28 @@ pub struct ExecutionStartRequest {
     pub commit: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductSurface {
+    GitHubOverlayExtension,
+    Portal,
+}
+
+impl ProductSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHubOverlayExtension => "github_overlay_extension",
+            Self::Portal => "portal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayRepositoryContext {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionMigrateRequest {
     pub target: String,
@@ -5086,6 +5108,111 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
             "execution_id": execution_id,
             "status": "starting",
             "workspace_url": format!("https://workspace-{workspace_slug}.ddockit.dev")
+        })
+        .to_string(),
+    )
+}
+
+pub fn surface_execution_start_endpoint(
+    surface: ProductSurface,
+    request: &ExecutionStartRequest,
+) -> (String, String) {
+    let (path, body) = executions_start_endpoint(request);
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&body).expect("executions_start_endpoint emits valid JSON payload");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("surface".to_string(), json!(surface.as_str()));
+        object.insert("entry_api".to_string(), json!("/api/v1/executions"));
+        object.insert("control_plane".to_string(), json!("unified"));
+    }
+    (path, payload.to_string())
+}
+
+pub fn detect_overlay_repository_context(url: &str) -> Option<OverlayRepositoryContext> {
+    let github_root = "https://github.com/";
+    let path = url.strip_prefix(github_root)?;
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let owner = segments.next()?.to_string();
+    let repo = segments.next()?.to_string();
+    let branch = match segments.next() {
+        Some("tree") => {
+            let suffix = segments.collect::<Vec<_>>().join("/");
+            if suffix.is_empty() {
+                "main".to_string()
+            } else {
+                suffix
+            }
+        }
+        _ => "main".to_string(),
+    };
+    Some(OverlayRepositoryContext {
+        owner,
+        repo,
+        branch,
+    })
+}
+
+pub fn extension_overlay_actions() -> [&'static str; 5] {
+    ["run", "instant_run", "analyze", "runtime", "commits"]
+}
+
+pub fn extension_overlay_actions_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/extension/actions".to_string(),
+        json!({
+            "surface": ProductSurface::GitHubOverlayExtension.as_str(),
+            "actions": extension_overlay_actions(),
+            "run_entrypoint": "/api/v1/executions"
+        })
+        .to_string(),
+    )
+}
+
+pub fn portal_initial_navigation() -> [&'static str; 7] {
+    [
+        "dashboard",
+        "workspaces",
+        "repositories",
+        "executions",
+        "agents",
+        "analytics",
+        "settings",
+    ]
+}
+
+pub fn portal_navigation_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/portal/navigation".to_string(),
+        json!({
+            "surface": ProductSurface::Portal.as_str(),
+            "navigation": portal_initial_navigation(),
+            "workspace_path": "/api/v1/executions/{id}"
+        })
+        .to_string(),
+    )
+}
+
+pub fn dual_surface_experience_contract_endpoint() -> (String, String) {
+    (
+        "/api/v1/dual-surface/contract".to_string(),
+        json!({
+            "surfaces": [
+                {
+                    "id": ProductSurface::GitHubOverlayExtension.as_str(),
+                    "role": "activation",
+                    "actions": extension_overlay_actions(),
+                },
+                {
+                    "id": ProductSurface::Portal.as_str(),
+                    "role": "management",
+                    "navigation": portal_initial_navigation(),
+                }
+            ],
+            "shared_backend": {
+                "execution_api": "/api/v1/executions",
+                "control_plane": "unified"
+            },
+            "state_guarantees": ["same_execution_ids", "same_urls", "same_state"]
         })
         .to_string(),
     )
@@ -8891,6 +9018,9 @@ impl Default for RestApiSpec {
             "GET /executions/{id}/history",
             "GET /repositories/{id}/healing",
             "GET /repositories/{id}/last-good",
+            "GET /api/v1/dual-surface/contract",
+            "GET /api/v1/surfaces/extension/actions",
+            "GET /api/v1/surfaces/portal/navigation",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
         Self {
@@ -12705,6 +12835,15 @@ dependencies:
         assert!(spec.routes.contains(&"GET /executions/{id}/history"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/healing"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/last-good"));
+        assert!(spec
+            .routes
+            .contains(&"GET /api/v1/dual-surface/contract"));
+        assert!(spec
+            .routes
+            .contains(&"GET /api/v1/surfaces/extension/actions"));
+        assert!(spec
+            .routes
+            .contains(&"GET /api/v1/surfaces/portal/navigation"));
     }
 
     #[test]
@@ -13347,6 +13486,91 @@ services:
         );
         assert_eq!(migrate_path, "/api/v1/executions/exec-1/migrate");
         assert!(migrate_body.contains("\"target\":\"cloud\""));
+    }
+
+    #[test]
+    fn dual_surface_contract_uses_single_execution_api_and_control_plane() {
+        let (path, body) = dual_surface_experience_contract_endpoint();
+        assert_eq!(path, "/api/v1/dual-surface/contract");
+        assert!(body.contains("\"github_overlay_extension\""));
+        assert!(body.contains("\"portal\""));
+        assert!(body.contains("\"execution_api\":\"/api/v1/executions\""));
+        assert!(body.contains("\"control_plane\":\"unified\""));
+        assert!(body.contains("\"same_execution_ids\""));
+        assert!(body.contains("\"same_urls\""));
+        assert!(body.contains("\"same_state\""));
+    }
+
+    #[test]
+    fn overlay_repository_detection_extracts_owner_repo_and_branch() {
+        let context = detect_overlay_repository_context("https://github.com/org/repo")
+            .expect("github URL should parse");
+        assert_eq!(context.owner, "org");
+        assert_eq!(context.repo, "repo");
+        assert_eq!(context.branch, "main");
+
+        let branch_context =
+            detect_overlay_repository_context("https://github.com/org/repo/tree/release")
+                .expect("github URL with branch should parse");
+        assert_eq!(branch_context.branch, "release");
+
+        let nested_branch_context =
+            detect_overlay_repository_context("https://github.com/org/repo/tree/feature/ui")
+                .expect("github URL with nested branch should parse");
+        assert_eq!(nested_branch_context.branch, "feature/ui");
+    }
+
+    #[test]
+    fn extension_and_portal_execution_starts_share_ids_and_urls() {
+        let request = ExecutionStartRequest {
+            repo_url: "https://github.com/example/app".to_string(),
+            branch: Some("main".to_string()),
+            commit: None,
+        };
+        let (extension_path, extension_body) =
+            surface_execution_start_endpoint(ProductSurface::GitHubOverlayExtension, &request);
+        let (portal_path, portal_body) =
+            surface_execution_start_endpoint(ProductSurface::Portal, &request);
+
+        assert_eq!(extension_path, "/api/v1/executions");
+        assert_eq!(portal_path, "/api/v1/executions");
+
+        let extension_payload: serde_json::Value =
+            serde_json::from_str(&extension_body).expect("extension payload json");
+        let portal_payload: serde_json::Value =
+            serde_json::from_str(&portal_body).expect("portal payload json");
+
+        assert_eq!(
+            extension_payload
+                .get("execution_id")
+                .and_then(serde_json::Value::as_str),
+            portal_payload
+                .get("execution_id")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            extension_payload
+                .get("workspace_url")
+                .and_then(serde_json::Value::as_str),
+            portal_payload
+                .get("workspace_url")
+                .and_then(serde_json::Value::as_str)
+        );
+    }
+
+    #[test]
+    fn dual_surface_endpoints_expose_extension_actions_and_portal_navigation() {
+        let (extension_path, extension_body) = extension_overlay_actions_endpoint();
+        assert_eq!(extension_path, "/api/v1/surfaces/extension/actions");
+        assert!(extension_body.contains("\"run\""));
+        assert!(extension_body.contains("\"instant_run\""));
+        assert!(extension_body.contains("\"run_entrypoint\":\"/api/v1/executions\""));
+
+        let (portal_path, portal_body) = portal_navigation_endpoint();
+        assert_eq!(portal_path, "/api/v1/surfaces/portal/navigation");
+        assert!(portal_body.contains("\"dashboard\""));
+        assert!(portal_body.contains("\"workspaces\""));
+        assert!(portal_body.contains("\"workspace_path\":\"/api/v1/executions/{id}\""));
     }
 
     #[test]
