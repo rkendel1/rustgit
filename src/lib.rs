@@ -171,12 +171,60 @@ pub struct RuntimeAffinity {
     pub fallback_providers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExecutionTier {
+    LocalMachine,
+    LocalDocker,
+    ExternalProvider,
+    CloudPartner,
+    DDockitCloud,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCapability {
+    pub tier: ExecutionTier,
+    pub latency_score: u32,
+    pub cost_score: u32,
+    pub reliability_score: u32,
+    pub supported_runtimes: Vec<RuntimeType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscalationPolicy {
+    pub max_local_wait_ms: u64,
+    pub allow_external_fallback: bool,
+    pub allow_cloud_fallback: bool,
+    pub prefer_local: bool,
+}
+
+impl Default for EscalationPolicy {
+    fn default() -> Self {
+        Self {
+            max_local_wait_ms: 2_000,
+            allow_external_fallback: true,
+            allow_cloud_fallback: true,
+            prefer_local: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscalationTraceStep {
+    pub tier: ExecutionTier,
+    pub provider_id: Option<String>,
+    pub result: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSelection {
     pub runtime: RuntimeType,
     pub provider_id: String,
     pub reason: String,
     pub fallback_chain: Vec<RuntimeType>,
+    pub selected_tier: ExecutionTier,
+    pub escalation_trace: Vec<EscalationTraceStep>,
+    pub trace_uri: String,
+    pub trace_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +476,7 @@ impl NativeRuntimeEngine {
                 "native:{}:{}:{}",
                 request.command, resources.max_memory_mb, resources.max_cpu_millis
             ),
+            ..ProcessHandle::default()
         })
     }
 }
@@ -457,6 +506,7 @@ impl HybridExecutionBridge {
                 self.wasm.execute_module(wasm_bytes, &spec, wasi)?;
                 Ok(ProcessHandle {
                     pid_hint: format!("wasm:{}", ctx.execution_graph.cache_key()),
+                    ..ProcessHandle::default()
                 })
             }
             ExecutionTarget::Native | ExecutionTarget::Static => self.native.execute(
@@ -601,41 +651,214 @@ pub enum ExecutionTarget {
     Static,
 }
 
+#[derive(Default)]
+struct ProviderRegistry;
+
+#[derive(Debug)]
+struct ScoredProvider {
+    score: i32,
+    provider_id: String,
+}
+
+const TIER_LOCAL_MACHINE_PROXIMITY_SCORE: i32 = 50;
+const TIER_LOCAL_DOCKER_PROXIMITY_SCORE: i32 = 40;
+const TIER_EXTERNAL_PROVIDER_PROXIMITY_SCORE: i32 = 30;
+const TIER_CLOUD_PARTNER_PROXIMITY_SCORE: i32 = 20;
+const TIER_DDOCKIT_CLOUD_PROXIMITY_SCORE: i32 = 10;
+const PREFERRED_PROVIDER_AFFINITY_BONUS: i32 = 30;
+const FALLBACK_PROVIDER_AFFINITY_BONUS: i32 = 20;
+const CAPABILITY_MATCH_BONUS: i32 = 10;
+
+impl ProviderRegistry {
+    fn ranked_provider_ids_for_tier(
+        &self,
+        providers: &[Box<dyn ExecutionProvider + Send + Sync>],
+        tier: ExecutionTier,
+        ctx: &ExecutionContext,
+        affinity: &RuntimeAffinity,
+    ) -> Vec<String> {
+        let primary_runtime = ctx.analysis.classification.primary_runtime;
+        let mut scored = providers
+            .iter()
+            .filter_map(|provider| {
+                let capability = provider.capability();
+                if capability.tier != tier || !provider.can_run(ctx) {
+                    return None;
+                }
+                // Weighted score favors locality first, then capability/reliability, then cost/latency.
+                let proximity_score = match tier {
+                    ExecutionTier::LocalMachine => TIER_LOCAL_MACHINE_PROXIMITY_SCORE,
+                    ExecutionTier::LocalDocker => TIER_LOCAL_DOCKER_PROXIMITY_SCORE,
+                    ExecutionTier::ExternalProvider => TIER_EXTERNAL_PROVIDER_PROXIMITY_SCORE,
+                    ExecutionTier::CloudPartner => TIER_CLOUD_PARTNER_PROXIMITY_SCORE,
+                    ExecutionTier::DDockitCloud => TIER_DDOCKIT_CLOUD_PROXIMITY_SCORE,
+                };
+                let affinity_bonus = if provider.id() == affinity.preferred_provider {
+                    PREFERRED_PROVIDER_AFFINITY_BONUS
+                } else if affinity
+                    .fallback_providers
+                    .iter()
+                    .any(|fallback| fallback == provider.id())
+                {
+                    FALLBACK_PROVIDER_AFFINITY_BONUS
+                } else {
+                    0
+                };
+                let capability_bonus = if capability.supported_runtimes.contains(&primary_runtime) {
+                    CAPABILITY_MATCH_BONUS
+                } else {
+                    0
+                };
+                let score = proximity_score
+                    + capability.reliability_score as i32
+                    + affinity_bonus
+                    + capability_bonus
+                    - capability.latency_score as i32
+                    - capability.cost_score as i32;
+                Some(ScoredProvider {
+                    score,
+                    provider_id: provider.id().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
+        scored.into_iter().map(|entry| entry.provider_id).collect()
+    }
+}
+
 pub struct ExecutionRouter {
     providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>,
+    escalation_policy: EscalationPolicy,
+    provider_registry: ProviderRegistry,
 }
 
 impl ExecutionRouter {
     pub fn new(providers: Vec<Box<dyn ExecutionProvider + Send + Sync>>) -> Self {
-        Self { providers }
+        Self {
+            providers,
+            escalation_policy: EscalationPolicy::default(),
+            provider_registry: ProviderRegistry,
+        }
+    }
+
+    fn tier_order() -> [ExecutionTier; 5] {
+        [
+            ExecutionTier::LocalMachine,
+            ExecutionTier::LocalDocker,
+            ExecutionTier::ExternalProvider,
+            ExecutionTier::CloudPartner,
+            ExecutionTier::DDockitCloud,
+        ]
+    }
+
+    fn execution_trace_uri(workspace_id: &str) -> String {
+        let safe_workspace_id = Self::sanitized_workspace_id(workspace_id);
+        format!("ddockit://workspace/{safe_workspace_id}/trace")
+    }
+
+    fn execution_trace_url(workspace_id: &str) -> String {
+        let safe_workspace_id = Self::sanitized_workspace_id(workspace_id);
+        format!("https://app.ddockit.dev/workspaces/{safe_workspace_id}/execution-path")
+    }
+
+    fn sanitized_workspace_id(workspace_id: &str) -> String {
+        let mut encoded = String::with_capacity(workspace_id.len());
+        for byte in workspace_id.bytes() {
+            let ch = byte as char;
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                encoded.push(ch);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        if encoded.is_empty() {
+            "workspace-empty".to_string()
+        } else {
+            encoded
+        }
+    }
+
+    fn tier_allowed_by_policy(&self, tier: ExecutionTier) -> bool {
+        match tier {
+            ExecutionTier::LocalMachine | ExecutionTier::LocalDocker => true,
+            ExecutionTier::ExternalProvider => self.escalation_policy.allow_external_fallback,
+            ExecutionTier::CloudPartner | ExecutionTier::DDockitCloud => {
+                self.escalation_policy.allow_cloud_fallback
+            }
+        }
     }
 
     pub fn select(&self, ctx: &ExecutionContext) -> Result<RuntimeSelection> {
         let affinity = &ctx.analysis.execution_profile.runtime_affinity;
-        let mut ordered_provider_ids = vec![affinity.preferred_provider.clone()];
-        ordered_provider_ids.extend(affinity.fallback_providers.iter().cloned());
-        let mut seen_provider_ids = ordered_provider_ids.iter().cloned().collect::<HashSet<_>>();
-        for provider in &self.providers {
-            let provider_id = provider.id().to_string();
-            if seen_provider_ids.insert(provider_id.clone()) {
-                ordered_provider_ids.push(provider_id);
-            }
-        }
-
+        let mut escalation_trace = Vec::new();
         let mut matched_provider_ids = Vec::new();
-        for provider_id in ordered_provider_ids {
-            let Some(provider) = self.provider_by_id(&provider_id) else {
+        let mut selected_provider_id = None::<String>;
+        let mut selected_tier = None::<ExecutionTier>;
+
+        for tier in Self::tier_order() {
+            if !self.tier_allowed_by_policy(tier) {
+                escalation_trace.push(EscalationTraceStep {
+                    tier,
+                    provider_id: None,
+                    result: "skipped by escalation policy".to_string(),
+                });
                 continue;
-            };
-            if provider.can_handle(ctx) {
-                matched_provider_ids.push(provider.id().to_string());
+            }
+
+            let ranked_provider_ids = self.provider_registry.ranked_provider_ids_for_tier(
+                &self.providers,
+                tier,
+                ctx,
+                affinity,
+            );
+            if ranked_provider_ids.is_empty() {
+                escalation_trace.push(EscalationTraceStep {
+                    tier,
+                    provider_id: None,
+                    result: "no available provider".to_string(),
+                });
+                continue;
+            }
+
+            for provider_id in ranked_provider_ids {
+                matched_provider_ids.push(provider_id.clone());
+                let result = if selected_provider_id.is_none() {
+                    selected_provider_id = Some(provider_id.clone());
+                    selected_tier = Some(tier);
+                    "selected"
+                } else {
+                    "fallback candidate"
+                };
+                escalation_trace.push(EscalationTraceStep {
+                    tier,
+                    provider_id: Some(provider_id),
+                    result: result.to_string(),
+                });
+            }
+            if selected_provider_id.is_some() {
+                break;
             }
         }
 
-        let selected_provider_id = matched_provider_ids.first().cloned().ok_or_else(|| {
+        let selected_provider_id = selected_provider_id.ok_or_else(|| {
+            let attempted = escalation_trace
+                .iter()
+                .map(|step| format!("{:?}:{}", step.tier, step.result))
+                .collect::<Vec<_>>()
+                .join(", ");
             RuntimeError::UnsupportedRepository(format!(
-                "no execution provider matched for workspace {} with framework {:?}",
-                ctx.workspace_id, ctx.analysis.framework
+                "no execution provider matched for workspace {} with framework {:?}; attempts: {}",
+                ctx.workspace_id, ctx.analysis.framework, attempted
+            ))
+        })?;
+        let selected_tier = selected_tier.ok_or_else(|| {
+            RuntimeError::CommandFailed(format!(
+                "internal error: selected_tier missing for workspace {} provider {}",
+                ctx.workspace_id, selected_provider_id
             ))
         })?;
 
@@ -654,13 +877,13 @@ impl ExecutionRouter {
 
         let reason = if selected_provider_id == affinity.preferred_provider {
             format!(
-                "selected preferred runtime provider `{}` from runtime affinity",
-                selected_provider_id
+                "selected preferred runtime provider `{}` in {:?}",
+                selected_provider_id, selected_tier
             )
         } else {
             format!(
-                "preferred provider `{}` unavailable; selected fallback provider `{}`",
-                affinity.preferred_provider, selected_provider_id
+                "preferred provider `{}` unavailable; escalated to `{}` in {:?}",
+                affinity.preferred_provider, selected_provider_id, selected_tier
             )
         };
 
@@ -669,6 +892,10 @@ impl ExecutionRouter {
             provider_id: selected_provider_id,
             reason,
             fallback_chain,
+            selected_tier,
+            escalation_trace,
+            trace_uri: Self::execution_trace_uri(&ctx.workspace_id),
+            trace_url: Self::execution_trace_url(&ctx.workspace_id),
         })
     }
 
@@ -684,7 +911,11 @@ impl ExecutionRouter {
         let handle = provider.start(ctx)?;
         let health = provider.health(&handle)?;
         if health.healthy {
-            Ok(handle)
+            Ok(ProcessHandle {
+                pid_hint: handle.pid_hint,
+                trace_uri: Some(selection.trace_uri),
+                trace_url: Some(selection.trace_url),
+            })
         } else {
             match provider.stop(&handle) {
                 Ok(()) => Err(RuntimeError::CommandFailed(format!(
@@ -1985,9 +2216,11 @@ impl CacheKeyEngine {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProcessHandle {
     pub pid_hint: String,
+    pub trace_uri: Option<String>,
+    pub trace_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2442,10 +2675,33 @@ pub struct BuildPlanner;
 pub trait ExecutionProvider {
     /// Stable provider identifier used by runtime affinity and router selection.
     fn id(&self) -> &'static str;
+    /// Execution tier owned by this provider.
+    fn tier(&self) -> ExecutionTier;
     /// Runtime family owned by this provider.
     fn runtime(&self) -> RuntimeType;
+    /// Provider capability metadata used for ranked selection.
+    fn capability(&self) -> ProviderCapability {
+        let (latency_score, cost_score, reliability_score) = match self.tier() {
+            ExecutionTier::LocalMachine => (10, 5, 35),
+            ExecutionTier::LocalDocker => (15, 10, 30),
+            ExecutionTier::ExternalProvider => (20, 20, 25),
+            ExecutionTier::CloudPartner => (25, 30, 25),
+            ExecutionTier::DDockitCloud => (30, 35, 30),
+        };
+        ProviderCapability {
+            tier: self.tier(),
+            latency_score,
+            cost_score,
+            reliability_score,
+            supported_runtimes: vec![self.runtime()],
+        }
+    }
     /// Returns true when this provider owns runtime execution for `ctx`.
     fn can_handle(&self, ctx: &ExecutionContext) -> bool;
+    /// Returns true when this provider can run `req`.
+    fn can_run(&self, req: &ExecutionContext) -> bool {
+        self.can_handle(req)
+    }
     /// Mutates provider-specific runtime details before start.
     fn prepare(&self, ctx: &mut ExecutionContext) -> Result<()>;
     /// Starts execution from an immutable execution contract.
@@ -4163,6 +4419,10 @@ impl ExecutionProvider for WasmExecutionProvider {
         "WasmExecutionProvider"
     }
 
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalMachine
+    }
+
     fn runtime(&self) -> RuntimeType {
         RuntimeType::Wasm
     }
@@ -4241,6 +4501,7 @@ impl ExecutionProvider for WasmExecutionProvider {
                     runtime.instantiate(&execution_context)?;
                     last_handle = Some(ProcessHandle {
                         pid_hint: format!("wasm:{}:{}", binding.node_id, binding.artifact_key),
+                        ..ProcessHandle::default()
                     });
                 }
                 ExecutionTarget::Native | ExecutionTarget::Static => {
@@ -4288,6 +4549,10 @@ impl ExecutionProvider for NodeRuntimeProvider {
         "NodeRuntimeProvider"
     }
 
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
     fn runtime(&self) -> RuntimeType {
         RuntimeType::Node
     }
@@ -4317,6 +4582,7 @@ impl ExecutionProvider for NodeRuntimeProvider {
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
             pid_hint: format!("node:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
         })
     }
 
@@ -4335,6 +4601,10 @@ impl ExecutionProvider for NodeRuntimeProvider {
 impl ExecutionProvider for RustRuntimeProvider {
     fn id(&self) -> &'static str {
         "RustRuntimeProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::ExternalProvider
     }
 
     fn runtime(&self) -> RuntimeType {
@@ -4359,6 +4629,7 @@ impl ExecutionProvider for RustRuntimeProvider {
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
             pid_hint: format!("rust:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
         })
     }
 
@@ -4379,6 +4650,10 @@ impl ExecutionProvider for StaticRuntimeProvider {
         "StaticRuntimeProvider"
     }
 
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::DDockitCloud
+    }
+
     fn runtime(&self) -> RuntimeType {
         RuntimeType::Static
     }
@@ -4394,6 +4669,7 @@ impl ExecutionProvider for StaticRuntimeProvider {
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
             pid_hint: format!("static:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
         })
     }
 
@@ -6518,6 +6794,15 @@ mod tests {
         let selection = router.select(&ctx).expect("select preferred provider");
         assert_eq!(selection.provider_id, "WasmExecutionProvider");
         assert_eq!(selection.runtime, RuntimeType::Wasm);
+        assert_eq!(selection.selected_tier, ExecutionTier::LocalMachine);
+        assert_eq!(
+            selection.trace_uri,
+            "ddockit://workspace/ws-router-preferred/trace"
+        );
+        assert_eq!(
+            selection.trace_url,
+            "https://app.ddockit.dev/workspaces/ws-router-preferred/execution-path"
+        );
     }
 
     #[test]
@@ -6570,6 +6855,71 @@ mod tests {
 
         let handle = engine.start(&mut ctx).expect("engine should use fallback");
         assert!(handle.pid_hint.starts_with("rust:"));
+        assert_eq!(
+            handle.trace_uri.as_deref(),
+            Some("ddockit://workspace/ws-router-fallback/trace")
+        );
+        assert_eq!(
+            handle.trace_url.as_deref(),
+            Some("https://app.ddockit.dev/workspaces/ws-router-fallback/execution-path")
+        );
+    }
+
+    #[test]
+    fn execution_router_escalates_through_tiers_and_records_trace() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let mut analysis =
+            test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Rust);
+        analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+            preferred_provider: "NodeRuntimeProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        };
+        let ctx = ExecutionContext {
+            workspace_id: "ws-escalation-trace".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            analysis,
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+        let router = ExecutionRouter::new(vec![
+            Box::new(WasmExecutionProvider),
+            Box::new(NodeRuntimeProvider),
+            Box::new(RustRuntimeProvider),
+            Box::new(StaticRuntimeProvider),
+        ]);
+
+        let selection = router.select(&ctx).expect("select escalated provider");
+        assert_eq!(selection.provider_id, "RustRuntimeProvider");
+        assert_eq!(selection.selected_tier, ExecutionTier::ExternalProvider);
+        assert!(selection
+            .escalation_trace
+            .iter()
+            .any(|step| step.tier == ExecutionTier::LocalMachine && step.provider_id.is_none()));
+        assert!(selection.escalation_trace.iter().any(|step| {
+            step.tier == ExecutionTier::ExternalProvider
+                && step.provider_id.as_deref() == Some("RustRuntimeProvider")
+                && step.result == "selected"
+        }));
     }
 
     #[test]
