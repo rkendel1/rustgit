@@ -761,12 +761,12 @@ impl ExecutionRouter {
         format!("ddockit://workspace/{safe_workspace_id}/trace")
     }
 
-    fn execution_id(workspace_id: &str) -> ExecutionId {
+    fn execution_id_from_workspace(workspace_id: &str) -> ExecutionId {
         Self::sanitized_workspace_id(workspace_id)
     }
 
     fn execution_trace_url(workspace_id: &str) -> String {
-        let execution_id = Self::execution_id(workspace_id);
+        let execution_id = Self::execution_id_from_workspace(workspace_id);
         ExecutionIdentity::canonical_url_for(&execution_id)
     }
 
@@ -891,7 +891,7 @@ impl ExecutionRouter {
                 affinity.preferred_provider, selected_provider_id, selected_tier
             )
         };
-        let execution_id = Self::execution_id(&ctx.workspace_id);
+        let execution_id = Self::execution_id_from_workspace(&ctx.workspace_id);
 
         Ok(RuntimeSelection {
             runtime: provider.runtime(),
@@ -2592,9 +2592,7 @@ impl ExecutionGateway {
     ) -> Option<ExecutionRoute> {
         let requested_execution_id = parse_execution_id(canonical_request_url)?;
         let execution_id = match session_id.and_then(|id| self.affinity_by_session.get(id)) {
-            Some(affinity) if affinity.execution_id == requested_execution_id => {
-                affinity.execution_id.clone()
-            }
+            Some(affinity) if affinity.execution_id == requested_execution_id => requested_execution_id,
             Some(_) => return None,
             None => requested_execution_id,
         };
@@ -2633,7 +2631,6 @@ impl ExecutionRebindingEngine {
             to: to_tier,
         });
         let Some(identity) = resolver.rebind(execution_id, to_tier, endpoint) else {
-            trace.events.push(TraceEvent::HealthCheckFailed);
             return false;
         };
         trace.events.push(TraceEvent::UrlRebound {
