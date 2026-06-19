@@ -4134,11 +4134,157 @@ pub struct NetworkPolicy {
 pub type WorkspaceId = String;
 pub type RepositoryId = String;
 pub type UserId = String;
+pub type OrganizationId = String;
 pub type ExecutionId = String;
 pub type WorkerId = String;
 pub type DateTime = u64;
 pub type RuntimeKind = RuntimeType;
 pub type ExecutionUrl = String;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthProvider {
+    Github,
+    Google,
+    Microsoft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrganizationPlan {
+    Free,
+    Pro,
+    Enterprise,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MembershipRole {
+    Owner,
+    Admin,
+    Developer,
+    Viewer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    WorkspaceCreate,
+    WorkspaceRun,
+    WorkspaceDelete,
+    ExecutionView,
+    OrgAdmin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceVisibility {
+    Private,
+    Org,
+    Public,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserIdentity {
+    pub user_id: UserId,
+    pub email: String,
+    pub name: String,
+    pub auth_provider: AuthProvider,
+    pub created_at: DateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationIdentity {
+    pub org_id: OrganizationId,
+    pub name: String,
+    pub slug: String,
+    pub plan: OrganizationPlan,
+    pub created_at: DateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationMembership {
+    pub user_id: UserId,
+    pub org_id: OrganizationId,
+    pub role: MembershipRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationQuota {
+    pub max_workspaces: u32,
+    pub max_concurrent_executions: u32,
+    pub max_runtime_minutes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub user_id: UserId,
+    pub org_id: OrganizationId,
+    pub action: String,
+    pub resource: String,
+    pub timestamp: DateTime,
+    pub ip_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthClaims {
+    pub user_id: UserId,
+    pub org_id: OrganizationId,
+    pub role: MembershipRole,
+    pub permissions: Vec<Permission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthContext {
+    pub user_id: UserId,
+    pub org_id: OrganizationId,
+    pub role: MembershipRole,
+    pub permissions: Vec<Permission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RbacPolicyEngine;
+
+impl RbacPolicyEngine {
+    pub fn role_permissions(role: MembershipRole) -> Vec<Permission> {
+        match role {
+            MembershipRole::Owner | MembershipRole::Admin => vec![
+                Permission::WorkspaceCreate,
+                Permission::WorkspaceRun,
+                Permission::WorkspaceDelete,
+                Permission::ExecutionView,
+                Permission::OrgAdmin,
+            ],
+            MembershipRole::Developer => vec![
+                Permission::WorkspaceCreate,
+                Permission::WorkspaceRun,
+                Permission::ExecutionView,
+            ],
+            MembershipRole::Viewer => vec![Permission::ExecutionView],
+        }
+    }
+
+    pub fn authorize(
+        claims: &AuthClaims,
+        org_id: &str,
+        required: &[Permission],
+    ) -> Option<AuthContext> {
+        if claims.org_id != org_id {
+            return None;
+        }
+        let granted: std::collections::HashSet<Permission> =
+            claims.permissions.iter().copied().collect();
+        if required.iter().any(|permission| !granted.contains(permission)) {
+            return None;
+        }
+        Some(AuthContext {
+            user_id: claims.user_id.clone(),
+            org_id: claims.org_id.clone(),
+            role: claims.role,
+            permissions: claims.permissions.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionState {
@@ -4244,7 +4390,9 @@ pub struct WorkspaceQuota {
 pub struct WorkspaceRecord {
     pub workspace_id: WorkspaceId,
     pub repository_id: RepositoryId,
-    pub owner_id: UserId,
+    pub org_id: OrganizationId,
+    pub created_by: UserId,
+    pub visibility: WorkspaceVisibility,
     pub execution_id: ExecutionId,
     pub assigned_worker: Option<WorkerId>,
     pub assigned_runtime: RuntimeKind,
@@ -4597,6 +4745,8 @@ pub struct RepositoryAnalyzeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionStartRequest {
+    pub org_id: String,
+    pub user_id: String,
     pub repo_url: String,
     pub branch: Option<String>,
     pub commit: Option<String>,
@@ -5109,10 +5259,118 @@ pub fn execution_plan_endpoint(analysis: &RepositoryAnalysis) -> (String, String
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthLoginRequest {
+    pub user: UserIdentity,
+    pub org_id: String,
+    pub role: MembershipRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationCreateRequest {
+    pub name: String,
+    pub slug: String,
+    pub plan: OrganizationPlan,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganizationMembershipCreateRequest {
+    pub org_id: String,
+    pub user_id: String,
+    pub role: MembershipRole,
+}
+
+pub fn auth_login_endpoint(request: &AuthLoginRequest) -> (String, String) {
+    let claims = AuthClaims {
+        user_id: request.user.user_id.clone(),
+        org_id: request.org_id.clone(),
+        role: request.role,
+        permissions: RbacPolicyEngine::role_permissions(request.role),
+    };
+    (
+        "/auth/login".to_string(),
+        json!({
+            "provider": request.user.auth_provider,
+            "token_type": "jwt",
+            "claims": claims
+        })
+        .to_string(),
+    )
+}
+
+pub fn auth_logout_endpoint(context: &AuthContext) -> (String, String) {
+    (
+        "/auth/logout".to_string(),
+        json!({
+            "user_id": &context.user_id,
+            "org_id": &context.org_id,
+            "status": "logged_out"
+        })
+        .to_string(),
+    )
+}
+
+pub fn auth_me_endpoint(context: &AuthContext) -> (String, String) {
+    (
+        "/auth/me".to_string(),
+        json!({
+            "user_id": &context.user_id,
+            "org_id": &context.org_id,
+            "role": context.role,
+            "permissions": &context.permissions
+        })
+        .to_string(),
+    )
+}
+
+pub fn org_create_endpoint(request: &OrganizationCreateRequest) -> (String, String) {
+    let org_id = format!("org-{}", hash_key(&format!("{}:{}", request.slug, request.created_by)));
+    (
+        "/orgs".to_string(),
+        json!({
+            "org_id": org_id,
+            "name": &request.name,
+            "slug": &request.slug,
+            "plan": request.plan,
+            "created_by": &request.created_by
+        })
+        .to_string(),
+    )
+}
+
+pub fn org_get_endpoint(org: &OrganizationIdentity) -> (String, String) {
+    (
+        format!("/orgs/{}", org.org_id),
+        json!({
+            "org_id": &org.org_id,
+            "name": &org.name,
+            "slug": &org.slug,
+            "plan": org.plan,
+            "created_at": org.created_at
+        })
+        .to_string(),
+    )
+}
+
+pub fn org_add_member_endpoint(request: &OrganizationMembershipCreateRequest) -> (String, String) {
+    (
+        format!("/orgs/{}/members", request.org_id),
+        json!({
+            "org_id": &request.org_id,
+            "user_id": &request.user_id,
+            "role": request.role
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCreateRequest {
     pub repository_id: String,
     pub commit_hash: String,
-    pub owner_id: String,
+    pub org_id: String,
+    pub created_by: String,
+    pub visibility: WorkspaceVisibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5124,15 +5382,20 @@ pub struct WorkspaceRuntimeRequest {
 }
 
 pub fn workspace_create_endpoint(request: &WorkspaceCreateRequest) -> (String, String) {
-    let workspace_seed = format!("{}:{}", request.repository_id, request.commit_hash);
+    let workspace_seed = format!(
+        "{}:{}:{}",
+        request.org_id, request.repository_id, request.commit_hash
+    );
     let workspace_id = ExecutionRouter::sanitized_workspace_id(&hash_key(&workspace_seed)[..12]);
     (
         "/workspaces".to_string(),
         json!({
             "workspace_id": workspace_id.clone(),
+            "org_id": &request.org_id,
             "repository_id": &request.repository_id,
             "commit_hash": &request.commit_hash,
-            "owner_id": &request.owner_id,
+            "created_by": &request.created_by,
+            "visibility": request.visibility,
             "status": "pending",
             "workspace_url": stable_workspace_url(&workspace_id, true).0
         })
@@ -5147,7 +5410,10 @@ pub fn workspace_resolve_endpoint(workspace_id: &str, router: &WorkspaceRouter) 
         format!("/workspaces/{workspace_id}"),
         json!({
             "workspace_id": workspace_id,
+            "org_id": workspace.map(|record| record.org_id.as_str()),
             "repository_id": workspace.map(|record| record.repository_id.as_str()),
+            "created_by": workspace.map(|record| record.created_by.as_str()),
+            "visibility": workspace.map(|record| record.visibility),
             "status": workspace.map(|record| format!("{:?}", record.state)),
             "url": workspace.map(|record| record.assigned_url.0.as_str()),
             "runtime_type": binding.map(|entry| format!("{:?}", entry.runtime_type)),
@@ -5192,21 +5458,90 @@ pub fn workspace_migrate_endpoint(
     )
 }
 
+pub fn workspaces_list_endpoint(org_id: &str, router: &WorkspaceRouter) -> (String, String) {
+    let workspaces = router
+        .registry
+        .all()
+        .into_iter()
+        .filter(|record| record.org_id == org_id)
+        .map(|record| {
+            json!({
+                "workspace_id": record.workspace_id,
+                "org_id": record.org_id,
+                "created_by": record.created_by,
+                "visibility": record.visibility,
+                "status": format!("{:?}", record.state),
+                "url": record.assigned_url.0
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        format!("/workspaces?org_id={org_id}"),
+        json!({
+            "org_id": org_id,
+            "workspaces": workspaces
+        })
+        .to_string(),
+    )
+}
+
+pub fn workspace_delete_endpoint(workspace_id: &str, org_id: &str) -> (String, String) {
+    (
+        format!("/workspaces/{workspace_id}"),
+        json!({
+            "workspace_id": workspace_id,
+            "org_id": org_id,
+            "status": "deleted"
+        })
+        .to_string(),
+    )
+}
+
 pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, String) {
     let execution_seed = format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}|{}",
+        request.org_id,
+        request.user_id,
         request.repo_url,
         request.branch.as_deref().unwrap_or_default(),
         request.commit.as_deref().unwrap_or_default()
     );
     let execution_id = format!("exec-{}", hash_key(&execution_seed));
     let workspace_slug = ExecutionRouter::sanitized_workspace_id(&execution_id);
+    let workspace_id = workspace_slug.clone();
     (
         "/api/v1/executions".to_string(),
         json!({
             "execution_id": execution_id,
+            "org_id": &request.org_id,
+            "user_id": &request.user_id,
+            "workspace_id": workspace_id,
             "status": "starting",
             "workspace_url": format!("https://workspace-{workspace_slug}.trythissoftware.com")
+        })
+        .to_string(),
+    )
+}
+
+pub fn executions_list_endpoint(org_id: &str, executions: &[EidbExecutionRecord]) -> (String, String) {
+    let scoped = executions
+        .iter()
+        .filter(|execution| execution.org_id == org_id)
+        .map(|execution| {
+            json!({
+                "execution_id": &execution.execution_id,
+                "org_id": &execution.org_id,
+                "user_id": &execution.user_id,
+                "workspace_id": &execution.workspace_id,
+                "status": &execution.status
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        format!("/executions?org_id={org_id}"),
+        json!({
+            "org_id": org_id,
+            "executions": scoped
         })
         .to_string(),
     )
@@ -5465,11 +5800,11 @@ pub fn extension_overlay_ui_endpoint() -> (String, String) {
 
 const PORTAL_INITIAL_NAVIGATION: &[&str] = &[
     "dashboard",
+    "organization",
+    "members",
     "workspaces",
-    "repositories",
     "executions",
-    "agents",
-    "analytics",
+    "billing",
     "settings",
 ];
 
@@ -5484,6 +5819,7 @@ pub fn portal_navigation_endpoint() -> (String, String) {
             "surface": ProductSurface::Portal.as_str(),
             "navigation": portal_initial_navigation(),
             "workspace_path": "/api/v1/executions/{id}",
+            "org_switcher": ["Org A", "Org B", "Create Org"],
             "ui_endpoint": "/api/v1/surfaces/portal/ui"
         })
         .to_string(),
@@ -5981,6 +6317,9 @@ pub struct EidbTopologyRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EidbExecutionRecord {
     pub execution_id: String,
+    pub org_id: String,
+    pub user_id: String,
+    pub workspace_id: String,
     pub repository_id: String,
     pub commit_hash: String,
     pub started_at: u64,
@@ -6389,16 +6728,19 @@ impl WorkspaceRouter {
         &mut self,
         repository_id: &str,
         commit_hash: &str,
-        owner_id: &str,
+        org_id: &str,
+        created_by: &str,
         now: DateTime,
     ) -> WorkspaceRecord {
         let workspace_id = ExecutionRouter::sanitized_workspace_id(&hash_key(&format!(
-            "{repository_id}:{commit_hash}"
+            "{org_id}:{repository_id}:{commit_hash}"
         ))[..12]);
         let record = WorkspaceRecord {
             workspace_id: workspace_id.clone(),
             repository_id: repository_id.to_string(),
-            owner_id: owner_id.to_string(),
+            org_id: org_id.to_string(),
+            created_by: created_by.to_string(),
+            visibility: WorkspaceVisibility::Private,
             execution_id: format!("exec-{}", hash_key(&format!("{workspace_id}:{commit_hash}"))),
             assigned_worker: None,
             assigned_runtime: RuntimeType::Unknown,
@@ -9626,10 +9968,18 @@ pub mod ucpe_ti {
 impl Default for RestApiSpec {
     fn default() -> Self {
         let mut routes = vec![
+            "POST /auth/login",
+            "POST /auth/logout",
+            "GET /auth/me",
+            "POST /orgs",
+            "GET /orgs/{org_id}",
+            "POST /orgs/{org_id}/members",
             "POST /workspaces",
+            "GET /workspaces?org_id={org_id}",
             "GET /workspaces/{id}",
             "POST /workspaces/{id}/bind",
             "POST /workspaces/{id}/migrate",
+            "DELETE /workspaces/{id}",
             "POST /workspaces/{id}/stop",
             "POST /workspaces/{id}/restart",
             "GET /workspaces/{id}/logs",
@@ -9644,6 +9994,7 @@ impl Default for RestApiSpec {
             "POST /warm-pool/prewarm",
             "GET /repo/{id}/commits",
             "POST /execute/recover",
+            "GET /executions?org_id={org_id}",
             "POST /api/v1/repositories/analyze",
             "POST /api/v1/execution/plan",
             "POST /api/v1/executions",
@@ -13460,10 +13811,19 @@ dependencies:
     #[test]
     fn rest_api_spec_includes_execution_api_layer_routes() {
         let spec = RestApiSpec::default();
+        assert!(spec.routes.contains(&"POST /auth/login"));
+        assert!(spec.routes.contains(&"POST /auth/logout"));
+        assert!(spec.routes.contains(&"GET /auth/me"));
+        assert!(spec.routes.contains(&"POST /orgs"));
+        assert!(spec.routes.contains(&"GET /orgs/{org_id}"));
+        assert!(spec.routes.contains(&"POST /orgs/{org_id}/members"));
         assert!(spec.routes.contains(&"POST /workspaces"));
+        assert!(spec.routes.contains(&"GET /workspaces?org_id={org_id}"));
         assert!(spec.routes.contains(&"GET /workspaces/{id}"));
         assert!(spec.routes.contains(&"POST /workspaces/{id}/bind"));
         assert!(spec.routes.contains(&"POST /workspaces/{id}/migrate"));
+        assert!(spec.routes.contains(&"DELETE /workspaces/{id}"));
+        assert!(spec.routes.contains(&"GET /executions?org_id={org_id}"));
         assert!(spec.routes.contains(&"POST /api/v1/repositories/analyze"));
         assert!(spec.routes.contains(&"POST /api/v1/execution/plan"));
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
@@ -13674,7 +14034,9 @@ dependencies:
         registry.upsert(WorkspaceRecord {
             workspace_id: "a1b2".to_string(),
             repository_id: "repo-1".to_string(),
-            owner_id: "user-1".to_string(),
+            org_id: "org-1".to_string(),
+            created_by: "user-1".to_string(),
+            visibility: WorkspaceVisibility::Private,
             execution_id: "exec-1".to_string(),
             assigned_worker: Some("worker-3".to_string()),
             assigned_runtime: RuntimeType::Node,
@@ -13708,7 +14070,7 @@ dependencies:
     #[test]
     fn workspace_router_migrates_runtime_without_url_change() {
         let mut router = WorkspaceRouter::default();
-        let workspace = router.create_workspace("repo-1", "aaaaaaa", "user-1", 10);
+        let workspace = router.create_workspace("repo-1", "aaaaaaa", "org-1", "user-1", 10);
         assert!(router.bind_runtime(
             &workspace.workspace_id,
             WorkspaceRuntimeBinding {
@@ -13956,7 +14318,9 @@ dependencies:
         registry.upsert(WorkspaceRecord {
             workspace_id: "z9y8".to_string(),
             repository_id: "repo-2".to_string(),
-            owner_id: "user-2".to_string(),
+            org_id: "org-2".to_string(),
+            created_by: "user-2".to_string(),
+            visibility: WorkspaceVisibility::Private,
             execution_id: "exec-2".to_string(),
             assigned_worker: Some("worker-a".to_string()),
             assigned_runtime: RuntimeType::Rust,
@@ -14161,11 +14525,15 @@ services:
         assert!(plan_body.contains("\"startup_order\":[\"backend\"]"));
 
         let (start_path, start_body) = executions_start_endpoint(&ExecutionStartRequest {
+            org_id: "org-1".to_string(),
+            user_id: "user-1".to_string(),
             repo_url: "https://github.com/example/app".to_string(),
             branch: Some("main".to_string()),
             commit: None,
         });
         assert_eq!(start_path, "/api/v1/executions");
+        assert!(start_body.contains("\"org_id\":\"org-1\""));
+        assert!(start_body.contains("\"user_id\":\"user-1\""));
         assert!(start_body.contains("\"status\":\"starting\""));
         assert!(start_body.contains("\"workspace_url\":\"https://workspace-"));
 
@@ -14173,13 +14541,16 @@ services:
             workspace_create_endpoint(&WorkspaceCreateRequest {
                 repository_id: "repo-1".to_string(),
                 commit_hash: "aaaaaaa".to_string(),
-                owner_id: "user-1".to_string(),
+                org_id: "org-1".to_string(),
+                created_by: "user-1".to_string(),
+                visibility: WorkspaceVisibility::Private,
             });
         assert_eq!(workspace_create_path, "/workspaces");
+        assert!(workspace_create_body.contains("\"org_id\":\"org-1\""));
         assert!(workspace_create_body.contains("\"workspace_url\":\"workspace-"));
 
         let mut workspace_router = WorkspaceRouter::default();
-        let workspace = workspace_router.create_workspace("repo-1", "aaaaaaa", "user-1", 1);
+        let workspace = workspace_router.create_workspace("repo-1", "aaaaaaa", "org-1", "user-1", 1);
         let (workspace_resolve_path, workspace_resolve_body) =
             workspace_resolve_endpoint(&workspace.workspace_id, &workspace_router);
         assert_eq!(
@@ -14187,6 +14558,7 @@ services:
             format!("/workspaces/{}", workspace.workspace_id)
         );
         assert!(workspace_resolve_body.contains("\"workspace_id\""));
+        assert!(workspace_resolve_body.contains("\"org_id\":\"org-1\""));
 
         let (workspace_bind_path, workspace_bind_body) = workspace_bind_endpoint(
             &workspace.workspace_id,
@@ -14242,6 +14614,123 @@ services:
         );
         assert_eq!(migrate_path, "/api/v1/executions/exec-1/migrate");
         assert!(migrate_body.contains("\"target\":\"cloud\""));
+
+        let (workspace_list_path, workspace_list_body) =
+            workspaces_list_endpoint("org-1", &workspace_router);
+        assert_eq!(workspace_list_path, "/workspaces?org_id=org-1");
+        assert!(workspace_list_body.contains("\"workspace_id\""));
+
+        let (workspace_delete_path, workspace_delete_body) =
+            workspace_delete_endpoint(&workspace.workspace_id, "org-1");
+        assert_eq!(
+            workspace_delete_path,
+            format!("/workspaces/{}", workspace.workspace_id)
+        );
+        assert!(workspace_delete_body.contains("\"status\":\"deleted\""));
+    }
+
+    #[test]
+    fn auth_and_org_endpoints_emit_org_scoped_identity_payloads() {
+        let user = UserIdentity {
+            user_id: "user-1".to_string(),
+            email: "user@example.com".to_string(),
+            name: "User One".to_string(),
+            auth_provider: AuthProvider::Github,
+            created_at: 1,
+        };
+        let (login_path, login_body) = auth_login_endpoint(&AuthLoginRequest {
+            user: user.clone(),
+            org_id: "org-1".to_string(),
+            role: MembershipRole::Admin,
+        });
+        assert_eq!(login_path, "/auth/login");
+        assert!(login_body.contains("\"org_id\":\"org-1\""));
+        assert!(login_body.contains("workspace_create"));
+
+        let claims = AuthClaims {
+            user_id: "user-1".to_string(),
+            org_id: "org-1".to_string(),
+            role: MembershipRole::Admin,
+            permissions: RbacPolicyEngine::role_permissions(MembershipRole::Admin),
+        };
+        let context = RbacPolicyEngine::authorize(
+            &claims,
+            "org-1",
+            &[Permission::WorkspaceDelete, Permission::OrgAdmin],
+        )
+        .expect("admin should be authorized");
+        assert!(RbacPolicyEngine::authorize(&claims, "org-2", &[Permission::OrgAdmin]).is_none());
+
+        let (me_path, me_body) = auth_me_endpoint(&context);
+        assert_eq!(me_path, "/auth/me");
+        assert!(me_body.contains("\"role\":\"admin\""));
+
+        let (logout_path, logout_body) = auth_logout_endpoint(&context);
+        assert_eq!(logout_path, "/auth/logout");
+        assert!(logout_body.contains("\"status\":\"logged_out\""));
+
+        let (org_create_path, org_create_body) = org_create_endpoint(&OrganizationCreateRequest {
+            name: "Org One".to_string(),
+            slug: "org-one".to_string(),
+            plan: OrganizationPlan::Pro,
+            created_by: user.user_id.clone(),
+        });
+        assert_eq!(org_create_path, "/orgs");
+        assert!(org_create_body.contains("\"plan\":\"pro\""));
+
+        let org = OrganizationIdentity {
+            org_id: "org-1".to_string(),
+            name: "Org One".to_string(),
+            slug: "org-one".to_string(),
+            plan: OrganizationPlan::Pro,
+            created_at: 1,
+        };
+        let (org_get_path, org_get_body) = org_get_endpoint(&org);
+        assert_eq!(org_get_path, "/orgs/org-1");
+        assert!(org_get_body.contains("\"org_id\":\"org-1\""));
+
+        let (member_path, member_body) = org_add_member_endpoint(&OrganizationMembershipCreateRequest {
+            org_id: "org-1".to_string(),
+            user_id: "user-2".to_string(),
+            role: MembershipRole::Developer,
+        });
+        assert_eq!(member_path, "/orgs/org-1/members");
+        assert!(member_body.contains("\"role\":\"developer\""));
+    }
+
+    #[test]
+    fn executions_list_endpoint_filters_by_org() {
+        let executions = vec![
+            EidbExecutionRecord {
+                execution_id: "exec-1".to_string(),
+                org_id: "org-1".to_string(),
+                user_id: "user-1".to_string(),
+                workspace_id: "ws-1".to_string(),
+                repository_id: "repo".to_string(),
+                commit_hash: "aaaaaaa".to_string(),
+                started_at: 1,
+                completed_at: None,
+                status: "running".to_string(),
+                execution_tier: "DEA".to_string(),
+            },
+            EidbExecutionRecord {
+                execution_id: "exec-2".to_string(),
+                org_id: "org-2".to_string(),
+                user_id: "user-2".to_string(),
+                workspace_id: "ws-2".to_string(),
+                repository_id: "repo".to_string(),
+                commit_hash: "bbbbbbb".to_string(),
+                started_at: 1,
+                completed_at: None,
+                status: "running".to_string(),
+                execution_tier: "CLOUD".to_string(),
+            },
+        ];
+
+        let (path, body) = executions_list_endpoint("org-1", &executions);
+        assert_eq!(path, "/executions?org_id=org-1");
+        assert!(body.contains("\"execution_id\":\"exec-1\""));
+        assert!(!body.contains("\"execution_id\":\"exec-2\""));
     }
 
     #[test]
@@ -14283,6 +14772,8 @@ services:
     #[test]
     fn extension_and_portal_execution_starts_share_ids_and_urls() {
         let request = ExecutionStartRequest {
+            org_id: "org-1".to_string(),
+            user_id: "user-1".to_string(),
             repo_url: "https://github.com/example/app".to_string(),
             branch: Some("main".to_string()),
             commit: None,
@@ -14330,7 +14821,11 @@ services:
         let (portal_path, portal_body) = portal_navigation_endpoint();
         assert_eq!(portal_path, "/api/v1/surfaces/portal/navigation");
         assert!(portal_body.contains("\"dashboard\""));
+        assert!(portal_body.contains("\"organization\""));
+        assert!(portal_body.contains("\"members\""));
         assert!(portal_body.contains("\"workspaces\""));
+        assert!(portal_body.contains("\"billing\""));
+        assert!(portal_body.contains("\"org_switcher\""));
         assert!(portal_body.contains("\"workspace_path\":\"/api/v1/executions/{id}\""));
         assert!(portal_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
     }
@@ -15004,6 +15499,9 @@ services:
     #[test]
     fn eidb_schema_tracks_required_postgres_tables() {
         let schema = ExecutionIntelligenceDatabase::postgres_schema().join("\n");
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS users"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS organizations"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS memberships"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS repositories"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS commits"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS fingerprints"));
@@ -15020,6 +15518,7 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS agents"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS journey_results"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS commit_execution_results"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS audit_logs"));
     }
 
     #[test]
@@ -15044,6 +15543,9 @@ services:
         });
         database.record_execution(EidbExecutionRecord {
             execution_id: "exec-1".to_string(),
+            org_id: "org-1".to_string(),
+            user_id: "user-1".to_string(),
+            workspace_id: "ws-1".to_string(),
             repository_id: "repo-eidb".to_string(),
             commit_hash: "aaaaaaa".to_string(),
             started_at: 11,
@@ -15111,6 +15613,9 @@ services:
         });
         database.record_execution(EidbExecutionRecord {
             execution_id: "exec-2".to_string(),
+            org_id: "org-1".to_string(),
+            user_id: "user-1".to_string(),
+            workspace_id: "ws-2".to_string(),
             repository_id: "repo-eidb".to_string(),
             commit_hash: "bbbbbbb".to_string(),
             started_at: 11,

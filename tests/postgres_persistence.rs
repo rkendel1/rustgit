@@ -20,9 +20,13 @@ fn postgres_migrations_apply_and_enforce_foreign_keys() -> Result<(), Box<dyn st
     store.reset_for_development()?;
 
     assert_eq!(store.migration_count()?, 3);
+    assert!(store.table_exists("users")?);
+    assert!(store.table_exists("organizations")?);
+    assert!(store.table_exists("memberships")?);
     assert!(store.table_exists("repositories")?);
     assert!(store.table_exists("executions")?);
     assert!(store.table_exists("workspaces")?);
+    assert!(store.table_exists("audit_logs")?);
     assert!(store.table_exists("workspace_runtime_bindings")?);
     assert!(store.table_exists("schema_migrations")?);
 
@@ -65,6 +69,9 @@ fn postgres_store_round_trips_history_endpoints() -> Result<(), Box<dyn std::err
 
     store.insert_execution(&EidbExecutionRecord {
         execution_id: "exec-1".to_string(),
+        org_id: "org-bootstrap".to_string(),
+        user_id: "user-bootstrap".to_string(),
+        workspace_id: "ws-1".to_string(),
         repository_id: "repo-eidb".to_string(),
         commit_hash: "aaaaaaa".to_string(),
         started_at: 11,

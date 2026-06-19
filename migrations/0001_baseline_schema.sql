@@ -1,3 +1,30 @@
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    auth_provider TEXT NOT NULL CHECK (auth_provider IN ('github', 'google', 'microsoft')),
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS organizations (
+    org_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    plan TEXT NOT NULL CHECK (plan IN ('free', 'pro', 'enterprise')),
+    max_workspaces INTEGER NOT NULL DEFAULT 3 CHECK (max_workspaces >= 1),
+    max_concurrent_executions INTEGER NOT NULL DEFAULT 5 CHECK (max_concurrent_executions >= 1),
+    max_runtime_minutes INTEGER NOT NULL DEFAULT 1000 CHECK (max_runtime_minutes >= 1),
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'developer', 'viewer')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, org_id)
+);
+
 CREATE TABLE IF NOT EXISTS repositories (
     repo_id TEXT PRIMARY KEY,
     repo_url TEXT NOT NULL,
@@ -43,8 +70,24 @@ CREATE TABLE IF NOT EXISTS topologies (
     CHECK (edge_count >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    repository_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+    commit_hash TEXT NOT NULL REFERENCES commits(commit_hash) ON DELETE CASCADE,
+    created_by TEXT NOT NULL REFERENCES users(user_id) ON DELETE RESTRICT,
+    visibility TEXT NOT NULL CHECK (visibility IN ('private', 'org', 'public')),
+    current_runtime TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    last_healthy_at TIMESTAMPTZ
+);
+
 CREATE TABLE IF NOT EXISTS executions (
     execution_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE RESTRICT,
+    workspace_id TEXT NOT NULL,
     repository_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
     commit_hash TEXT NOT NULL REFERENCES commits(commit_hash) ON DELETE CASCADE,
     started_at TIMESTAMPTZ NOT NULL,
@@ -96,16 +139,6 @@ CREATE TABLE IF NOT EXISTS url_allocations (
     CHECK (released_at IS NULL OR released_at >= created_at)
 );
 
-CREATE TABLE IF NOT EXISTS workspaces (
-    workspace_id TEXT PRIMARY KEY,
-    repository_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-    commit_hash TEXT NOT NULL REFERENCES commits(commit_hash) ON DELETE CASCADE,
-    current_runtime TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL,
-    last_healthy_at TIMESTAMPTZ
-);
-
 CREATE TABLE IF NOT EXISTS workspace_runtime_bindings (
     workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     runtime_type TEXT NOT NULL CHECK (runtime_type IN ('DEA', 'CLOUD', 'DOCKER', 'EXTERNAL')),
@@ -140,4 +173,14 @@ CREATE TABLE IF NOT EXISTS commit_execution_results (
     startup_time_ms DOUBLE PRECISION NOT NULL,
     recorded_at TIMESTAMPTZ NOT NULL,
     CHECK (startup_time_ms >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE RESTRICT,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    ip_address TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
 );
