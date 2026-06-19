@@ -1,0 +1,19 @@
+.panel {
+  display: grid;
+  gap: 12px;
+}
+
+.subtitle {
+  margin-top: -4px;
+  color: #5f6b7a;
+}
+
+#status {
+  min-height: 1.2em;
+  font-size: 12px;
+}
+
+#workspace-link {
+  word-break: break-all;
+  font-size: 12px;
+}

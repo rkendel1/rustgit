@@ -5170,9 +5170,104 @@ pub fn detect_overlay_repository_context(url: &str) -> Option<OverlayRepositoryC
 }
 
 const OVERLAY_EXTENSION_ACTIONS: &[&str] = &["run", "instant_run", "analyze", "runtime", "commits"];
+const SHARED_SURFACE_COMPONENTS: &[&str] = &[
+    "Button",
+    "Card",
+    "Badge",
+    "Table",
+    "Modal",
+    "Drawer",
+    "Tabs",
+    "Navigation",
+    "Progress",
+    "LogsViewer",
+    "TopologyGraph",
+    "StatusIndicator",
+];
 
 pub fn extension_overlay_actions() -> &'static [&'static str] {
     OVERLAY_EXTENSION_ACTIONS
+}
+
+pub fn shared_design_system_manifest() -> Value {
+    json!({
+        "name": "DDockit Design System",
+        "theme": "dark-first",
+        "persona": "developer-focused",
+        "focus": "execution-centric",
+        "components": SHARED_SURFACE_COMPONENTS,
+        "status_colors": {
+            "Running": "#22c55e",
+            "Starting": "#38bdf8",
+            "Stopped": "#94a3b8",
+            "Failed": "#f87171",
+            "Healing": "#facc15",
+            "Migrating": "#a78bfa"
+        }
+    })
+}
+
+pub fn surface_component_registry() -> Value {
+    json!({
+        "button": "Button",
+        "card": "Card",
+        "badge": "Badge",
+        "table": "Table",
+        "modal": "Modal",
+        "drawer": "Drawer",
+        "tabs": "Tabs",
+        "navigation": "Navigation",
+        "progress": "Progress",
+        "log_stream": "LogsViewer",
+        "topology": "TopologyGraph",
+        "status_indicator": "StatusIndicator"
+    })
+}
+
+fn resolve_surface_component(component_type: &str) -> &'static str {
+    match component_type {
+        "button" => "Button",
+        "card" => "Card",
+        "badge" => "Badge",
+        "table" => "Table",
+        "modal" => "Modal",
+        "drawer" => "Drawer",
+        "tabs" => "Tabs",
+        "navigation" => "Navigation",
+        "progress" => "Progress",
+        "log_stream" => "LogsViewer",
+        "topology" => "TopologyGraph",
+        "status_indicator" => "StatusIndicator",
+        _ => "Card",
+    }
+}
+
+pub fn render_surface_view(view: &str, components: &[Value]) -> Value {
+    let rendered_components = components
+        .iter()
+        .map(|component| {
+            let component_type = component
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("card");
+            let slot = component
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("component");
+            json!({
+                "slot": slot,
+                "component": resolve_surface_component(component_type),
+                "contract_type": component_type,
+                "definition": component
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "renderer": "unified_surface_renderer",
+        "view": view,
+        "components": rendered_components
+    })
 }
 
 pub fn extension_overlay_actions_endpoint() -> (String, String) {
@@ -5189,16 +5284,68 @@ pub fn extension_overlay_actions_endpoint() -> (String, String) {
 }
 
 pub fn extension_overlay_ui_endpoint() -> (String, String) {
+    let components = vec![
+        json!({
+            "id": "overlay_shell",
+            "type": "card",
+            "title": "DDockit",
+            "subtitle": "GitHub overlay shell"
+        }),
+        json!({
+            "id": "overlay_actions",
+            "type": "button",
+            "actions": ["run", "instant_run", "analyze"]
+        }),
+        json!({
+            "id": "run_flow",
+            "type": "drawer",
+            "states": ["Analyzing Repository...", "Generating Execution Plan...", "Selecting Runtime...", "Starting...", "Running"]
+        }),
+        json!({
+            "id": "run_flow_progress",
+            "type": "progress",
+            "steps": ["analyzing", "planning", "runtime_selection", "starting", "running"]
+        }),
+        json!({
+            "id": "extension_status",
+            "type": "status_indicator",
+            "statuses": ["Running", "Starting", "Stopped", "Failed", "Healing", "Migrating"]
+        }),
+        json!({
+            "id": "analyze_panel",
+            "type": "table",
+            "columns": ["frameworks", "services", "ports", "runtime", "topology"]
+        }),
+        json!({
+            "id": "commit_panel",
+            "type": "table",
+            "columns": ["current_commit", "last_good_commit", "run_previous_commit"]
+        }),
+    ];
+    let rendered = render_surface_view("github_overlay_shell", &components);
     (
         "/api/v1/surfaces/extension/ui".to_string(),
         json!({
             "surface": ProductSurface::GitHubOverlayExtension.as_str(),
             "view": "overlay_panel",
+            "shell": "github_overlay_shell",
             "title": "Run with DDockit",
+            "design_system": shared_design_system_manifest(),
+            "component_registry": surface_component_registry(),
+            "components": components.clone(),
+            "rendered": rendered,
             "repository_context": {
                 "owner": "{owner}",
                 "repo": "{repo}",
                 "branch": "{branch}"
+            },
+            "screenshot": {
+                "id": "repository_detected_preview",
+                "shape": "orb",
+                "animation": "pulse",
+                "state": {
+                    "when_repository_detected": "pulse"
+                }
             },
             "sections": [
                 {
@@ -5260,10 +5407,81 @@ pub fn portal_navigation_endpoint() -> (String, String) {
 }
 
 pub fn portal_ui_endpoint() -> (String, String) {
+    let components = vec![
+        json!({
+            "id": "portal_navigation",
+            "type": "navigation",
+            "items": portal_initial_navigation()
+        }),
+        json!({
+            "id": "dashboard_metrics",
+            "type": "card",
+            "cards": ["Running Workspaces", "Healthy URLs", "DEA Agents", "Success Rate"]
+        }),
+        json!({
+            "id": "recent_executions",
+            "type": "table",
+            "columns": ["execution_id", "repository", "state", "health", "started_at"]
+        }),
+        json!({
+            "id": "recent_repositories",
+            "type": "table",
+            "columns": ["repository", "framework", "services", "runtime"]
+        }),
+        json!({
+            "id": "system_health",
+            "type": "status_indicator",
+            "statuses": ["Running", "Starting", "Stopped", "Failed", "Healing", "Migrating"]
+        }),
+        json!({
+            "id": "workspace_surface",
+            "type": "card",
+            "fields": ["workspace_name", "url", "status"],
+            "actions": ["open_app", "restart", "stop", "migrate"]
+        }),
+        json!({
+            "id": "workspace_tabs",
+            "type": "tabs",
+            "tabs": ["overview", "logs", "topology", "commits", "healing", "metrics"]
+        }),
+        json!({
+            "id": "workspace_logs",
+            "type": "log_stream",
+            "searchable": true,
+            "filterable": true
+        }),
+        json!({
+            "id": "workspace_topology",
+            "type": "topology",
+            "graph": ["frontend", "backend", "database"]
+        }),
+        json!({
+            "id": "workspace_commits",
+            "type": "table",
+            "columns": ["HEAD", "HEAD~1", "HEAD~2", "Last Known Good"],
+            "actions": ["run_commit", "compare", "rollback"]
+        }),
+        json!({
+            "id": "workspace_healing",
+            "type": "table",
+            "columns": ["failure", "classifier", "repair", "validation"]
+        }),
+        json!({
+            "id": "analytics_cards",
+            "type": "card",
+            "cards": ["Time To URL", "Startup Success Rate", "Healing Success Rate", "Runtime Distribution"]
+        })
+    ];
+    let rendered = render_surface_view("portal_shell", &components);
     (
         "/api/v1/surfaces/portal/ui".to_string(),
         json!({
             "surface": ProductSurface::Portal.as_str(),
+            "shell": "portal_shell",
+            "design_system": shared_design_system_manifest(),
+            "component_registry": surface_component_registry(),
+            "components": components.clone(),
+            "rendered": rendered,
             "layout": {
                 "type": "shell",
                 "navigation": portal_initial_navigation(),
@@ -13705,16 +13923,58 @@ services:
         let (extension_ui_path, extension_ui_body) = extension_overlay_ui_endpoint();
         assert_eq!(extension_ui_path, "/api/v1/surfaces/extension/ui");
         assert!(extension_ui_body.contains("\"view\":\"overlay_panel\""));
+        assert!(extension_ui_body.contains("\"shell\":\"github_overlay_shell\""));
         assert!(extension_ui_body.contains("\"quick_actions\""));
         assert!(extension_ui_body.contains("\"latest_execution\""));
+        assert!(extension_ui_body.contains("\"component_registry\""));
+        assert!(extension_ui_body.contains("\"rendered\""));
+        assert!(extension_ui_body.contains("\"screenshot\""));
+        assert!(extension_ui_body.contains("\"shape\":\"orb\""));
+        assert!(extension_ui_body.contains("\"animation\":\"pulse\""));
+        assert!(extension_ui_body.contains("\"when_repository_detected\":\"pulse\""));
 
         let (portal_ui_path, portal_ui_body) = portal_ui_endpoint();
         assert_eq!(portal_ui_path, "/api/v1/surfaces/portal/ui");
         assert!(portal_ui_body.contains("\"layout\""));
+        assert!(portal_ui_body.contains("\"shell\":\"portal_shell\""));
         assert!(portal_ui_body.contains("\"dashboard\""));
         assert!(portal_ui_body.contains("\"workspaces\""));
         assert!(portal_ui_body.contains("\"executions\""));
         assert!(portal_ui_body.contains("\"agents\""));
+        assert!(portal_ui_body.contains("\"component_registry\""));
+        assert!(portal_ui_body.contains("\"rendered\""));
+    }
+
+    #[test]
+    fn surface_renderer_maps_contract_components_to_shared_design_system() {
+        let components = vec![
+            json!({"id": "workspace_card", "type": "card"}),
+            json!({"id": "execution_table", "type": "table"}),
+            json!({"id": "log_stream", "type": "log_stream"}),
+            json!({"id": "topology_graph", "type": "topology"}),
+            json!({"id": "health", "type": "status_indicator"}),
+        ];
+        let rendered = render_surface_view("workspace", &components);
+        let rendered_components = rendered
+            .get("components")
+            .and_then(serde_json::Value::as_array)
+            .expect("rendered components");
+        assert_eq!(rendered.get("renderer"), Some(&json!("unified_surface_renderer")));
+        assert!(rendered_components
+            .iter()
+            .any(|entry| entry.get("component") == Some(&json!("Card"))));
+        assert!(rendered_components
+            .iter()
+            .any(|entry| entry.get("component") == Some(&json!("Table"))));
+        assert!(rendered_components
+            .iter()
+            .any(|entry| entry.get("component") == Some(&json!("LogsViewer"))));
+        assert!(rendered_components
+            .iter()
+            .any(|entry| entry.get("component") == Some(&json!("TopologyGraph"))));
+        assert!(rendered_components
+            .iter()
+            .any(|entry| entry.get("component") == Some(&json!("StatusIndicator"))));
     }
 
     #[test]

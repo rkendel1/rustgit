@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DDockit Side Panel</title>
+    <link rel="stylesheet" href="../styles/shared.css" />
+    <link rel="stylesheet" href="./sidepanel.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <h1>DDockit</h1>
+      <p class="subtitle">Launch GitHub repositories instantly.</p>
+
+      <section>
+        <label for="repo">Repository</label>
+        <input id="repo" type="text" placeholder="owner/repo" />
+      </section>
+
+      <section>
+        <label for="branch">Branch</label>
+        <input id="branch" type="text" value="main" />
+      </section>
+
+      <button id="launch">Run with DDockit</button>
+      <p id="status" aria-live="polite"></p>
+      <a id="workspace-link" target="_blank" rel="noopener noreferrer"></a>
+    </main>
+
+    <script type="module" src="./sidepanel.js"></script>
+  </body>
+</html>
