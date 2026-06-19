@@ -209,12 +209,12 @@ pub enum PackageManagerKind {
     Poetry,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryStrategy {
-    NodeScript { command: &'static str },
-    PythonModule { module: &'static str },
-    RustBinary { target: &'static str },
-    BunScript { command: &'static str },
+    NodeScript { command: String },
+    PythonModule { module: String },
+    RustBinary { target: String },
+    BunScript { command: String },
     DockerEntrypoint,
 }
 
@@ -362,14 +362,14 @@ impl ExecutionImageCompiler {
             language_kind_from_signature(&fingerprint.language_signature.to_ascii_lowercase());
         let package_manager = package_manager_for_framework(framework, runtime, fingerprint);
         let runtime_version = runtime_version_for(runtime).to_string();
-        let entry_strategy = entry_strategy_for(runtime, framework);
+        let entry_strategy = entry_strategy_for(runtime, framework, package_manager);
         let build_steps = vec![
             BuildStep::InstallDependencies,
             BuildStep::Compile,
             BuildStep::GenerateArtifacts,
             BuildStep::LinkCache,
         ];
-        let build_strategy = BuildStrategyPlanner::plan(runtime, package_manager, &entry_strategy);
+        let build_strategy = BuildStrategyPlanner::plan(runtime, package_manager);
         let confidence = confidence_for_compiler(framework, runtime, language);
 
         let mut environment_vars = BTreeSet::new();
@@ -418,7 +418,6 @@ impl BuildStrategyPlanner {
     fn plan(
         runtime: ImageRuntimeKind,
         package_manager: Option<PackageManagerKind>,
-        entry_strategy: &EntryStrategy,
     ) -> BuildStrategy {
         let mut commands = Vec::new();
         match runtime {
@@ -461,7 +460,6 @@ impl BuildStrategyPlanner {
             ]),
             ImageRuntimeKind::Unknown => {}
         }
-        commands.push(entry_strategy_label(entry_strategy).to_string());
         BuildStrategy { commands }
     }
 }
@@ -3459,7 +3457,8 @@ pub fn execution_image_endpoint(
             "framework": framework,
             "runtime": runtime_type_to_agent_label(matched.image.runtime),
             "image": matched.image.image_id,
-            "confidence": matched.confidence,
+            "confidence": f64::from(matched.confidence) / 100.0,
+            "confidence_raw": matched.confidence,
             "image_spec": execution_image_spec_payload(&compiled.image_spec)
         })
         .to_string(),
@@ -3478,7 +3477,8 @@ pub fn execution_image_compile_endpoint(
             "repo_url": repo_url,
             "branch": branch,
             "image_spec": execution_image_spec_payload(&compiled.image_spec),
-            "confidence": f64::from(compiled.confidence) / 100.0
+            "confidence": f64::from(compiled.confidence) / 100.0,
+            "confidence_raw": compiled.confidence
         })
         .to_string(),
     )
@@ -6357,10 +6357,13 @@ fn package_manager_for_framework(
     if lockfile_hint.contains("yarn") {
         return Some(PackageManagerKind::Yarn);
     }
+    if framework == FrameworkKind::NextJs {
+        return Some(PackageManagerKind::Pnpm);
+    }
 
     match runtime {
-        ImageRuntimeKind::Node => Some(PackageManagerKind::Pnpm),
-        ImageRuntimeKind::Python => Some(PackageManagerKind::Uv),
+        ImageRuntimeKind::Node => Some(PackageManagerKind::Npm),
+        ImageRuntimeKind::Python => Some(PackageManagerKind::Pip),
         ImageRuntimeKind::Rust => Some(PackageManagerKind::Cargo),
         ImageRuntimeKind::Bun => Some(PackageManagerKind::Bun),
         ImageRuntimeKind::Unknown => None,
@@ -6380,29 +6383,35 @@ fn runtime_version_for(runtime: ImageRuntimeKind) -> &'static str {
 fn entry_strategy_for(
     runtime: ImageRuntimeKind,
     framework: Option<FrameworkKind>,
+    package_manager: Option<PackageManagerKind>,
 ) -> EntryStrategy {
     match runtime {
         ImageRuntimeKind::Node => EntryStrategy::NodeScript {
             command: if matches!(framework, Some(FrameworkKind::NextJs)) {
-                "pnpm dev"
+                match package_manager.unwrap_or(PackageManagerKind::Pnpm) {
+                    PackageManagerKind::Yarn => "yarn dev".to_string(),
+                    PackageManagerKind::Bun => "bun run dev".to_string(),
+                    PackageManagerKind::Npm => "npm run dev".to_string(),
+                    _ => "pnpm run dev".to_string(),
+                }
             } else {
-                "node server.js"
+                "node server.js".to_string()
             },
         },
         ImageRuntimeKind::Python => EntryStrategy::PythonModule {
             module: if matches!(framework, Some(FrameworkKind::FastApi)) {
-                "uvicorn app:app"
+                "uvicorn app:app".to_string()
             } else if matches!(framework, Some(FrameworkKind::Django)) {
-                "gunicorn app.wsgi"
+                "gunicorn app.wsgi".to_string()
             } else {
-                "app"
+                "app".to_string()
             },
         },
         ImageRuntimeKind::Rust => EntryStrategy::RustBinary {
-            target: "./target/release/app",
+            target: "./target/release/<binary>".to_string(),
         },
         ImageRuntimeKind::Bun => EntryStrategy::BunScript {
-            command: "bun run dev",
+            command: "bun run dev".to_string(),
         },
         ImageRuntimeKind::Unknown => EntryStrategy::DockerEntrypoint,
     }
@@ -6472,12 +6481,23 @@ fn package_manager_kind_label(package_manager: PackageManagerKind) -> &'static s
     }
 }
 
-fn entry_strategy_label(strategy: &EntryStrategy) -> &'static str {
+fn language_kind_label(language: LanguageKind) -> &'static str {
+    match language {
+        Language::JavaScript => "javascript",
+        Language::TypeScript => "typescript",
+        Language::Rust => "rust",
+        Language::Go => "go",
+        Language::Python => "python",
+        Language::Unknown => UNKNOWN_SIGNATURE,
+    }
+}
+
+fn entry_strategy_label(strategy: &EntryStrategy) -> &str {
     match strategy {
-        EntryStrategy::NodeScript { command } => command,
-        EntryStrategy::PythonModule { module } => module,
-        EntryStrategy::RustBinary { target } => target,
-        EntryStrategy::BunScript { command } => command,
+        EntryStrategy::NodeScript { command } => command.as_str(),
+        EntryStrategy::PythonModule { module } => module.as_str(),
+        EntryStrategy::RustBinary { target } => target.as_str(),
+        EntryStrategy::BunScript { command } => command.as_str(),
         EntryStrategy::DockerEntrypoint => "docker-entrypoint",
     }
 }
@@ -6545,19 +6565,19 @@ fn execution_image_spec_material(spec: &ExecutionImageSpec) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-            "version={}|language={:?}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}",
-            spec.spec_version,
-            spec.language,
-            image_runtime_kind_label(spec.runtime),
-            spec.runtime_version,
-            framework,
-            package_manager,
-            entry_strategy_label(&spec.entry_strategy),
-            build_steps,
-            environment,
-            sandbox_model_label(spec.sandbox_model),
-            spec.caching_policy.deterministic
-        )
+        "version={}|language={}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}",
+        spec.spec_version,
+        language_kind_label(spec.language),
+        image_runtime_kind_label(spec.runtime),
+        spec.runtime_version,
+        framework,
+        package_manager,
+        entry_strategy_label(&spec.entry_strategy),
+        build_steps,
+        environment,
+        sandbox_model_label(spec.sandbox_model),
+        spec.caching_policy.deterministic
+    )
 }
 
 fn execution_image_spec_payload(spec: &ExecutionImageSpec) -> Value {
@@ -6571,7 +6591,7 @@ fn execution_image_spec_payload(spec: &ExecutionImageSpec) -> Value {
         .unwrap_or(UNKNOWN_SIGNATURE);
     json!({
         "spec_version": spec.spec_version,
-        "language": format!("{:?}", spec.language).to_ascii_lowercase(),
+        "language": language_kind_label(spec.language),
         "runtime": image_runtime_kind_label(spec.runtime),
         "runtime_version": spec.runtime_version,
         "framework": framework,
