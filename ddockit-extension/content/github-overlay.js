@@ -17,6 +17,10 @@ function ensureButton() {
   button.textContent = "Run with DDockit";
   button.addEventListener("click", async () => {
     const payload = window.__ddockitRepositoryContext;
+    if (!payload?.owner || !payload?.repo) {
+      console.warn("DDockit repository context unavailable on this page.");
+      return;
+    }
     await chrome.runtime.sendMessage({ type: "DDOCKIT_OPEN_SIDEPANEL" });
     await chrome.runtime.sendMessage({ type: "DDOCKIT_DETECTED_REPOSITORY", payload });
   });

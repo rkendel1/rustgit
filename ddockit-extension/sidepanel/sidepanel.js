@@ -18,7 +18,13 @@ async function init() {
 }
 
 launchButton.addEventListener("click", async () => {
-  const [owner, repo] = repoInput.value.split("/").map((part) => part.trim());
+  const repositoryParts = repoInput.value
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const hasValidFormat = repositoryParts.length === 2;
+  const owner = hasValidFormat ? repositoryParts[0] : "";
+  const repo = hasValidFormat ? repositoryParts[1] : "";
   const branch = branchInput.value.trim() || "main";
 
   if (!owner || !repo) {

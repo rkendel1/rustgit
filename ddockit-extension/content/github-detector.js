@@ -10,10 +10,15 @@ function parseGithubRepository(pathname) {
     return null;
   }
 
+  let branch = "main";
+  if (segments[2] === "tree" && segments[3]) {
+    branch = decodeURIComponent(segments[3]);
+  }
+
   return {
     owner,
     repo,
-    branch: new URLSearchParams(window.location.search).get("branch") || "main",
+    branch,
     url: window.location.href
   };
 }
