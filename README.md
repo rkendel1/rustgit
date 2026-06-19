@@ -19,3 +19,30 @@ A Rust foundation for a Gitpod-compatible WebAssembly workspace runtime.
 cargo test
 cargo run --bin wasm-workspace-cli -- launch /absolute/path/to/repo
 ```
+
+## PostgreSQL persistence
+
+This repository now includes SQL migrations and a production-style PostgreSQL persistence layer for Execution Intelligence history.
+
+### Migrations
+
+Migrations are stored in `./migrations`:
+
+- `0001_baseline_schema.sql` — core tables, PK/FK constraints, nullable rules, and check constraints
+- `0002_indexes_and_constraints.sql` — performance indexes and uniqueness constraints
+- `0003_seed_bootstrap.sql` — bootstrap seed rows
+
+`ExecutionIntelligencePostgresStore::initialize()` runs migrations on startup and records applied versions in `schema_migrations`.
+
+### Environment variables
+
+- `DATABASE_URL` (required for runtime Postgres initialization)
+- `RUSTGIT_EIDB_TEST_DATABASE_URL` (optional, used by integration tests in `tests/postgres_persistence.rs`)
+
+### Local initialization example
+
+```bash
+docker run --name rustgit-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rustgit -p 5432:5432 -d postgres:17
+export DATABASE_URL=postgresql://<username>:<password>@localhost:5432/rustgit
+cargo test
+```

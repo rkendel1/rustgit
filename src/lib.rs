@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
@@ -12,10 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
 mod architecture_docs;
+mod postgres_db;
 
 pub use architecture_docs::{
     analyze_architecture_from_source, extract_execution_flow_from_source, generate_grounded_docs,
     ArchitectureSnapshot, CallGraph, ExecutionFlowGraph, GeneratedDocs,
+};
+pub use postgres_db::{
+    deserialize_string_array, infer_repository_from_commits, ExecutionIntelligencePersistenceError,
+    ExecutionIntelligencePostgresStore, ExecutionIntelligenceReadStore, PersistenceResult,
 };
 
 const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
@@ -5379,6 +5384,311 @@ pub struct TemporalRecoverRequest {
     pub strategy: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbRepositoryRecord {
+    pub repo_id: String,
+    pub repo_url: String,
+    pub default_branch: String,
+    /// Unix timestamp in epoch seconds, persisted as TIMESTAMPTZ via to_timestamp(epoch_seconds::double precision).
+    pub first_seen: u64,
+    /// Unix timestamp in epoch seconds, persisted as TIMESTAMPTZ via to_timestamp(epoch_seconds::double precision).
+    pub last_seen: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbCommitRecord {
+    pub commit_hash: String,
+    pub repository_id: String,
+    /// Unix timestamp in epoch seconds, persisted as TIMESTAMPTZ via to_timestamp(epoch_seconds::double precision).
+    pub author_date: u64,
+    pub message: String,
+    pub parent_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbFingerprintRecord {
+    pub fingerprint_id: String,
+    pub repository_id: String,
+    pub commit_hash: String,
+    pub frameworks: Vec<String>,
+    pub languages: Vec<String>,
+    pub services: Vec<String>,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbServiceRecord {
+    pub service_id: String,
+    pub fingerprint_id: String,
+    pub service_type: String,
+    pub framework: Option<String>,
+    pub runtime: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbTopologyRecord {
+    pub topology_id: String,
+    pub fingerprint_id: String,
+    pub service_count: u32,
+    pub edge_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbExecutionRecord {
+    pub execution_id: String,
+    pub repository_id: String,
+    pub commit_hash: String,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+    pub status: String,
+    pub execution_tier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbExecutionEventRecord {
+    pub execution_id: String,
+    pub event_type: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbRuntimeImageRecord {
+    pub image_id: String,
+    pub image_hash: String,
+    pub runtime: String,
+    pub framework: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbWarmPoolUsageRecord {
+    pub execution_id: String,
+    pub image_id: String,
+    pub cache_hit: bool,
+    pub cold_start: bool,
+    pub startup_time_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbHealingAttemptRecord {
+    pub repository_id: String,
+    pub execution_id: String,
+    pub failure_class: String,
+    pub repair_strategy: String,
+    pub success: bool,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbUrlAllocationRecord {
+    pub workspace_url: String,
+    pub execution_id: String,
+    pub created_at: u64,
+    pub released_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbAgentRecord {
+    pub agent_id: String,
+    pub capabilities: Vec<String>,
+    pub last_seen: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbJourneyResultRecord {
+    pub journey_type: String,
+    pub repo_id: String,
+    pub success: bool,
+    pub time_to_url_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbCommitExecutionResultRecord {
+    pub commit_hash: String,
+    pub success: bool,
+    pub startup_time_ms: f64,
+    pub recorded_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExecutionIntelligenceDatabase {
+    pub repositories: HashMap<String, EidbRepositoryRecord>,
+    pub commits: Vec<EidbCommitRecord>,
+    pub fingerprints: Vec<EidbFingerprintRecord>,
+    pub services: Vec<EidbServiceRecord>,
+    pub topologies: Vec<EidbTopologyRecord>,
+    pub executions: Vec<EidbExecutionRecord>,
+    pub execution_events: Vec<EidbExecutionEventRecord>,
+    pub runtime_images: Vec<EidbRuntimeImageRecord>,
+    pub warm_pool_usage: Vec<EidbWarmPoolUsageRecord>,
+    pub healing_attempts: Vec<EidbHealingAttemptRecord>,
+    pub url_allocations: Vec<EidbUrlAllocationRecord>,
+    pub agents: HashMap<String, EidbAgentRecord>,
+    pub journey_results: Vec<EidbJourneyResultRecord>,
+    pub commit_execution_results: Vec<EidbCommitExecutionResultRecord>,
+}
+
+impl ExecutionIntelligenceDatabase {
+    pub fn postgres_schema() -> &'static [&'static str] {
+        &[
+            include_str!("../migrations/0001_baseline_schema.sql"),
+            include_str!("../migrations/0002_indexes_and_constraints.sql"),
+            include_str!("../migrations/0003_seed_bootstrap.sql"),
+        ]
+    }
+
+    pub fn record_execution(&mut self, execution: EidbExecutionRecord) {
+        self.executions.push(execution);
+    }
+
+    pub fn record_execution_event(&mut self, event: EidbExecutionEventRecord) {
+        self.execution_events.push(event);
+    }
+
+    pub fn record_healing_attempt(&mut self, attempt: EidbHealingAttemptRecord) {
+        self.healing_attempts.push(attempt);
+    }
+
+    pub fn record_url_allocation(&mut self, allocation: EidbUrlAllocationRecord) {
+        self.url_allocations.push(allocation);
+    }
+
+    pub fn record_commit_execution_result(&mut self, result: EidbCommitExecutionResultRecord) {
+        self.commit_execution_results.push(result);
+    }
+
+    pub fn last_good_commit_for_repository(&self, repository_id: &str) -> Option<&str> {
+        let commit_to_repo: HashMap<&str, &str> = self
+            .commits
+            .iter()
+            .map(|commit| (commit.commit_hash.as_str(), commit.repository_id.as_str()))
+            .collect();
+        self.commit_execution_results
+            .iter()
+            .rev()
+            .find(|result| {
+                result.success
+                    && commit_to_repo
+                        .get(result.commit_hash.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        == repository_id
+            })
+            .map(|result| result.commit_hash.as_str())
+            .or_else(|| {
+                self.executions
+                    .iter()
+                    .rev()
+                    .find(|execution| {
+                        execution.repository_id == repository_id
+                            && eidb_execution_status_is_success(&execution.status)
+                    })
+                    .map(|execution| execution.commit_hash.as_str())
+            })
+    }
+}
+
+fn eidb_execution_status_is_success(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "success" | "succeeded" | "healthy"
+    )
+}
+
+pub fn repository_history_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_history_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_history_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
+        format!("/repositories/{repository_id}/history"),
+        json!({
+            "repository_id": repository_id,
+            "repository": store.repository(repository_id)?,
+            "commits": store.commits_for_repository(repository_id)?,
+            "executions": store.executions_for_repository(repository_id)?,
+            "journey_results": store.journey_results_for_repository(repository_id)?,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn execution_history_endpoint(
+    execution_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    execution_history_endpoint_with_store(execution_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn execution_history_endpoint_with_store(
+    execution_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
+        format!("/executions/{execution_id}/history"),
+        json!({
+            "execution": store.execution(execution_id)?,
+            "events": store.events_for_execution(execution_id)?,
+            "url_allocations": store.url_allocations_for_execution(execution_id)?,
+            "healing_attempts": store.healing_attempts_for_execution(execution_id)?,
+            "warm_pool_usage": store.warm_pool_usage_for_execution(execution_id)?,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_healing_history_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_healing_history_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_healing_history_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
+        format!("/repositories/{repository_id}/healing"),
+        json!({
+            "repository_id": repository_id,
+            "healing_attempts": store.healing_attempts_for_repository(repository_id)?,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_last_good_commit_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_last_good_commit_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_last_good_commit_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
+        format!("/repositories/{repository_id}/last-good"),
+        json!({
+            "repository_id": repository_id,
+            "commit_hash": store.last_good_commit_for_repository(repository_id)?,
+        })
+        .to_string(),
+    ))
+}
+
 /// Returns `/repo/{id}/commits` payload containing commit hashes, timestamps, and build status.
 pub fn list_repo_commits_endpoint(repo_id: &str, graph: &RepositoryTimeGraph) -> (String, String) {
     (
@@ -8577,6 +8887,10 @@ impl Default for RestApiSpec {
             "POST /api/v1/executions/{id}/restart",
             "POST /api/v1/executions/{id}/stop",
             "POST /api/v1/executions/{id}/migrate",
+            "GET /repositories/{id}/history",
+            "GET /executions/{id}/history",
+            "GET /repositories/{id}/healing",
+            "GET /repositories/{id}/last-good",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
         Self {
@@ -12387,6 +12701,10 @@ dependencies:
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/restart"));
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/stop"));
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/migrate"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/history"));
+        assert!(spec.routes.contains(&"GET /executions/{id}/history"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/healing"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/last-good"));
     }
 
     #[test]
@@ -13621,6 +13939,124 @@ services:
         );
         assert_eq!(recover_path, "/execute/recover");
         assert!(recover_body.contains("\"selected_commit\":\"bbbbbbb\""));
+    }
+
+    #[test]
+    fn eidb_schema_tracks_required_postgres_tables() {
+        let schema = ExecutionIntelligenceDatabase::postgres_schema().join("\n");
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repositories"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS commits"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS fingerprints"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS services"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS topologies"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS executions"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS execution_events"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS runtime_images"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS warm_pool_usage"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS healing_attempts"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS url_allocations"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS agents"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS journey_results"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS commit_execution_results"));
+    }
+
+    #[test]
+    fn eidb_history_endpoints_emit_persisted_payloads() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.repositories.insert(
+            "repo-eidb".to_string(),
+            EidbRepositoryRecord {
+                repo_id: "repo-eidb".to_string(),
+                repo_url: "https://github.com/rkendel1/rustgit-example".to_string(),
+                default_branch: "main".to_string(),
+                first_seen: 1,
+                last_seen: 2,
+            },
+        );
+        database.commits.push(EidbCommitRecord {
+            commit_hash: "aaaaaaa".to_string(),
+            repository_id: "repo-eidb".to_string(),
+            author_date: 10,
+            message: "initial".to_string(),
+            parent_commit: None,
+        });
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-1".to_string(),
+            repository_id: "repo-eidb".to_string(),
+            commit_hash: "aaaaaaa".to_string(),
+            started_at: 11,
+            completed_at: Some(12),
+            status: "success".to_string(),
+            execution_tier: "CLOUD".to_string(),
+        });
+        database.record_execution_event(EidbExecutionEventRecord {
+            execution_id: "exec-1".to_string(),
+            event_type: "STARTED".to_string(),
+            created_at: 11,
+        });
+        database.record_healing_attempt(EidbHealingAttemptRecord {
+            repository_id: "repo-eidb".to_string(),
+            execution_id: "exec-1".to_string(),
+            failure_class: "WrongPackageManager".to_string(),
+            repair_strategy: "switch-pnpm".to_string(),
+            success: true,
+            created_at: 12,
+        });
+        database.record_url_allocation(EidbUrlAllocationRecord {
+            workspace_url: "https://workspace-1.ddockit.dev".to_string(),
+            execution_id: "exec-1".to_string(),
+            created_at: 11,
+            released_at: None,
+        });
+        database.record_commit_execution_result(EidbCommitExecutionResultRecord {
+            commit_hash: "aaaaaaa".to_string(),
+            success: true,
+            startup_time_ms: 4200.0,
+            recorded_at: 12,
+        });
+
+        let (repo_history_path, repo_history_body) = repository_history_endpoint("repo-eidb", &database);
+        assert_eq!(repo_history_path, "/repositories/repo-eidb/history");
+        assert!(repo_history_body.contains("\"commit_hash\":\"aaaaaaa\""));
+
+        let (execution_history_path, execution_history_body) =
+            execution_history_endpoint("exec-1", &database);
+        assert_eq!(execution_history_path, "/executions/exec-1/history");
+        assert!(execution_history_body.contains("\"event_type\":\"STARTED\""));
+        assert!(execution_history_body.contains("workspace-1.ddockit.dev"));
+
+        let (healing_path, healing_body) = repository_healing_history_endpoint("repo-eidb", &database);
+        assert_eq!(healing_path, "/repositories/repo-eidb/healing");
+        assert!(healing_body.contains("\"failure_class\":\"WrongPackageManager\""));
+
+        let (last_good_path, last_good_body) = repository_last_good_commit_endpoint("repo-eidb", &database);
+        assert_eq!(last_good_path, "/repositories/repo-eidb/last-good");
+        assert!(last_good_body.contains("\"commit_hash\":\"aaaaaaa\""));
+    }
+
+    #[test]
+    fn eidb_last_good_commit_falls_back_to_successful_execution_status() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.commits.push(EidbCommitRecord {
+            commit_hash: "bbbbbbb".to_string(),
+            repository_id: "repo-eidb".to_string(),
+            author_date: 10,
+            message: "run".to_string(),
+            parent_commit: None,
+        });
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-2".to_string(),
+            repository_id: "repo-eidb".to_string(),
+            commit_hash: "bbbbbbb".to_string(),
+            started_at: 11,
+            completed_at: Some(12),
+            status: "Succeeded".to_string(),
+            execution_tier: "DEA".to_string(),
+        });
+        assert_eq!(
+            database.last_good_commit_for_repository("repo-eidb"),
+            Some("bbbbbbb")
+        );
     }
 
     #[test]
