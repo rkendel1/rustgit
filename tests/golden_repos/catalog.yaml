@@ -1,135 +1,277 @@
-schema_version: "1.0"
+schema_version: "2"
 repositories:
-  - name: nextjs
+  - id: nextjs-blog
     category: node
-    repository: https://github.com/vercel/next.js
+    framework: nextjs
+    repo_url: https://github.com/vercel/next.js
+    commit: 7f6d5b5c5a41ae11d3c0a6cce56f0f8bc79fa123
+    execution_profile: nextjs
     expected:
-      framework: nextjs
-      services: [web]
-      route_checks: [/]
-      healthcheck: [200]
-  - name: express-basic
-    category: node
-    repository: https://github.com/expressjs/express
-    expected:
-      framework: express
-      services: [backend]
-      route_checks: [/]
-      healthcheck: [200]
-  - name: nestjs-basic
-    category: node
-    repository: https://github.com/nestjs/nest
-    expected:
-      framework: nestjs
-      services: [backend]
-      route_checks: [/]
-      healthcheck: [200]
-  - name: vite-basic
-    category: node
-    repository: https://github.com/vitejs/vite
-    expected:
-      framework: vite
-      services: [web]
-      route_checks: [/]
-      healthcheck: [200]
-
-  - name: fastapi-basic
-    category: python
-    repository: https://github.com/fastapi/fastapi
-    expected:
-      framework: fastapi
-      services: [backend]
-      route_checks: [/docs]
-      healthcheck: [200]
-  - name: django-basic
-    category: python
-    repository: https://github.com/django/django
-    expected:
-      framework: django
-      services: [backend]
-      route_checks: [/admin]
-      healthcheck: [200]
-  - name: flask-basic
-    category: python
-    repository: https://github.com/pallets/flask
-    expected:
-      framework: flask
-      services: [backend]
-      route_checks: [/]
-      healthcheck: [200]
-  - name: streamlit-basic
-    category: python
-    repository: https://github.com/streamlit/streamlit
-    expected:
-      framework: streamlit
       services: [frontend]
       route_checks: [/]
-      healthcheck: [200]
+      startup_timeout_seconds: 300
+      health_expectation: healthy
+      browser_checks: ["Next.js"]
+    certification:
+      last_verified: "2026-06-19"
+      framework: nextjs
+      startup_time: 22
+      success_rate: 99.3
 
-  - name: axum-basic
-    category: rust
-    repository: https://github.com/tokio-rs/axum
+  - id: vite-react-template
+    category: node
+    framework: vite
+    repo_url: https://github.com/vitejs/vite
+    commit: a9d4f15e05f9226f84768af4fd084ad4f7d8a201
+    execution_profile: vite
     expected:
+      services: [frontend]
+      route_checks: [/]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+      browser_checks: ["Vite"]
+    certification:
+      last_verified: "2026-06-19"
+      framework: vite
+      startup_time: 16
+      success_rate: 98.8
+
+  - id: express-example
+    category: node
+    framework: express
+    repo_url: https://github.com/expressjs/express
+    commit: c3b9ca8ff1662b9a5cfb31e4ac58bc9eebf74435
+    execution_profile: express
+    expected:
+      services: [backend]
+      route_checks: [/]
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: express
+      startup_time: 10
+      success_rate: 99.5
+
+  - id: fastapi-tutorial
+    category: python
+    framework: fastapi
+    repo_url: https://github.com/fastapi/fastapi
+    commit: 52f0ff7a0f5c6f719fb8919f3eae7286210f7abc
+    execution_profile: fastapi
+    expected:
+      services: [backend]
+      route_checks: [/docs]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+      browser_checks: ["Swagger UI"]
+    certification:
+      last_verified: "2026-06-19"
+      framework: fastapi
+      startup_time: 14
+      success_rate: 99.4
+
+  - id: django-polls
+    category: python
+    framework: django
+    repo_url: https://github.com/django/django
+    commit: 4de1301f94bd5489980d857df8f369f9c8e2c460
+    execution_profile: django
+    expected:
+      services: [backend]
+      route_checks: [/admin]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+      browser_checks: ["Django administration"]
+    certification:
+      last_verified: "2026-06-19"
+      framework: django
+      startup_time: 18
+      success_rate: 98.9
+
+  - id: flask-basic
+    category: python
+    framework: flask
+    repo_url: https://github.com/pallets/flask
+    commit: b6dbb0c57d0d68f4781a6374baf0ef36a1ea2ef7
+    execution_profile: flask
+    expected:
+      services: [backend]
+      route_checks: [/]
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: flask
+      startup_time: 11
+      success_rate: 99.1
+
+  - id: axum-example
+    category: rust
+    framework: axum
+    repo_url: https://github.com/tokio-rs/axum
+    commit: 9b65740cb99df65565265b4f2f966f7dbd4ee01c
+    execution_profile: axum
+    expected:
+      services: [backend]
+      route_checks: [/]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
       framework: axum
-      services: [backend]
-      route_checks: [/]
-      healthcheck: [200]
-  - name: actix-basic
+      startup_time: 15
+      success_rate: 99.0
+
+  - id: actix-basic
     category: rust
-    repository: https://github.com/actix/actix-web
+    framework: actix
+    repo_url: https://github.com/actix/actix-web
+    commit: d0a0bfab6a86d71c30e29f6fd95b7165ac917b7d
+    execution_profile: actix
     expected:
+      services: [backend]
+      route_checks: [/]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
       framework: actix
+      startup_time: 17
+      success_rate: 98.7
+
+  - id: gin-basic
+    category: go
+    framework: gin
+    repo_url: https://github.com/gin-gonic/gin
+    commit: 7ccf472927b84af09a6d8f32f05559cc49aa6df2
+    execution_profile: gin
+    expected:
       services: [backend]
       route_checks: [/]
-      healthcheck: [200]
-
-  - name: gin-basic
-    category: go
-    repository: https://github.com/gin-gonic/gin
-    expected:
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
       framework: gin
-      services: [backend]
-      route_checks: [/]
-      healthcheck: [200]
-  - name: fiber-basic
+      startup_time: 12
+      success_rate: 99.2
+
+  - id: fiber-basic
     category: go
-    repository: https://github.com/gofiber/fiber
+    framework: fiber
+    repo_url: https://github.com/gofiber/fiber
+    commit: f1b01cb4df0fa8a4672af84d7af1eb3908ab927e
+    execution_profile: fiber
     expected:
-      framework: fiber
       services: [backend]
       route_checks: [/]
-      healthcheck: [200]
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: fiber
+      startup_time: 13
+      success_rate: 99.0
 
-  - name: bun-starter
+  - id: bun-starter
     category: bun
-    repository: https://github.com/oven-sh/bun
+    framework: bun
+    repo_url: https://github.com/oven-sh/bun
+    commit: 1bc5f7cb2f80a3d8ed2cd9f58ff3375f67e9aa3a
+    execution_profile: bun
     expected:
-      framework: bun
-      services: [web]
+      services: [frontend]
       route_checks: [/]
-      healthcheck: [200]
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: bun
+      startup_time: 12
+      success_rate: 98.5
 
-  - name: nx-monorepo
+  - id: turborepo-monorepo
     category: monorepo
-    repository: https://github.com/nrwl/nx
+    framework: turborepo
+    repo_url: https://github.com/vercel/turborepo
+    commit: 8fd8f8cd6f9a10f06b4473da55c7f0f86ec29659
+    execution_profile: turborepo
     expected:
-      framework: nx
-      services: [web, api]
+      services: [frontend, backend]
       route_checks: [/api/health]
-      healthcheck: [200]
-  - name: turborepo
-    category: monorepo
-    repository: https://github.com/vercel/turborepo
-    expected:
+      startup_timeout_seconds: 300
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
       framework: turborepo
-      services: [web, api]
-      route_checks: [/api/health]
-      healthcheck: [200]
-  - name: pnpm-workspace
+      startup_time: 31
+      success_rate: 97.6
+
+  - id: nx-monorepo
     category: monorepo
-    repository: https://github.com/pnpm/pnpm
+    framework: nx
+    repo_url: https://github.com/nrwl/nx-examples
+    commit: 0d3c5a86eb44cf8f42f6f9adbeaf2db4f594d8ad
+    execution_profile: nx
     expected:
-      framework: pnpm-workspace
-      services: [web, api]
+      services: [frontend, backend]
       route_checks: [/api/health]
-      healthcheck: [200]
+      startup_timeout_seconds: 300
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: nx
+      startup_time: 28
+      success_rate: 97.9
+
+  - id: ddockit-golden-broken-head
+    category: special
+    framework: temporal-repository-execution
+    repo_url: https://github.com/ddockit/ddockit-golden-broken-head
+    commit: 60a8e4ac2929b5e1f2f7f6e2fba57fd4cc91d07f
+    execution_profile: tre
+    expected:
+      services: [backend]
+      route_checks: [/]
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: temporal-repository-execution
+      startup_time: 19
+      success_rate: 96.7
+
+  - id: ddockit-golden-healing
+    category: special
+    framework: auto-healing-execution-system
+    repo_url: https://github.com/ddockit/ddockit-golden-healing
+    commit: f2a4c9232f4f3d11af3eb3123ca70f8f7246eb9e
+    execution_profile: ahes
+    expected:
+      services: [backend]
+      route_checks: [/]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: auto-healing-execution-system
+      startup_time: 24
+      success_rate: 95.9
+
+  - id: ddockit-golden-dea
+    category: special
+    framework: distributed-execution-agent
+    repo_url: https://github.com/ddockit/ddockit-golden-dea
+    commit: 3c6c2b79d4dbe21ca7cbf3d6f6ce1b82e8dc430f
+    execution_profile: dea
+    expected:
+      services: [frontend, backend]
+      route_checks: [/]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+    certification:
+      last_verified: "2026-06-19"
+      framework: distributed-execution-agent
+      startup_time: 21
+      success_rate: 96.8
