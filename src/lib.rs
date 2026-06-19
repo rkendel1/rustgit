@@ -495,8 +495,13 @@ pub enum WorkspaceState {
     Materializing,
     Analyzing,
     Planning,
+    Pending,
+    Provisioning,
     Starting,
     Running,
+    Degraded,
+    Restarting,
+    Migrating,
     Paused,
     Failed,
     Stopping,
@@ -1177,6 +1182,7 @@ pub struct WorkerNode {
 pub struct WorkerRegistry {
     pub workers: HashMap<String, WorkerNode>,
     pub heartbeats: HashMap<String, u64>,
+    pub heartbeat_reports: HashMap<String, WorkerHeartbeat>,
     pub heartbeat_timeout_secs: u64,
 }
 
@@ -1185,6 +1191,7 @@ impl WorkerRegistry {
         Self {
             workers: HashMap::new(),
             heartbeats: HashMap::new(),
+            heartbeat_reports: HashMap::new(),
             heartbeat_timeout_secs: heartbeat_timeout_secs.max(MIN_COORDINATION_TIMEOUT_SECS),
         }
     }
@@ -1214,6 +1221,20 @@ impl WorkerRegistry {
             worker.status = WorkerStatus::Ready;
         }
         self.heartbeats.insert(worker_id.to_string(), now);
+        true
+    }
+
+    pub fn record_worker_heartbeat(&mut self, heartbeat: WorkerHeartbeat) -> bool {
+        if !self.record_heartbeat(&heartbeat.worker_id, heartbeat.timestamp) {
+            return false;
+        }
+        let worker_id = heartbeat.worker_id.clone();
+        if !heartbeat.health {
+            if let Some(worker) = self.workers.get_mut(&worker_id) {
+                worker.status = WorkerStatus::Unhealthy;
+            }
+        }
+        self.heartbeat_reports.insert(worker_id, heartbeat);
         true
     }
 
@@ -1987,6 +2008,412 @@ pub struct NetworkPolicy {
     pub allowed_hosts: Vec<String>,
 }
 
+pub type WorkspaceId = String;
+pub type RepositoryId = String;
+pub type UserId = String;
+pub type ExecutionId = String;
+pub type WorkerId = String;
+pub type DateTime = u64;
+pub type RuntimeKind = RuntimeType;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct WorkspaceUrl(pub String);
+
+impl WorkspaceUrl {
+    pub fn wildcard(workspace_id: &str) -> Self {
+        Self(format!("workspace-{workspace_id}.ddockit.app"))
+    }
+
+    pub fn path(workspace_id: &str) -> Self {
+        Self(format!("ddockit.app/w/{workspace_id}"))
+    }
+}
+
+pub fn stable_workspace_url(workspace_id: &str, wildcard_dns: bool) -> WorkspaceUrl {
+    if wildcard_dns {
+        WorkspaceUrl::wildcard(workspace_id)
+    } else {
+        WorkspaceUrl::path(workspace_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceQuota {
+    pub max_cpu: u32,
+    pub max_memory: u64,
+    pub max_runtime_hours: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRecord {
+    pub workspace_id: WorkspaceId,
+    pub repository_id: RepositoryId,
+    pub owner_id: UserId,
+    pub execution_id: ExecutionId,
+    pub assigned_worker: Option<WorkerId>,
+    pub assigned_runtime: RuntimeKind,
+    pub assigned_url: WorkspaceUrl,
+    pub state: WorkspaceState,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub quota: WorkspaceQuota,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRegistry {
+    records: HashMap<WorkspaceId, WorkspaceRecord>,
+}
+
+impl WorkspaceRegistry {
+    pub fn upsert(&mut self, record: WorkspaceRecord) {
+        self.records.insert(record.workspace_id.clone(), record);
+    }
+
+    pub fn get(&self, workspace_id: &str) -> Option<&WorkspaceRecord> {
+        self.records.get(workspace_id)
+    }
+
+    pub fn get_mut(&mut self, workspace_id: &str) -> Option<&mut WorkspaceRecord> {
+        self.records.get_mut(workspace_id)
+    }
+
+    pub fn set_state(&mut self, workspace_id: &str, state: WorkspaceState, now: DateTime) -> bool {
+        let Some(record) = self.records.get_mut(workspace_id) else {
+            return false;
+        };
+        if can_transition(record.state, state) || record.state == state {
+            record.state = state;
+            record.updated_at = now;
+            return true;
+        }
+        false
+    }
+
+    pub fn all(&self) -> Vec<WorkspaceRecord> {
+        let mut records = self.records.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|a, b| a.workspace_id.cmp(&b.workspace_id));
+        records
+    }
+
+    pub fn count_active(&self) -> usize {
+        self.records
+            .values()
+            .filter(|record| {
+                !matches!(
+                    record.state,
+                    WorkspaceState::Stopped | WorkspaceState::Failed | WorkspaceState::Destroyed
+                )
+            })
+            .count()
+    }
+
+    pub fn count_failed(&self) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.state == WorkspaceState::Failed)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionLease {
+    pub workspace_id: WorkspaceId,
+    pub worker_id: WorkerId,
+    pub lease_until: DateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionLeaseRegistry {
+    leases: HashMap<WorkspaceId, ExecutionLease>,
+}
+
+impl ExecutionLeaseRegistry {
+    pub fn assign(
+        &mut self,
+        workspace_id: &str,
+        worker_id: &str,
+        now: DateTime,
+        lease_ttl_secs: u64,
+    ) {
+        self.leases.insert(
+            workspace_id.to_string(),
+            ExecutionLease {
+                workspace_id: workspace_id.to_string(),
+                worker_id: worker_id.to_string(),
+                lease_until: now.saturating_add(lease_ttl_secs.max(1)),
+            },
+        );
+    }
+
+    pub fn get(&self, workspace_id: &str) -> Option<&ExecutionLease> {
+        self.leases.get(workspace_id)
+    }
+
+    pub fn expire_for_worker(&mut self, worker_id: &str, now: DateTime) -> Vec<WorkspaceId> {
+        let mut expired = self
+            .leases
+            .iter()
+            .filter_map(|(workspace_id, lease)| {
+                ((lease.worker_id == worker_id) && lease.lease_until <= now)
+                    .then_some(workspace_id.clone())
+            })
+            .collect::<Vec<_>>();
+        expired.sort();
+        for workspace_id in &expired {
+            self.leases.remove(workspace_id);
+        }
+        expired
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRoute {
+    pub workspace_id: WorkspaceId,
+    pub worker_id: WorkerId,
+    pub runtime: RuntimeKind,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceProxyBinding {
+    pub worker_id: WorkerId,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceProxy {
+    routes: HashMap<WorkspaceId, WorkspaceProxyBinding>,
+}
+
+impl WorkspaceProxy {
+    pub fn bind(
+        &mut self,
+        workspace_id: &str,
+        worker_id: &str,
+        target: impl Into<String>,
+    ) -> WorkspaceProxyBinding {
+        let binding = WorkspaceProxyBinding {
+            worker_id: worker_id.to_string(),
+            target: target.into(),
+        };
+        self.routes
+            .insert(workspace_id.to_string(), binding.clone());
+        binding
+    }
+
+    pub fn resolve(&self, workspace_id: &str) -> Option<&WorkspaceProxyBinding> {
+        self.routes.get(workspace_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceMetrics {
+    pub active_workspaces: usize,
+    pub failed_workspaces: usize,
+    pub workspace_restarts: u64,
+    pub migration_count: u64,
+    pub router_latency: f64,
+    pub worker_utilization: f64,
+}
+
+impl Default for WorkspaceMetrics {
+    fn default() -> Self {
+        Self {
+            active_workspaces: 0,
+            failed_workspaces: 0,
+            workspace_restarts: 0,
+            migration_count: 0,
+            router_latency: 0.0,
+            worker_utilization: 0.0,
+        }
+    }
+}
+
+impl WorkspaceMetrics {
+    pub fn render_prometheus(&self) -> String {
+        format!(
+            "active_workspaces {}\nfailed_workspaces {}\nworkspace_restarts {}\nmigration_count {}\nrouter_latency {}\nworker_utilization {}\n",
+            self.active_workspaces,
+            self.failed_workspaces,
+            self.workspace_restarts,
+            self.migration_count,
+            self.router_latency,
+            self.worker_utilization
+        )
+    }
+}
+
+pub fn metrics_endpoint(metrics: &WorkspaceMetrics) -> (String, String) {
+    ("/metrics".to_string(), metrics.render_prometheus())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRouter;
+
+impl WorkspaceRouter {
+    pub fn resolve_workspace(
+        &self,
+        registry: &WorkspaceRegistry,
+        workspace_id: &str,
+    ) -> Option<WorkspaceRecord> {
+        registry.get(workspace_id).cloned()
+    }
+
+    pub fn resolve_worker(&self, registry: &WorkspaceRegistry, workspace_id: &str) -> Option<WorkerId> {
+        registry
+            .get(workspace_id)
+            .and_then(|record| record.assigned_worker.clone())
+    }
+
+    pub fn route_request(
+        &self,
+        registry: &WorkspaceRegistry,
+        proxy: &WorkspaceProxy,
+        request_target: &str,
+    ) -> Option<WorkspaceRoute> {
+        let start = current_unix_epoch_micros();
+        let workspace_id = parse_workspace_id(request_target)?;
+        let workspace = registry.get(&workspace_id)?;
+        let binding = proxy.resolve(&workspace_id)?;
+        let _latency = current_unix_epoch_micros().saturating_sub(start);
+
+        Some(WorkspaceRoute {
+            workspace_id: workspace_id.clone(),
+            worker_id: binding.worker_id.clone(),
+            runtime: workspace.assigned_runtime,
+            target: binding.target.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHealthStatus {
+    pub workspace_id: WorkspaceId,
+    pub http_ok: bool,
+    pub tcp_reachable: bool,
+    pub process_alive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceHealthMonitor;
+
+impl WorkspaceHealthMonitor {
+    pub fn evaluate(&self, health: &WorkspaceHealthStatus) -> WorkspaceState {
+        if health.http_ok && health.tcp_reachable && health.process_alive {
+            WorkspaceState::Running
+        } else {
+            WorkspaceState::Degraded
+        }
+    }
+
+    pub fn apply(
+        &self,
+        registry: &mut WorkspaceRegistry,
+        health: WorkspaceHealthStatus,
+        now: DateTime,
+    ) -> Option<WorkspaceState> {
+        let next = self.evaluate(&health);
+        if registry.set_state(&health.workspace_id, next, now) {
+            Some(next)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRecoveryManager;
+
+impl WorkspaceRecoveryManager {
+    pub fn restart(
+        &self,
+        registry: &mut WorkspaceRegistry,
+        workspace_id: &str,
+        now: DateTime,
+    ) -> bool {
+        if !registry.set_state(workspace_id, WorkspaceState::Restarting, now) {
+            return false;
+        }
+        registry.set_state(workspace_id, WorkspaceState::Running, now.saturating_add(1))
+    }
+
+    pub fn migrate(
+        &self,
+        registry: &mut WorkspaceRegistry,
+        lease_registry: &mut ExecutionLeaseRegistry,
+        workspace_id: &str,
+        target_worker: &str,
+        now: DateTime,
+        lease_ttl_secs: u64,
+    ) -> bool {
+        if !registry.set_state(workspace_id, WorkspaceState::Migrating, now) {
+            return false;
+        }
+        let Some(record) = registry.get_mut(workspace_id) else {
+            return false;
+        };
+        let stable_url = record.assigned_url.clone();
+        record.assigned_worker = Some(target_worker.to_string());
+        record.assigned_url = stable_url;
+        record.updated_at = now;
+        lease_registry.assign(workspace_id, target_worker, now, lease_ttl_secs);
+        registry.set_state(workspace_id, WorkspaceState::Running, now.saturating_add(1))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerHeartbeat {
+    pub worker_id: WorkerId,
+    pub cpu: u32,
+    pub memory: u64,
+    pub running_workspaces: usize,
+    pub health: bool,
+    pub timestamp: DateTime,
+}
+
+pub const MAX_WORKSPACES_PER_WORKER: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCapacitySnapshot {
+    pub worker_id: WorkerId,
+    pub cpu_available: u32,
+    pub memory_available: u64,
+    pub workspace_capacity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityScheduler {
+    pub max_workspaces_per_worker: usize,
+}
+
+impl Default for CapacityScheduler {
+    fn default() -> Self {
+        Self {
+            max_workspaces_per_worker: MAX_WORKSPACES_PER_WORKER,
+        }
+    }
+}
+
+impl CapacityScheduler {
+    pub fn score(&self, worker: &WorkerCapacitySnapshot) -> u128 {
+        u128::from(worker.cpu_available)
+            + u128::from(worker.memory_available)
+            + (worker.workspace_capacity as u128)
+    }
+
+    pub fn select_worker(&self, workers: &[WorkerCapacitySnapshot]) -> Option<WorkerId> {
+        workers
+            .iter()
+            .filter(|worker| worker.workspace_capacity <= self.max_workspaces_per_worker)
+            .max_by(|a, b| {
+                self.score(a)
+                    .cmp(&self.score(b))
+                    .then_with(|| a.worker_id.cmp(&b.worker_id))
+            })
+            .map(|worker| worker.worker_id.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub id: String,
@@ -2044,7 +2471,7 @@ pub trait WasmWorkspace {
     fn ports(&self, id: &str) -> Result<Vec<PortInfo>>;
 }
 
-struct WorkspaceRecord {
+struct ActiveWorkspaceRecord {
     workspace: Workspace,
     logs: Vec<String>,
     execution_context: Option<ExecutionContext>,
@@ -2059,7 +2486,7 @@ pub struct ExecutionEngine {
 pub struct WorkspaceManager {
     root: PathBuf,
     execution_engine: ExecutionEngine,
-    workspaces: Arc<Mutex<HashMap<String, WorkspaceRecord>>>,
+    workspaces: Arc<Mutex<HashMap<String, ActiveWorkspaceRecord>>>,
     repository_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
     sequence: AtomicU64,
 }
@@ -2283,7 +2710,7 @@ impl WasmWorkspace for WorkspaceManager {
             let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
             workspaces.insert(
                 id.clone(),
-                WorkspaceRecord {
+                ActiveWorkspaceRecord {
                     workspace: workspace.clone(),
                     logs: vec!["workspace created".to_string()],
                     execution_context: None,
@@ -3996,11 +4423,45 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
             matches!(to, WorkspaceState::Planning | WorkspaceState::Failed)
         }
         WorkspaceState::Planning => matches!(to, WorkspaceState::Starting | WorkspaceState::Failed),
+        WorkspaceState::Pending => {
+            matches!(to, WorkspaceState::Provisioning | WorkspaceState::Failed)
+        }
+        WorkspaceState::Provisioning => {
+            matches!(to, WorkspaceState::Starting | WorkspaceState::Failed)
+        }
         WorkspaceState::Starting => matches!(to, WorkspaceState::Running | WorkspaceState::Failed),
         WorkspaceState::Running => {
             matches!(
                 to,
-                WorkspaceState::Paused | WorkspaceState::Stopping | WorkspaceState::Failed
+                WorkspaceState::Paused
+                    | WorkspaceState::Stopping
+                    | WorkspaceState::Degraded
+                    | WorkspaceState::Restarting
+                    | WorkspaceState::Migrating
+                    | WorkspaceState::Stopped
+                    | WorkspaceState::Failed
+            )
+        }
+        WorkspaceState::Degraded => {
+            matches!(
+                to,
+                WorkspaceState::Running
+                    | WorkspaceState::Restarting
+                    | WorkspaceState::Migrating
+                    | WorkspaceState::Stopped
+                    | WorkspaceState::Failed
+            )
+        }
+        WorkspaceState::Restarting => {
+            matches!(
+                to,
+                WorkspaceState::Starting | WorkspaceState::Running | WorkspaceState::Failed
+            )
+        }
+        WorkspaceState::Migrating => {
+            matches!(
+                to,
+                WorkspaceState::Starting | WorkspaceState::Running | WorkspaceState::Failed
             )
         }
         WorkspaceState::Paused => {
@@ -4012,12 +4473,23 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
         WorkspaceState::Failed => {
             matches!(
                 to,
-                WorkspaceState::Starting | WorkspaceState::Stopping | WorkspaceState::Destroyed
+                WorkspaceState::Starting
+                    | WorkspaceState::Restarting
+                    | WorkspaceState::Migrating
+                    | WorkspaceState::Stopping
+                    | WorkspaceState::Stopped
+                    | WorkspaceState::Destroyed
             )
         }
         WorkspaceState::Stopping => matches!(to, WorkspaceState::Stopped | WorkspaceState::Failed),
         WorkspaceState::Stopped => {
-            matches!(to, WorkspaceState::Starting | WorkspaceState::Destroyed)
+            matches!(
+                to,
+                WorkspaceState::Starting
+                    | WorkspaceState::Restarting
+                    | WorkspaceState::Provisioning
+                    | WorkspaceState::Destroyed
+            )
         }
         WorkspaceState::Destroyed => false,
     }
@@ -4905,6 +5377,27 @@ fn current_unix_epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn current_unix_epoch_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn parse_workspace_id(request_target: &str) -> Option<String> {
+    if let Some(id) = request_target
+        .strip_prefix("workspace-")
+        .and_then(|value| value.strip_suffix(".ddockit.app"))
+    {
+        return Some(id.to_string());
+    }
+
+    request_target
+        .strip_prefix("ddockit.app/w/")
+        .or_else(|| request_target.strip_prefix("/w/"))
+        .map(|id| id.to_string())
 }
 
 #[cfg(test)]
@@ -6454,5 +6947,178 @@ mod tests {
             timestamp: 100,
         });
         assert_eq!(ide.log_stream.entries.len(), 1);
+    }
+
+    #[test]
+    fn control_plane_workspace_state_transitions_cover_runtime_lifecycle() {
+        assert!(can_transition(
+            WorkspaceState::Pending,
+            WorkspaceState::Provisioning
+        ));
+        assert!(can_transition(
+            WorkspaceState::Provisioning,
+            WorkspaceState::Starting
+        ));
+        assert!(can_transition(
+            WorkspaceState::Running,
+            WorkspaceState::Degraded
+        ));
+        assert!(can_transition(
+            WorkspaceState::Degraded,
+            WorkspaceState::Restarting
+        ));
+        assert!(can_transition(
+            WorkspaceState::Running,
+            WorkspaceState::Migrating
+        ));
+        assert!(!can_transition(
+            WorkspaceState::Pending,
+            WorkspaceState::Running
+        ));
+    }
+
+    #[test]
+    fn workspace_router_resolves_stable_url_and_proxy_target() {
+        let mut registry = WorkspaceRegistry::default();
+        registry.upsert(WorkspaceRecord {
+            workspace_id: "a1b2".to_string(),
+            repository_id: "repo-1".to_string(),
+            owner_id: "user-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            assigned_worker: Some("worker-3".to_string()),
+            assigned_runtime: RuntimeType::Node,
+            assigned_url: stable_workspace_url("a1b2", true),
+            state: WorkspaceState::Running,
+            created_at: 1,
+            updated_at: 1,
+            quota: WorkspaceQuota {
+                max_cpu: 1000,
+                max_memory: 2048,
+                max_runtime_hours: 4,
+            },
+        });
+        let mut proxy = WorkspaceProxy::default();
+        proxy.bind("a1b2", "worker-3", "http://worker-3:3012");
+        let router = WorkspaceRouter;
+
+        let route = router
+            .route_request(&registry, &proxy, "workspace-a1b2.ddockit.app")
+            .expect("route for stable host should resolve");
+        assert_eq!(route.worker_id, "worker-3");
+        assert_eq!(route.target, "http://worker-3:3012");
+        assert_eq!(
+            registry
+                .get("a1b2")
+                .map(|record| record.assigned_url.clone()),
+            Some(WorkspaceUrl("workspace-a1b2.ddockit.app".to_string()))
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_and_lease_expiry_drive_failure_detection() {
+        let worker = WorkerNode {
+            id: "worker-a".to_string(),
+            capabilities: WorkerCapabilities {
+                wasm: true,
+                native: true,
+                cpu_cores: 8,
+                memory_mb: 8192,
+                labels: vec![],
+            },
+            status: WorkerStatus::Ready,
+        };
+        let mut workers = WorkerRegistry::from_workers(vec![worker], 10, 100);
+        assert!(workers.record_worker_heartbeat(WorkerHeartbeat {
+            worker_id: "worker-a".to_string(),
+            cpu: 40,
+            memory: 2048,
+            running_workspaces: 3,
+            health: true,
+            timestamp: 105,
+        }));
+        let mut leases = ExecutionLeaseRegistry::default();
+        leases.assign("a1b2", "worker-a", 105, 10);
+
+        assert_eq!(workers.detect_failed_workers(116), vec!["worker-a"]);
+        assert_eq!(leases.expire_for_worker("worker-a", 116), vec!["a1b2"]);
+    }
+
+    #[test]
+    fn recovery_manager_migrates_workspace_without_changing_url() {
+        let mut registry = WorkspaceRegistry::default();
+        let url = stable_workspace_url("z9y8", true);
+        registry.upsert(WorkspaceRecord {
+            workspace_id: "z9y8".to_string(),
+            repository_id: "repo-2".to_string(),
+            owner_id: "user-2".to_string(),
+            execution_id: "exec-2".to_string(),
+            assigned_worker: Some("worker-a".to_string()),
+            assigned_runtime: RuntimeType::Rust,
+            assigned_url: url.clone(),
+            state: WorkspaceState::Running,
+            created_at: 1,
+            updated_at: 1,
+            quota: WorkspaceQuota::default(),
+        });
+
+        let mut leases = ExecutionLeaseRegistry::default();
+        leases.assign("z9y8", "worker-a", 1, 5);
+        let recovery = WorkspaceRecoveryManager;
+        assert!(recovery.migrate(
+            &mut registry,
+            &mut leases,
+            "z9y8",
+            "worker-b",
+            10,
+            10
+        ));
+
+        let record = registry.get("z9y8").expect("workspace should exist");
+        assert_eq!(record.assigned_worker.as_deref(), Some("worker-b"));
+        assert_eq!(record.assigned_url, url);
+        assert_eq!(record.state, WorkspaceState::Running);
+    }
+
+    #[test]
+    fn capacity_scheduler_prefers_highest_score_under_limit_and_metrics_render() {
+        let scheduler = CapacityScheduler {
+            max_workspaces_per_worker: 100,
+        };
+        let selected = scheduler
+            .select_worker(&[
+                WorkerCapacitySnapshot {
+                    worker_id: "worker-a".to_string(),
+                    cpu_available: 800,
+                    memory_available: 4096,
+                    workspace_capacity: 95,
+                },
+                WorkerCapacitySnapshot {
+                    worker_id: "worker-b".to_string(),
+                    cpu_available: 700,
+                    memory_available: 8192,
+                    workspace_capacity: 80,
+                },
+                WorkerCapacitySnapshot {
+                    worker_id: "worker-c".to_string(),
+                    cpu_available: 900,
+                    memory_available: 8192,
+                    workspace_capacity: 101,
+                },
+            ])
+            .expect("one worker should be schedulable");
+        assert_eq!(selected, "worker-b");
+
+        let metrics = WorkspaceMetrics {
+            active_workspaces: 100,
+            failed_workspaces: 2,
+            workspace_restarts: 7,
+            migration_count: 3,
+            router_latency: 1.5,
+            worker_utilization: 0.72,
+        };
+        let (path, body) = metrics_endpoint(&metrics);
+        assert_eq!(path, "/metrics");
+        assert!(body.contains("active_workspaces 100"));
+        assert!(body.contains("worker_utilization 0.72"));
     }
 }
