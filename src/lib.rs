@@ -1099,6 +1099,496 @@ impl TemporalExecutionRouter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureClass {
+    MissingDependency,
+    MissingLockfile,
+    WrongPackageManager,
+    MissingEnvironmentVariable,
+    InvalidStartupCommand,
+    PortConflict,
+    MissingBuildArtifact,
+    RuntimeVersionMismatch,
+    DockerMisconfiguration,
+    ServiceDependencyFailure,
+    DatabaseUnavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairAction {
+    InstallDependency,
+    RebuildArtifacts,
+    ChangeRuntimeVersion,
+    SwitchPackageManager,
+    RegenerateLockfile,
+    AllocateNewPort,
+    InjectEnvironmentDefaults,
+    RestartDependency,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairStrategy {
+    pub strategy_id: String,
+    pub confidence: f32,
+    pub actions: Vec<RepairAction>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealingConfidence {
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FailureSignal {
+    pub message: String,
+    pub attempted_command: Option<String>,
+    pub expected_package_manager: Option<String>,
+    pub required_runtime: Option<String>,
+    pub detected_runtime: Option<String>,
+    pub missing_environment_variables: Vec<String>,
+    pub required_artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FailureClassifier;
+
+impl FailureClassifier {
+    pub fn classify(&self, failure: &FailureSignal, fingerprint: &RepositoryFingerprint) -> FailureClass {
+        let message = failure.message.to_ascii_lowercase();
+        let attempted_command = failure
+            .attempted_command
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let expected_package_manager = failure
+            .expected_package_manager
+            .as_deref()
+            .or(fingerprint.build_signals.lockfile_type.as_deref())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !expected_package_manager.is_empty()
+            && !attempted_command.is_empty()
+            && package_manager_conflicts(&expected_package_manager, &attempted_command)
+        {
+            return FailureClass::WrongPackageManager;
+        }
+
+        if (!failure.missing_environment_variables.is_empty()
+            || message.contains("missing environment variable")
+            || message.contains("missing env"))
+            && !message.contains("lockfile")
+        {
+            return FailureClass::MissingEnvironmentVariable;
+        }
+
+        if !fingerprint.build_signals.has_lockfile
+            && (message.contains("lockfile") || message.contains("frozen-lockfile"))
+        {
+            return FailureClass::MissingLockfile;
+        }
+
+        if message.contains("modulenotfounderror")
+            || message.contains("cannot find module")
+            || message.contains("no module named")
+        {
+            return FailureClass::MissingDependency;
+        }
+
+        let required_runtime = failure
+            .required_runtime
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let detected_runtime = failure
+            .detected_runtime
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !required_runtime.is_empty()
+            && !detected_runtime.is_empty()
+            && required_runtime != detected_runtime
+        {
+            return FailureClass::RuntimeVersionMismatch;
+        }
+        if message.contains("runtime mismatch")
+            || (message.contains("requires node") && message.contains("detected"))
+        {
+            return FailureClass::RuntimeVersionMismatch;
+        }
+
+        if message.contains("eaddrinuse") || message.contains("address already in use") {
+            return FailureClass::PortConflict;
+        }
+
+        if failure.required_artifact.is_some()
+            || message.contains("dist/")
+            || message.contains("missing build artifact")
+        {
+            return FailureClass::MissingBuildArtifact;
+        }
+
+        if message.contains("missing script")
+            || message.contains("command not found")
+            || message.contains("invalid startup")
+        {
+            return FailureClass::InvalidStartupCommand;
+        }
+
+        if message.contains("database unavailable")
+            || (fingerprint.infra_signals.uses_database && message.contains("connection refused"))
+        {
+            return FailureClass::DatabaseUnavailable;
+        }
+
+        if message.contains("service dependency")
+            || message.contains("upstream")
+            || message.contains("dependency failed")
+        {
+            return FailureClass::ServiceDependencyFailure;
+        }
+
+        if message.contains("docker")
+            && (message.contains("misconfiguration")
+                || message.contains("daemon")
+                || message.contains("compose"))
+        {
+            return FailureClass::DockerMisconfiguration;
+        }
+
+        FailureClass::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuntimeHealingEngine;
+
+impl RuntimeHealingEngine {
+    pub fn actions_for(&self, class: FailureClass) -> Vec<RepairAction> {
+        match class {
+            FailureClass::PortConflict => vec![RepairAction::AllocateNewPort],
+            FailureClass::ServiceDependencyFailure => vec![RepairAction::RestartDependency],
+            _ => vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TopologyHealingEngine;
+
+impl TopologyHealingEngine {
+    pub fn actions_for(&self, class: FailureClass) -> Vec<RepairAction> {
+        match class {
+            FailureClass::ServiceDependencyFailure | FailureClass::DatabaseUnavailable => {
+                vec![RepairAction::RestartDependency]
+            }
+            _ => vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnvironmentResolver;
+
+impl EnvironmentResolver {
+    pub fn defaults_for(&self, missing_vars: &[String]) -> Vec<(String, String)> {
+        missing_vars
+            .iter()
+            .map(|name| {
+                let value = if name.eq_ignore_ascii_case("database_url") {
+                    "database.internal"
+                } else {
+                    "stub-value"
+                };
+                (name.clone(), value.to_string())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DependencyResolver;
+
+impl DependencyResolver {
+    pub fn actions_for(&self, class: FailureClass) -> Vec<RepairAction> {
+        match class {
+            FailureClass::MissingDependency => vec![RepairAction::InstallDependency],
+            FailureClass::WrongPackageManager => vec![RepairAction::SwitchPackageManager],
+            FailureClass::MissingLockfile => vec![RepairAction::RegenerateLockfile],
+            FailureClass::MissingBuildArtifact | FailureClass::InvalidStartupCommand => {
+                vec![RepairAction::RebuildArtifacts]
+            }
+            _ => vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuntimeCompatibilityResolver;
+
+impl RuntimeCompatibilityResolver {
+    pub fn actions_for(&self, class: FailureClass) -> Vec<RepairAction> {
+        match class {
+            FailureClass::RuntimeVersionMismatch => vec![RepairAction::ChangeRuntimeVersion],
+            _ => vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HealingCatalog {
+    runtime_layer: RuntimeHealingEngine,
+    topology_layer: TopologyHealingEngine,
+    environment_resolver: EnvironmentResolver,
+    dependency_resolver: DependencyResolver,
+    runtime_compatibility: RuntimeCompatibilityResolver,
+}
+
+impl HealingCatalog {
+    pub fn strategy_for(
+        &self,
+        class: FailureClass,
+        failure: &FailureSignal,
+        _fingerprint: &RepositoryFingerprint,
+    ) -> RepairStrategy {
+        let mut actions = Vec::new();
+        append_unique_actions(&mut actions, self.runtime_layer.actions_for(class));
+        append_unique_actions(&mut actions, self.topology_layer.actions_for(class));
+        append_unique_actions(&mut actions, self.dependency_resolver.actions_for(class));
+        append_unique_actions(&mut actions, self.runtime_compatibility.actions_for(class));
+        if !failure.missing_environment_variables.is_empty()
+            || class == FailureClass::MissingEnvironmentVariable
+        {
+            let _defaults = self
+                .environment_resolver
+                .defaults_for(&failure.missing_environment_variables);
+            append_unique_actions(&mut actions, vec![RepairAction::InjectEnvironmentDefaults]);
+        }
+        if actions.is_empty() {
+            actions.push(RepairAction::RestartDependency);
+        }
+
+        RepairStrategy {
+            strategy_id: format!("repair::{class:?}").to_ascii_lowercase(),
+            confidence: healing_confidence_for(class).score,
+            actions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HealingValidationEngine;
+
+impl HealingValidationEngine {
+    pub fn validate(&self, result: &ExecutionResult, healthy: bool) -> bool {
+        result.started && result.stable && healthy
+    }
+}
+
+pub trait HealingRuntime {
+    fn apply_repair(&mut self, action: RepairAction) -> bool;
+    fn re_execute(&mut self) -> ExecutionResult;
+    fn health_check(&self) -> bool;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HealingEngine;
+
+impl HealingEngine {
+    pub fn execute_plan<R: HealingRuntime>(
+        &self,
+        strategy: &RepairStrategy,
+        runtime: &mut R,
+        validator: &HealingValidationEngine,
+    ) -> Option<ExecutionResult> {
+        for action in strategy.actions.iter().copied() {
+            if !runtime.apply_repair(action) {
+                return None;
+            }
+        }
+        let result = runtime.re_execute();
+        if validator.validate(&result, runtime.health_check()) {
+            Some(result)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealingOutcome {
+    Success,
+    EscalatedToTre,
+    HumanIntervention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealingJournalEntry {
+    pub repo_id: String,
+    pub failure_class: FailureClass,
+    pub strategy_id: String,
+    pub outcome: HealingOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HealingJournal {
+    entries: Vec<HealingJournalEntry>,
+}
+
+impl HealingJournal {
+    pub fn record(
+        &mut self,
+        repo_id: &str,
+        failure_class: FailureClass,
+        strategy_id: &str,
+        outcome: HealingOutcome,
+    ) {
+        self.entries.push(HealingJournalEntry {
+            repo_id: repo_id.to_string(),
+            failure_class,
+            strategy_id: strategy_id.to_string(),
+            outcome,
+        });
+    }
+
+    pub fn entries_for_repo(&self, repo_id: &str) -> Vec<HealingJournalEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.repo_id == repo_id)
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HealingDecision {
+    Recovered {
+        failure_class: FailureClass,
+        strategy: RepairStrategy,
+        result: ExecutionResult,
+    },
+    EscalatedToTre {
+        failure_class: FailureClass,
+        strategy: RepairStrategy,
+        selected_commit: String,
+    },
+    HumanInterventionRequired {
+        failure_class: FailureClass,
+        strategy: RepairStrategy,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HealingMetrics {
+    pub healing_attempts: u64,
+    pub healing_success_rate: f64,
+    pub repair_type_distribution: f64,
+    pub avg_repair_time: f64,
+    pub commit_fallback_rate: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HealingCoordinator {
+    classifier: FailureClassifier,
+    catalog: HealingCatalog,
+    engine: HealingEngine,
+    validator: HealingValidationEngine,
+    pub journal: HealingJournal,
+}
+
+impl HealingCoordinator {
+    pub fn heal_or_escalate<R: HealingRuntime>(
+        &mut self,
+        repo_id: &str,
+        failure: &FailureSignal,
+        fingerprint: &RepositoryFingerprint,
+        runtime: &mut R,
+        temporal_router: &TemporalExecutionRouter,
+        graph: &RepositoryTimeGraph,
+        head_commit: &str,
+    ) -> HealingDecision {
+        let failure_class = self.classifier.classify(failure, fingerprint);
+        let strategy = self.catalog.strategy_for(failure_class, failure, fingerprint);
+        if let Some(result) = self
+            .engine
+            .execute_plan(&strategy, runtime, &self.validator)
+        {
+            self.journal.record(
+                repo_id,
+                failure_class,
+                &strategy.strategy_id,
+                HealingOutcome::Success,
+            );
+            return HealingDecision::Recovered {
+                failure_class,
+                strategy,
+                result,
+            };
+        }
+
+        if let Some(commit) = temporal_router.route(graph, head_commit, RecoveryStrategy::LastKnownGood) {
+            self.journal.record(
+                repo_id,
+                failure_class,
+                &strategy.strategy_id,
+                HealingOutcome::EscalatedToTre,
+            );
+            return HealingDecision::EscalatedToTre {
+                failure_class,
+                strategy,
+                selected_commit: commit,
+            };
+        }
+
+        self.journal.record(
+            repo_id,
+            failure_class,
+            &strategy.strategy_id,
+            HealingOutcome::HumanIntervention,
+        );
+        HealingDecision::HumanInterventionRequired {
+            failure_class,
+            strategy,
+        }
+    }
+}
+
+fn append_unique_actions(actions: &mut Vec<RepairAction>, additional: Vec<RepairAction>) {
+    for action in additional {
+        if !actions.contains(&action) {
+            actions.push(action);
+        }
+    }
+}
+
+fn healing_confidence_for(class: FailureClass) -> HealingConfidence {
+    let score = match class {
+        FailureClass::PortConflict => 0.99,
+        FailureClass::WrongPackageManager => 0.95,
+        FailureClass::RuntimeVersionMismatch => 0.90,
+        FailureClass::MissingLockfile => 0.70,
+        FailureClass::MissingDependency => 0.92,
+        FailureClass::MissingEnvironmentVariable => 0.93,
+        FailureClass::MissingBuildArtifact => 0.89,
+        FailureClass::DockerMisconfiguration => 0.78,
+        FailureClass::ServiceDependencyFailure => 0.87,
+        FailureClass::DatabaseUnavailable => 0.85,
+        FailureClass::InvalidStartupCommand => 0.82,
+        FailureClass::Unknown => 0.40,
+    };
+    HealingConfidence { score }
+}
+
+fn package_manager_conflicts(expected: &str, attempted_command: &str) -> bool {
+    match expected {
+        "pnpm" => attempted_command.starts_with("npm "),
+        "npm" => attempted_command.starts_with("pnpm "),
+        "yarn" => attempted_command.starts_with("npm ") || attempted_command.starts_with("pnpm "),
+        "bun" => attempted_command.starts_with("npm ") || attempted_command.starts_with("pnpm "),
+        _ => false,
+    }
+}
+
 /// Returns whether a commit can be treated as runnable for temporal recovery.
 ///
 /// A runnable commit must have successful (or partial-success) build status
@@ -11721,6 +12211,190 @@ mod tests {
         let router = TemporalExecutionRouter::default();
         let selected = router.route(&graph, "aaaaaaa", RecoveryStrategy::LastKnownGood);
         assert_eq!(selected.as_deref(), Some("bbbbbbb"));
+    }
+
+    #[test]
+    fn failure_classifier_detects_wrong_package_manager_for_pnpm_lockfile() {
+        let classifier = FailureClassifier;
+        let fingerprint = RepositoryFingerprint {
+            build_signals: BuildSignals {
+                has_lockfile: true,
+                lockfile_type: Some("pnpm".to_string()),
+                build_scripts: vec![],
+            },
+            ..RepositoryFingerprint::default()
+        };
+        let failure = FailureSignal {
+            message: "npm ERR! install failed".to_string(),
+            attempted_command: Some("npm install".to_string()),
+            ..FailureSignal::default()
+        };
+        assert_eq!(
+            classifier.classify(&failure, &fingerprint),
+            FailureClass::WrongPackageManager
+        );
+    }
+
+    #[test]
+    fn failure_classifier_detects_missing_dependency_for_python_traceback() {
+        let classifier = FailureClassifier;
+        let failure = FailureSignal {
+            message: "ModuleNotFoundError: No module named 'fastapi'".to_string(),
+            ..FailureSignal::default()
+        };
+        assert_eq!(
+            classifier.classify(&failure, &RepositoryFingerprint::default()),
+            FailureClass::MissingDependency
+        );
+    }
+
+    #[test]
+    fn healing_coordinator_recovers_after_deterministic_repair() {
+        #[derive(Debug)]
+        struct StubRuntime {
+            applied: Vec<RepairAction>,
+            result: ExecutionResult,
+            healthy: bool,
+        }
+
+        impl HealingRuntime for StubRuntime {
+            fn apply_repair(&mut self, action: RepairAction) -> bool {
+                self.applied.push(action);
+                true
+            }
+
+            fn re_execute(&mut self) -> ExecutionResult {
+                self.result.clone()
+            }
+
+            fn health_check(&self) -> bool {
+                self.healthy
+            }
+        }
+
+        let mut coordinator = HealingCoordinator::default();
+        let mut runtime = StubRuntime {
+            applied: vec![],
+            result: ExecutionResult {
+                started: true,
+                stable: true,
+                message: "running".to_string(),
+            },
+            healthy: true,
+        };
+        let failure = FailureSignal {
+            message: "EADDRINUSE".to_string(),
+            ..FailureSignal::default()
+        };
+        let decision = coordinator.heal_or_escalate(
+            "repo-ahes",
+            &failure,
+            &RepositoryFingerprint::default(),
+            &mut runtime,
+            &TemporalExecutionRouter::default(),
+            &RepositoryTimeGraph::default(),
+            "aaaaaaa",
+        );
+        match decision {
+            HealingDecision::Recovered {
+                failure_class,
+                strategy,
+                result,
+            } => {
+                assert_eq!(failure_class, FailureClass::PortConflict);
+                assert!(strategy.actions.contains(&RepairAction::AllocateNewPort));
+                assert!(result.stable);
+            }
+            _ => panic!("expected recovered decision"),
+        }
+        assert!(runtime.applied.contains(&RepairAction::AllocateNewPort));
+        let entries = coordinator.journal.entries_for_repo("repo-ahes");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, HealingOutcome::Success);
+    }
+
+    #[test]
+    fn healing_coordinator_escalates_to_tre_after_failed_repair_validation() {
+        #[derive(Debug)]
+        struct StubRuntime {
+            result: ExecutionResult,
+        }
+
+        impl HealingRuntime for StubRuntime {
+            fn apply_repair(&mut self, _action: RepairAction) -> bool {
+                true
+            }
+
+            fn re_execute(&mut self) -> ExecutionResult {
+                self.result.clone()
+            }
+
+            fn health_check(&self) -> bool {
+                false
+            }
+        }
+
+        let graph = RepositoryTimeGraph {
+            repo_id: "repo-temporal".to_string(),
+            commits: vec![
+                CommitNode {
+                    commit_hash: "aaaaaaa".to_string(),
+                    timestamp: 2,
+                    urfs_snapshot: None,
+                    build_status: Some(BuildStatus::Failed),
+                    execution_result: Some(ExecutionResult {
+                        started: false,
+                        stable: false,
+                        message: "failed".to_string(),
+                    }),
+                },
+                CommitNode {
+                    commit_hash: "bbbbbbb".to_string(),
+                    timestamp: 1,
+                    urfs_snapshot: None,
+                    build_status: Some(BuildStatus::Success),
+                    execution_result: Some(ExecutionResult {
+                        started: true,
+                        stable: true,
+                        message: "ok".to_string(),
+                    }),
+                },
+            ],
+            edges: vec![CommitEdge {
+                from_hash: "aaaaaaa".to_string(),
+                to_hash: "bbbbbbb".to_string(),
+            }],
+        };
+        let mut coordinator = HealingCoordinator::default();
+        let mut runtime = StubRuntime {
+            result: ExecutionResult {
+                started: true,
+                stable: false,
+                message: "still unstable".to_string(),
+            },
+        };
+        let failure = FailureSignal {
+            message: "connection refused".to_string(),
+            ..FailureSignal::default()
+        };
+        let decision = coordinator.heal_or_escalate(
+            "repo-temporal",
+            &failure,
+            &RepositoryFingerprint::default(),
+            &mut runtime,
+            &TemporalExecutionRouter::default(),
+            &graph,
+            "aaaaaaa",
+        );
+        match decision {
+            HealingDecision::EscalatedToTre {
+                selected_commit, ..
+            } => assert_eq!(selected_commit, "bbbbbbb"),
+            _ => panic!("expected TRE escalation"),
+        }
+        let entries = coordinator.journal.entries_for_repo("repo-temporal");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, HealingOutcome::EscalatedToTre);
     }
 
     #[test]
