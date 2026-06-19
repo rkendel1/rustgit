@@ -274,11 +274,7 @@ pub fn generate_grounded_docs(
             "struct NativeRuntimeEngine",
             "impl NativeRuntimeEngine"
         ),
-        component_status(
-            source,
-            "struct ExecutionRouter",
-            "impl ExecutionRouter"
-        ),
+        component_status(source, "struct ExecutionRouter", "impl ExecutionRouter"),
     );
 
     let execution_flow = format!(
