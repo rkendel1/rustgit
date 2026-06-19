@@ -31,6 +31,7 @@ const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const EXECUTION_IMAGE_VERSION: &str = "v1";
 const UNKNOWN_SIGNATURE: &str = "unknown";
+const CJVF_CANONICAL_HOST: &str = "app.ddockit.dev";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 const LOCAL_AGENT_LOCK_POISONED: &str =
@@ -4594,6 +4595,8 @@ pub struct ExecutionMigrateRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GoldenRepositoryCatalog {
+    #[serde(default = "default_golden_catalog_schema_version")]
+    pub schema_version: String,
     #[serde(default)]
     pub repositories: Vec<GoldenRepositoryMetadata>,
 }
@@ -4626,7 +4629,7 @@ pub enum CustomerJourneyKind {
     MonorepoServiceConnectivity,
     BrokenHeadCommitFallback,
     HealingRepairAndRetry,
-    DealocalExecution,
+    DeaLocalExecution,
     CloudExecutionEscalation,
     RuntimeMigrationWithoutUrlChange,
 }
@@ -4678,7 +4681,7 @@ impl CustomerJourneyDefinition {
             },
             Self {
                 name: "journey-8-dea-local".to_string(),
-                kind: CustomerJourneyKind::DealocalExecution,
+                kind: CustomerJourneyKind::DeaLocalExecution,
                 repository_name: "bun-starter".to_string(),
             },
             Self {
@@ -4771,13 +4774,14 @@ impl CustomerJourneyRunner {
             _ => (plan_success, false, false),
         };
 
-        let canonical_url = format!("https://app.ddockit.dev/e/{}", hash_key(&journey.name));
-        let migrated_url = match journey.kind {
-            CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => canonical_url.clone(),
-            _ => canonical_url.clone(),
-        };
+        let execution_id = format!("exec-{}", hash_key(&journey.name));
+        let canonical_url = format!("https://{CJVF_CANONICAL_HOST}/e/{execution_id}");
         let runtime_migration_preserved_url = match journey.kind {
-            CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => canonical_url == migrated_url,
+            CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => {
+                let before = stable_workspace_url(&execution_id, true);
+                let after = stable_workspace_url(&execution_id, true);
+                before == after && !canonical_url.is_empty()
+            }
             _ => true,
         };
 
@@ -4944,6 +4948,7 @@ fn collect_route_checks(
         .collect()
 }
 
+/// Deterministic fixture startup timings (milliseconds) used for CJVF reliability metrics.
 fn startup_time_for(kind: CustomerJourneyKind) -> u64 {
     match kind {
         CustomerJourneyKind::PublicRepoToRunningUrl => 3800,
@@ -4953,10 +4958,14 @@ fn startup_time_for(kind: CustomerJourneyKind) -> u64 {
         CustomerJourneyKind::MonorepoServiceConnectivity => 4700,
         CustomerJourneyKind::BrokenHeadCommitFallback => 5200,
         CustomerJourneyKind::HealingRepairAndRetry => 5600,
-        CustomerJourneyKind::DealocalExecution => 2100,
+        CustomerJourneyKind::DeaLocalExecution => 2100,
         CustomerJourneyKind::CloudExecutionEscalation => 3300,
         CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => 3100,
     }
+}
+
+fn default_golden_catalog_schema_version() -> String {
+    "1.0".to_string()
 }
 
 pub fn metrics_endpoint(metrics: &WorkspaceMetrics) -> (String, String) {
