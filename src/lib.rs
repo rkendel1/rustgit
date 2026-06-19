@@ -1294,13 +1294,12 @@ impl EnvironmentResolver {
     pub fn defaults_for(&self, missing_vars: &[String]) -> Vec<(String, String)> {
         missing_vars
             .iter()
-            .map(|name| {
-                let value = if name.eq_ignore_ascii_case("database_url") {
-                    "database.internal"
+            .filter_map(|name| {
+                if name.eq_ignore_ascii_case("database_url") {
+                    Some((name.clone(), "database.internal".to_string()))
                 } else {
-                    "stub-value"
-                };
-                (name.clone(), value.to_string())
+                    None
+                }
             })
             .collect()
     }
@@ -1356,16 +1355,11 @@ impl HealingCatalog {
         append_unique_actions(&mut actions, self.topology_layer.actions_for(class));
         append_unique_actions(&mut actions, self.dependency_resolver.actions_for(class));
         append_unique_actions(&mut actions, self.runtime_compatibility.actions_for(class));
-        if !failure.missing_environment_variables.is_empty()
-            || class == FailureClass::MissingEnvironmentVariable
-        {
-            let _defaults = self
-                .environment_resolver
-                .defaults_for(&failure.missing_environment_variables);
+        let environment_defaults = self
+            .environment_resolver
+            .defaults_for(&failure.missing_environment_variables);
+        if !environment_defaults.is_empty() {
             append_unique_actions(&mut actions, vec![RepairAction::InjectEnvironmentDefaults]);
-        }
-        if actions.is_empty() {
-            actions.push(RepairAction::RestartDependency);
         }
 
         RepairStrategy {
@@ -1478,15 +1472,6 @@ pub enum HealingDecision {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct HealingMetrics {
-    pub healing_attempts: u64,
-    pub healing_success_rate: f64,
-    pub repair_type_distribution: f64,
-    pub avg_repair_time: f64,
-    pub commit_fallback_rate: f64,
-}
-
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HealingCoordinator {
     classifier: FailureClassifier,
@@ -1562,30 +1547,66 @@ fn append_unique_actions(actions: &mut Vec<RepairAction>, additional: Vec<Repair
 }
 
 fn healing_confidence_for(class: FailureClass) -> HealingConfidence {
+    const PORT_REASSIGN_CONFIDENCE: f32 = 0.99;
+    const PACKAGE_MANAGER_SWAP_CONFIDENCE: f32 = 0.95;
+    const RUNTIME_SWAP_CONFIDENCE: f32 = 0.90;
+    const LOCKFILE_REGEN_CONFIDENCE: f32 = 0.70;
+    const DEPENDENCY_INSTALL_CONFIDENCE: f32 = 0.92;
+    const ENVIRONMENT_INJECTION_CONFIDENCE: f32 = 0.93;
+    const ARTIFACT_REBUILD_CONFIDENCE: f32 = 0.89;
+    const DOCKER_REPAIR_CONFIDENCE: f32 = 0.78;
+    const SERVICE_RESTART_CONFIDENCE: f32 = 0.87;
+    const DATABASE_RECOVERY_CONFIDENCE: f32 = 0.85;
+    const STARTUP_RECOVERY_CONFIDENCE: f32 = 0.82;
+    const UNKNOWN_CONFIDENCE: f32 = 0.40;
+
     let score = match class {
-        FailureClass::PortConflict => 0.99,
-        FailureClass::WrongPackageManager => 0.95,
-        FailureClass::RuntimeVersionMismatch => 0.90,
-        FailureClass::MissingLockfile => 0.70,
-        FailureClass::MissingDependency => 0.92,
-        FailureClass::MissingEnvironmentVariable => 0.93,
-        FailureClass::MissingBuildArtifact => 0.89,
-        FailureClass::DockerMisconfiguration => 0.78,
-        FailureClass::ServiceDependencyFailure => 0.87,
-        FailureClass::DatabaseUnavailable => 0.85,
-        FailureClass::InvalidStartupCommand => 0.82,
-        FailureClass::Unknown => 0.40,
+        FailureClass::PortConflict => PORT_REASSIGN_CONFIDENCE,
+        FailureClass::WrongPackageManager => PACKAGE_MANAGER_SWAP_CONFIDENCE,
+        FailureClass::RuntimeVersionMismatch => RUNTIME_SWAP_CONFIDENCE,
+        FailureClass::MissingLockfile => LOCKFILE_REGEN_CONFIDENCE,
+        FailureClass::MissingDependency => DEPENDENCY_INSTALL_CONFIDENCE,
+        FailureClass::MissingEnvironmentVariable => ENVIRONMENT_INJECTION_CONFIDENCE,
+        FailureClass::MissingBuildArtifact => ARTIFACT_REBUILD_CONFIDENCE,
+        FailureClass::DockerMisconfiguration => DOCKER_REPAIR_CONFIDENCE,
+        FailureClass::ServiceDependencyFailure => SERVICE_RESTART_CONFIDENCE,
+        FailureClass::DatabaseUnavailable => DATABASE_RECOVERY_CONFIDENCE,
+        FailureClass::InvalidStartupCommand => STARTUP_RECOVERY_CONFIDENCE,
+        FailureClass::Unknown => UNKNOWN_CONFIDENCE,
     };
     HealingConfidence { score }
 }
 
 fn package_manager_conflicts(expected: &str, attempted_command: &str) -> bool {
-    match expected {
-        "pnpm" => attempted_command.starts_with("npm "),
-        "npm" => attempted_command.starts_with("pnpm "),
-        "yarn" => attempted_command.starts_with("npm ") || attempted_command.starts_with("pnpm "),
-        "bun" => attempted_command.starts_with("npm ") || attempted_command.starts_with("pnpm "),
-        _ => false,
+    let Some(attempted_manager) = detect_package_manager_from_command(attempted_command) else {
+        return false;
+    };
+    let expected_manager = normalize_package_manager(expected);
+    !expected_manager.is_empty() && attempted_manager != expected_manager
+}
+
+fn detect_package_manager_from_command(command: &str) -> Option<&'static str> {
+    let command = command.trim_start();
+    if command.starts_with("npm ") || command == "npm" {
+        Some("npm")
+    } else if command.starts_with("pnpm ") || command == "pnpm" {
+        Some("pnpm")
+    } else if command.starts_with("yarn ") || command == "yarn" {
+        Some("yarn")
+    } else if command.starts_with("bun ") || command == "bun" {
+        Some("bun")
+    } else {
+        None
+    }
+}
+
+fn normalize_package_manager(value: &str) -> &str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pnpm" | "pnpm-lock.yaml" => "pnpm",
+        "npm" | "package-lock.json" => "npm",
+        "yarn" | "yarn.lock" => "yarn",
+        "bun" | "bun.lockb" => "bun",
+        _ => "",
     }
 }
 
@@ -12236,6 +12257,28 @@ mod tests {
     }
 
     #[test]
+    fn failure_classifier_detects_wrong_package_manager_for_npm_lockfile() {
+        let classifier = FailureClassifier;
+        let fingerprint = RepositoryFingerprint {
+            build_signals: BuildSignals {
+                has_lockfile: true,
+                lockfile_type: Some("package-lock.json".to_string()),
+                build_scripts: vec![],
+            },
+            ..RepositoryFingerprint::default()
+        };
+        let failure = FailureSignal {
+            message: "yarn install failed".to_string(),
+            attempted_command: Some("yarn install".to_string()),
+            ..FailureSignal::default()
+        };
+        assert_eq!(
+            classifier.classify(&failure, &fingerprint),
+            FailureClass::WrongPackageManager
+        );
+    }
+
+    #[test]
     fn failure_classifier_detects_missing_dependency_for_python_traceback() {
         let classifier = FailureClassifier;
         let failure = FailureSignal {
@@ -12245,6 +12288,19 @@ mod tests {
         assert_eq!(
             classifier.classify(&failure, &RepositoryFingerprint::default()),
             FailureClass::MissingDependency
+        );
+    }
+
+    #[test]
+    fn environment_resolver_only_generates_known_safe_defaults() {
+        let resolver = EnvironmentResolver;
+        let defaults = resolver.defaults_for(&[
+            "DATABASE_URL".to_string(),
+            "SECRET_TOKEN".to_string(),
+        ]);
+        assert_eq!(
+            defaults,
+            vec![("DATABASE_URL".to_string(), "database.internal".to_string())]
         );
     }
 
