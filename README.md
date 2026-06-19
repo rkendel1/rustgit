@@ -49,6 +49,11 @@ Example badge embed:
 </a>
 ```
 
+Badge screenshots:
+
+![Execution status badge screenshot](https://cdn.trythissoftware.com/badge/vercel/next.js.svg)
+![Healed badge screenshot](https://cdn.trythissoftware.com/badge/healed/vercel/next.js.svg)
+
 This badge updates automatically based on repository execution health.
 
 ## Quick start
