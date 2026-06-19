@@ -6511,14 +6511,20 @@ pub fn derive_badge_runtime_state(snapshot: &BadgeExecutionSnapshot) -> BadgeRun
     }
 }
 
+const BADGE_PADDING_WIDTH: i32 = 32;
+const BADGE_CHAR_WIDTH: i32 = 6;
+const BADGE_MIN_LEFT_WIDTH: i32 = 48;
+const BADGE_MIN_RIGHT_WIDTH: i32 = 78;
+
 pub fn badge_svg_endpoint(owner: &str, repo: &str, snapshot: &BadgeExecutionSnapshot) -> (String, String) {
     let state = derive_badge_runtime_state(snapshot);
     let (label, color, emoji) = badge_state_label(state);
     let repo_name = escape_svg_text(&format!("{owner}/{repo}"));
     let status_text = escape_svg_text(&format!("{emoji} {label}"));
     let health = snapshot.health_score.clamp(0.0, 100.0);
-    let left_width = 32 + (repo_name.chars().count() as i32 * 6).max(48);
-    let right_width = 32 + (status_text.chars().count() as i32 * 6).max(78);
+    let left_width = BADGE_PADDING_WIDTH + (repo_name.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_LEFT_WIDTH);
+    let right_width =
+        BADGE_PADDING_WIDTH + (status_text.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_RIGHT_WIDTH);
     let total_width = left_width + right_width;
 
     (
@@ -6537,7 +6543,7 @@ pub fn badge_svg_endpoint(owner: &str, repo: &str, snapshot: &BadgeExecutionSnap
     <text x="{left_text_x}" y="15" fill="#fff">{repo_name}</text>
     <text x="{right_text_x}" y="15" fill="#fff">{status_text}</text>
   </g>
-  <title>{repo_name} - {label} ({health:.1} health)</title>
+  <title>{repo_name} - {label} ({health:.1}% health)</title>
 </svg>"##,
             left_text_x = left_width / 2,
             right_text_x = left_width + (right_width / 2),
@@ -6565,10 +6571,10 @@ pub fn badge_seed_launch_endpoint(owner: &str, repo: &str, branch: Option<&str>)
     let (execution_path, execution_body) = executions_start_endpoint(&ExecutionStartRequest {
         org_id: None,
         user_id: None,
-        anon_user_id: Some(format!("anon-seed-{}", hash_key(&repo_url)[..12].to_string())),
+        anon_user_id: Some(format!("anon-seed-{}", &hash_key(&repo_url)[..12])),
         anon_session_id: Some(format!(
             "seed-{}",
-            hash_key(&format!("{repo_url}:{normalized_branch}"))[..12].to_string()
+            &hash_key(&format!("{repo_url}:{normalized_branch}"))[..12]
         )),
         device_fingerprint: Some("readme-badge-seed".to_string()),
         repo_url: repo_url.clone(),
@@ -6576,8 +6582,13 @@ pub fn badge_seed_launch_endpoint(owner: &str, repo: &str, branch: Option<&str>)
         commit: None,
     });
 
-    let execution_payload: Value =
-        serde_json::from_str(&execution_body).unwrap_or_else(|_| json!({ "raw": execution_body }));
+    let execution_payload: Value = match serde_json::from_str(&execution_body) {
+        Ok(payload) => payload,
+        Err(error) => json!({
+            "warning": format!("failed_to_parse_execution_payload: {error}"),
+            "raw": execution_body
+        }),
+    };
 
     (
         format!("/seed/{owner}/{repo}"),
@@ -16261,9 +16272,16 @@ services:
         assert_eq!(seed_path, "/seed/octocat/hello-world");
         assert!(seed_body.contains("\"entrypoint\":\"readme_badge\""));
         assert!(seed_body.contains("\"analyze_endpoint\":\"/api/v1/repositories/analyze\""));
-        assert!(seed_body.contains("\"execution_start_endpoint\":\"/api/v1/executions\""));
         assert!(seed_body.contains("\"ownership_transfer\""));
         assert!(seed_body.contains("\"workspace_url\":\"https://workspace-"));
+        let seed_payload: Value = serde_json::from_str(&seed_body).expect("seed payload json");
+        let execution_start_endpoint = seed_payload
+            .get("pipeline")
+            .and_then(Value::as_object)
+            .and_then(|pipeline| pipeline.get("execution_start_endpoint"))
+            .and_then(Value::as_str)
+            .expect("seed pipeline should include execution start endpoint");
+        assert_eq!(execution_start_endpoint, "/api/v1/executions");
     }
 
     #[test]
