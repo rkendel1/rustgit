@@ -5401,6 +5401,14 @@ pub struct RepositoryAnalyzeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeGenerateRequest {
+    pub repo_url: String,
+    pub branch: Option<String>,
+    pub mode: Option<String>,
+    pub visibility: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionStartRequest {
     pub org_id: Option<String>,
     pub user_id: Option<String>,
@@ -5919,6 +5927,124 @@ pub fn repositories_analyze_endpoint(
             "fingerprint_id": &analysis.fingerprint.repo_hash,
             "frameworks": frameworks,
             "services": services
+        })
+        .to_string(),
+    )
+}
+
+fn parse_badge_repository_context(repo_url: &str) -> Option<OverlayRepositoryContext> {
+    let trimmed = repo_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_suffix = without_query.trim_end_matches('/').trim_end_matches(".git");
+    let without_scheme = without_suffix
+        .strip_prefix("https://")
+        .or_else(|| without_suffix.strip_prefix("http://"))
+        .unwrap_or(without_suffix);
+    let (host, path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let host = host.to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+    let normalized = format!("https://github.com/{}", path.trim_start_matches('/'));
+    detect_overlay_repository_context(&normalized)
+}
+
+fn normalize_badge_mode(mode: Option<&str>) -> &'static str {
+    match mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("wasm") => "wasm",
+        Some("docker") => "docker",
+        _ => "auto",
+    }
+}
+
+fn normalize_badge_visibility(visibility: Option<&str>) -> &'static str {
+    match visibility
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("private") => "private",
+        _ => "public",
+    }
+}
+
+pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, String) {
+    let endpoint = "/api/badge/generate".to_string();
+    let Some(context) = parse_badge_repository_context(&request.repo_url) else {
+        return (
+            endpoint,
+            json!({
+                "error": "invalid_github_repo_url",
+                "message": "Expected a GitHub repository URL like https://github.com/owner/repo"
+            })
+            .to_string(),
+        );
+    };
+
+    let branch = request
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(context.branch.as_str());
+    let mode = normalize_badge_mode(request.mode.as_deref());
+    let visibility = normalize_badge_visibility(request.visibility.as_deref());
+
+    let owner = context.owner;
+    let repo = context.repo;
+    let canonical_repo_url = format!("https://github.com/{owner}/{repo}");
+    let execution_profile_id = hash_key(&canonical_repo_url);
+    let badge_url = format!("https://cdn.trythissoftware.com/badge/{owner}/{repo}.svg");
+    let seed_url = format!("https://trythissoftware.com/seed/{owner}/{repo}");
+    let alt_text = format!("{owner}/{repo} execution status badge");
+    let markdown_embed = format!("[<img src=\"{badge_url}\" alt=\"{alt_text}\">]({seed_url})");
+    let html_embed = format!("<a href=\"{seed_url}\">\n  <img src=\"{badge_url}\" alt=\"{alt_text}\">\n</a>");
+
+    (
+        endpoint,
+        json!({
+            "repo": {
+                "owner": owner,
+                "name": repo,
+                "url": canonical_repo_url,
+                "branch": branch
+            },
+            "config": {
+                "mode": mode,
+                "visibility": visibility
+            },
+            "badge_url": badge_url,
+            "seed_url": seed_url,
+            "embed_snippets": {
+                "markdown": markdown_embed,
+                "html": html_embed,
+                "raw_badge_url": badge_url,
+                "seed_link": seed_url
+            },
+            "execution_profile": {
+                "repo_id": execution_profile_id,
+                "repo_url": canonical_repo_url,
+                "runtime_preference": mode,
+                "analysis_status": "pending",
+                "analyze_endpoint": "/api/v1/repositories/analyze"
+            },
+            "config_variants": {
+                "runtime_preference": ["auto", "wasm", "docker"],
+                "visibility_mode": ["public", "private"]
+            },
+            "badge_types": ["default", "execution_ready", "broken", "healing", "verified"],
+            "auto_update_notice": "This badge updates automatically based on repository execution health.",
+            "state_model": "Badge is a pointer, not state. The SVG resolves from live execution state."
         })
         .to_string(),
     )
@@ -6937,6 +7063,28 @@ pub fn portal_ui_endpoint() -> (String, String) {
             "id": "dashboard_metrics",
             "type": "card",
             "cards": ["Running Workspaces", "Healthy URLs", "DEA Agents", "Success Rate"]
+        }),
+        json!({
+            "id": "badge_generator_studio",
+            "type": "generator",
+            "title": "Generate Badge",
+            "input": {
+                "repo_url": "https://github.com/vercel/next.js",
+                "optional": {
+                    "branch": "main",
+                    "runtime_preference": ["auto", "wasm", "docker"],
+                    "visibility_mode": ["public", "private"]
+                }
+            },
+            "output": {
+                "markdown": "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)",
+                "html": "<a href=\"https://trythissoftware.com/seed/vercel/next.js\"><img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\"></a>",
+                "badge_url": "https://cdn.trythissoftware.com/badge/vercel/next.js.svg",
+                "seed_link": "https://trythissoftware.com/seed/vercel/next.js"
+            },
+            "copy_to_clipboard": true,
+            "generate_api": "/api/badge/generate",
+            "notice": "This badge updates automatically based on repository execution health."
         }),
         json!({
             "id": "recent_executions",
@@ -11320,6 +11468,7 @@ impl Default for RestApiSpec {
             "GET /api/v1/surfaces/portal/navigation",
             "GET /api/v1/surfaces/extension/ui",
             "GET /api/v1/surfaces/portal/ui",
+            "POST /api/badge/generate",
             "GET /badge/{owner}/{repo}.svg",
             "GET /badge/healed/{owner}/{repo}.svg",
             "GET /seed/{owner}/{repo}",
@@ -15431,6 +15580,7 @@ dependencies:
             .contains(&"GET /api/v1/surfaces/portal/navigation"));
         assert!(spec.routes.contains(&"GET /api/v1/surfaces/extension/ui"));
         assert!(spec.routes.contains(&"GET /api/v1/surfaces/portal/ui"));
+        assert!(spec.routes.contains(&"POST /api/badge/generate"));
         assert!(spec.routes.contains(&"GET /badge/{owner}/{repo}.svg"));
         assert!(spec
             .routes
@@ -16285,6 +16435,95 @@ services:
     }
 
     #[test]
+    fn badge_generator_endpoint_emits_embed_snippets_and_variants() {
+        let request = BadgeGenerateRequest {
+            repo_url: "https://github.com/vercel/next.js".to_string(),
+            branch: Some("canary".to_string()),
+            mode: Some("wasm".to_string()),
+            visibility: Some("private".to_string()),
+        };
+        let (path, body) = badge_generate_endpoint(&request);
+        assert_eq!(path, "/api/badge/generate");
+
+        let payload: Value = serde_json::from_str(&body).expect("badge payload json");
+        assert_eq!(
+            payload
+                .get("repo")
+                .and_then(Value::as_object)
+                .and_then(|repo| repo.get("owner"))
+                .and_then(Value::as_str),
+            Some("vercel")
+        );
+        assert_eq!(
+            payload
+                .get("repo")
+                .and_then(Value::as_object)
+                .and_then(|repo| repo.get("name"))
+                .and_then(Value::as_str),
+            Some("next.js")
+        );
+        assert_eq!(
+            payload
+                .get("repo")
+                .and_then(Value::as_object)
+                .and_then(|repo| repo.get("branch"))
+                .and_then(Value::as_str),
+            Some("canary")
+        );
+        assert_eq!(
+            payload
+                .get("config")
+                .and_then(Value::as_object)
+                .and_then(|config| config.get("mode"))
+                .and_then(Value::as_str),
+            Some("wasm")
+        );
+        assert_eq!(
+            payload
+                .get("config")
+                .and_then(Value::as_object)
+                .and_then(|config| config.get("visibility"))
+                .and_then(Value::as_str),
+            Some("private")
+        );
+        assert_eq!(
+            payload.get("badge_url").and_then(Value::as_str),
+            Some("https://cdn.trythissoftware.com/badge/vercel/next.js.svg")
+        );
+        assert_eq!(
+            payload.get("seed_url").and_then(Value::as_str),
+            Some("https://trythissoftware.com/seed/vercel/next.js")
+        );
+        assert_eq!(
+            payload
+                .get("embed_snippets")
+                .and_then(Value::as_object)
+                .and_then(|snippets| snippets.get("markdown"))
+                .and_then(Value::as_str),
+            Some(
+                "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)"
+            )
+        );
+        assert_eq!(
+            payload.get("auto_update_notice").and_then(Value::as_str),
+            Some("This badge updates automatically based on repository execution health.")
+        );
+    }
+
+    #[test]
+    fn badge_generator_endpoint_rejects_non_github_urls() {
+        let request = BadgeGenerateRequest {
+            repo_url: "https://example.com/not-github/repo".to_string(),
+            branch: None,
+            mode: None,
+            visibility: None,
+        };
+        let (path, body) = badge_generate_endpoint(&request);
+        assert_eq!(path, "/api/badge/generate");
+        assert!(body.contains("\"error\":\"invalid_github_repo_url\""));
+    }
+
+    #[test]
     fn auth_and_org_endpoints_emit_org_scoped_identity_payloads() {
         let user = UserIdentity {
             user_id: "user-1".to_string(),
@@ -16603,6 +16842,10 @@ services:
         assert!(portal_ui_body.contains("\"workspaces\""));
         assert!(portal_ui_body.contains("\"executions\""));
         assert!(portal_ui_body.contains("\"agents\""));
+        assert!(portal_ui_body.contains("\"badge_generator_studio\""));
+        assert!(portal_ui_body.contains("\"generate_api\":\"/api/badge/generate\""));
+        assert!(portal_ui_body
+            .contains("\"notice\":\"This badge updates automatically based on repository execution health.\""));
         assert!(portal_ui_body.contains("\"component_registry\""));
         assert!(portal_ui_body.contains("\"rendered\""));
     }
