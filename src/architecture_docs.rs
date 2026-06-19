@@ -392,16 +392,16 @@ fn extract_workspace_transitions(source: &str) -> BTreeSet<String> {
         return transitions;
     };
     let lines: Vec<&str> = can_transition_block.lines().collect();
-    let mut i = 0usize;
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
+    let mut line_index = 0usize;
+    while line_index < lines.len() {
+        let trimmed = lines[line_index].trim();
         if !trimmed.contains("WorkspaceState::") || !trimmed.contains("=>") {
-            i += 1;
+            line_index += 1;
             continue;
         }
 
         let Some(from_start) = trimmed.find("WorkspaceState::") else {
-            i += 1;
+            line_index += 1;
             continue;
         };
         let from_tail = &trimmed[from_start + "WorkspaceState::".len()..];
@@ -411,20 +411,20 @@ fn extract_workspace_transitions(source: &str) -> BTreeSet<String> {
             .unwrap_or("")
             .to_string();
         if from.is_empty() {
-            i += 1;
+            line_index += 1;
             continue;
         }
 
         let mut rhs_block = trimmed.split("=>").nth(1).unwrap_or_default().to_string();
-        let mut j = i + 1;
-        while j < lines.len() {
-            let next = lines[j].trim();
+        let mut next_line_index = line_index + 1;
+        while next_line_index < lines.len() {
+            let next = lines[next_line_index].trim();
             if next.starts_with("WorkspaceState::") && next.contains("=>") {
                 break;
             }
             rhs_block.push(' ');
             rhs_block.push_str(next);
-            j += 1;
+            next_line_index += 1;
         }
 
         for part in rhs_block.split("WorkspaceState::").skip(1) {
@@ -437,7 +437,7 @@ fn extract_workspace_transitions(source: &str) -> BTreeSet<String> {
             }
         }
 
-        i = j;
+        line_index = next_line_index;
     }
 
     transitions
@@ -448,14 +448,14 @@ fn function_block<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
     let from_sig = &source[start..];
     let open_offset = from_sig.find('{')?;
     let block_start = start + open_offset;
-    let mut depth = 0usize;
-    for (idx, ch) in source[block_start..].char_indices() {
+    let mut depth = 1usize;
+    for (idx, ch) in source[block_start + 1..].char_indices() {
         match ch {
             '{' => depth += 1,
             '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(&source[start..=block_start + idx]);
+                    return Some(&source[start..=block_start + 1 + idx]);
                 }
             }
             _ => {}
