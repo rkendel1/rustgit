@@ -12,10 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
 mod architecture_docs;
+mod postgres_db;
 
 pub use architecture_docs::{
     analyze_architecture_from_source, extract_execution_flow_from_source, generate_grounded_docs,
     ArchitectureSnapshot, CallGraph, ExecutionFlowGraph, GeneratedDocs,
+};
+pub use postgres_db::{
+    deserialize_string_array, infer_repository_from_commits, ExecutionIntelligencePersistenceError,
+    ExecutionIntelligencePostgresStore, ExecutionIntelligenceReadStore, PersistenceResult,
 };
 
 const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
@@ -5384,9 +5389,9 @@ pub struct EidbRepositoryRecord {
     pub repo_id: String,
     pub repo_url: String,
     pub default_branch: String,
-    /// Unix timestamp in seconds, persisted as TIMESTAMPTZ in PostgreSQL.
+    /// Unix timestamp in epoch seconds, persisted as TIMESTAMPTZ via to_timestamp(epoch_seconds::double precision).
     pub first_seen: u64,
-    /// Unix timestamp in seconds, persisted as TIMESTAMPTZ in PostgreSQL.
+    /// Unix timestamp in epoch seconds, persisted as TIMESTAMPTZ via to_timestamp(epoch_seconds::double precision).
     pub last_seen: u64,
 }
 
@@ -5394,7 +5399,7 @@ pub struct EidbRepositoryRecord {
 pub struct EidbCommitRecord {
     pub commit_hash: String,
     pub repository_id: String,
-    /// Unix timestamp in seconds, persisted as TIMESTAMPTZ in PostgreSQL.
+    /// Unix timestamp in epoch seconds, persisted as TIMESTAMPTZ via to_timestamp(epoch_seconds::double precision).
     pub author_date: u64,
     pub message: String,
     pub parent_commit: Option<String>,
@@ -5526,20 +5531,9 @@ pub struct ExecutionIntelligenceDatabase {
 impl ExecutionIntelligenceDatabase {
     pub fn postgres_schema() -> &'static [&'static str] {
         &[
-            "CREATE TABLE IF NOT EXISTS repositories (repo_id TEXT PRIMARY KEY, repo_url TEXT NOT NULL, default_branch TEXT NOT NULL, first_seen TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS commits (commit_hash TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES repositories(repo_id), author_date TIMESTAMPTZ NOT NULL, message TEXT NOT NULL, parent_commit TEXT)",
-            "CREATE TABLE IF NOT EXISTS fingerprints (fingerprint_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES repositories(repo_id), commit_hash TEXT NOT NULL REFERENCES commits(commit_hash), frameworks JSONB NOT NULL, languages JSONB NOT NULL, services JSONB NOT NULL, confidence DOUBLE PRECISION NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS services (service_id TEXT PRIMARY KEY, fingerprint_id TEXT NOT NULL REFERENCES fingerprints(fingerprint_id), service_type TEXT NOT NULL, framework TEXT, runtime TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS topologies (topology_id TEXT PRIMARY KEY, fingerprint_id TEXT NOT NULL REFERENCES fingerprints(fingerprint_id), service_count INTEGER NOT NULL, edge_count INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS executions (execution_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES repositories(repo_id), commit_hash TEXT NOT NULL REFERENCES commits(commit_hash), started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ, status TEXT NOT NULL, execution_tier TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS execution_events (execution_id TEXT NOT NULL REFERENCES executions(execution_id), event_type TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS runtime_images (image_id TEXT PRIMARY KEY, image_hash TEXT NOT NULL, runtime TEXT NOT NULL, framework TEXT)",
-            "CREATE TABLE IF NOT EXISTS warm_pool_usage (execution_id TEXT NOT NULL REFERENCES executions(execution_id), image_id TEXT NOT NULL REFERENCES runtime_images(image_id), cache_hit BOOLEAN NOT NULL, cold_start BOOLEAN NOT NULL, startup_time_ms DOUBLE PRECISION NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS healing_attempts (repository_id TEXT NOT NULL REFERENCES repositories(repo_id), execution_id TEXT NOT NULL REFERENCES executions(execution_id), failure_class TEXT NOT NULL, repair_strategy TEXT NOT NULL, success BOOLEAN NOT NULL, created_at TIMESTAMPTZ NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS url_allocations (workspace_url TEXT PRIMARY KEY, execution_id TEXT NOT NULL REFERENCES executions(execution_id), created_at TIMESTAMPTZ NOT NULL, released_at TIMESTAMPTZ)",
-            "CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY, capabilities JSONB NOT NULL, last_seen TIMESTAMPTZ NOT NULL, status TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS journey_results (journey_type TEXT NOT NULL, repo_id TEXT NOT NULL REFERENCES repositories(repo_id), success BOOLEAN NOT NULL, time_to_url_ms BIGINT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS commit_execution_results (commit_hash TEXT NOT NULL REFERENCES commits(commit_hash), success BOOLEAN NOT NULL, startup_time_ms DOUBLE PRECISION NOT NULL, recorded_at TIMESTAMPTZ NOT NULL)",
+            include_str!("../migrations/0001_baseline_schema.sql"),
+            include_str!("../migrations/0002_indexes_and_constraints.sql"),
+            include_str!("../migrations/0003_seed_bootstrap.sql"),
         ]
     }
 
@@ -5605,62 +5599,94 @@ pub fn repository_history_endpoint(
     repository_id: &str,
     database: &ExecutionIntelligenceDatabase,
 ) -> (String, String) {
-    (
+    repository_history_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_history_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
         format!("/repositories/{repository_id}/history"),
         json!({
             "repository_id": repository_id,
-            "repository": database.repositories.get(repository_id),
-            "commits": database.commits.iter().filter(|commit| commit.repository_id == repository_id).collect::<Vec<_>>(),
-            "executions": database.executions.iter().filter(|execution| execution.repository_id == repository_id).collect::<Vec<_>>(),
-            "journey_results": database.journey_results.iter().filter(|journey| journey.repo_id == repository_id).collect::<Vec<_>>(),
+            "repository": store.repository(repository_id)?,
+            "commits": store.commits_for_repository(repository_id)?,
+            "executions": store.executions_for_repository(repository_id)?,
+            "journey_results": store.journey_results_for_repository(repository_id)?,
         })
         .to_string(),
-    )
+    ))
 }
 
 pub fn execution_history_endpoint(
     execution_id: &str,
     database: &ExecutionIntelligenceDatabase,
 ) -> (String, String) {
-    (
+    execution_history_endpoint_with_store(execution_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn execution_history_endpoint_with_store(
+    execution_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
         format!("/executions/{execution_id}/history"),
         json!({
-            "execution": database.executions.iter().find(|execution| execution.execution_id == execution_id),
-            "events": database.execution_events.iter().filter(|event| event.execution_id == execution_id).collect::<Vec<_>>(),
-            "url_allocations": database.url_allocations.iter().filter(|allocation| allocation.execution_id == execution_id).collect::<Vec<_>>(),
-            "healing_attempts": database.healing_attempts.iter().filter(|attempt| attempt.execution_id == execution_id).collect::<Vec<_>>(),
-            "warm_pool_usage": database.warm_pool_usage.iter().filter(|usage| usage.execution_id == execution_id).collect::<Vec<_>>(),
+            "execution": store.execution(execution_id)?,
+            "events": store.events_for_execution(execution_id)?,
+            "url_allocations": store.url_allocations_for_execution(execution_id)?,
+            "healing_attempts": store.healing_attempts_for_execution(execution_id)?,
+            "warm_pool_usage": store.warm_pool_usage_for_execution(execution_id)?,
         })
         .to_string(),
-    )
+    ))
 }
 
 pub fn repository_healing_history_endpoint(
     repository_id: &str,
     database: &ExecutionIntelligenceDatabase,
 ) -> (String, String) {
-    (
+    repository_healing_history_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_healing_history_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
         format!("/repositories/{repository_id}/healing"),
         json!({
             "repository_id": repository_id,
-            "healing_attempts": database.healing_attempts.iter().filter(|attempt| attempt.repository_id == repository_id).collect::<Vec<_>>(),
+            "healing_attempts": store.healing_attempts_for_repository(repository_id)?,
         })
         .to_string(),
-    )
+    ))
 }
 
 pub fn repository_last_good_commit_endpoint(
     repository_id: &str,
     database: &ExecutionIntelligenceDatabase,
 ) -> (String, String) {
-    (
+    repository_last_good_commit_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_last_good_commit_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    Ok((
         format!("/repositories/{repository_id}/last-good"),
         json!({
             "repository_id": repository_id,
-            "commit_hash": database.last_good_commit_for_repository(repository_id),
+            "commit_hash": store.last_good_commit_for_repository(repository_id)?,
         })
         .to_string(),
-    )
+    ))
 }
 
 /// Returns `/repo/{id}/commits` payload containing commit hashes, timestamps, and build status.
