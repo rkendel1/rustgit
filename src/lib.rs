@@ -101,6 +101,7 @@ pub enum Language {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeType {
     Node,
+    Wasm,
     Rust,
     Go,
     Python,
@@ -551,9 +552,10 @@ impl ExecutionRouter {
         let affinity = &ctx.analysis.execution_profile.runtime_affinity;
         let mut ordered_provider_ids = vec![affinity.preferred_provider.clone()];
         ordered_provider_ids.extend(affinity.fallback_providers.iter().cloned());
+        let mut seen_provider_ids = ordered_provider_ids.iter().cloned().collect::<HashSet<_>>();
         for provider in &self.providers {
             let provider_id = provider.id().to_string();
-            if !ordered_provider_ids.iter().any(|id| id == &provider_id) {
+            if seen_provider_ids.insert(provider_id.clone()) {
                 ordered_provider_ids.push(provider_id);
             }
         }
@@ -2566,6 +2568,10 @@ fn runtime_affinity_for_classification(
                 "StaticRuntimeProvider".to_string(),
             ],
         },
+        RuntimeType::Wasm => RuntimeAffinity {
+            preferred_provider: "WasmExecutionProvider".to_string(),
+            fallback_providers: vec!["StaticRuntimeProvider".to_string()],
+        },
         RuntimeType::Rust => RuntimeAffinity {
             preferred_provider: "RustRuntimeProvider".to_string(),
             fallback_providers: vec![
@@ -3118,7 +3124,7 @@ impl ExecutionProvider for WasmExecutionProvider {
     }
 
     fn runtime(&self) -> RuntimeType {
-        RuntimeType::Static
+        RuntimeType::Wasm
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
@@ -4457,7 +4463,7 @@ mod tests {
 
         let selection = router.select(&ctx).expect("select preferred provider");
         assert_eq!(selection.provider_id, "WasmExecutionProvider");
-        assert_eq!(selection.runtime, RuntimeType::Static);
+        assert_eq!(selection.runtime, RuntimeType::Wasm);
     }
 
     #[test]
