@@ -5166,7 +5166,52 @@ pub fn extension_overlay_actions_endpoint() -> (String, String) {
         json!({
             "surface": ProductSurface::GitHubOverlayExtension.as_str(),
             "actions": extension_overlay_actions(),
-            "run_entrypoint": "/api/v1/executions"
+            "run_entrypoint": "/api/v1/executions",
+            "ui_endpoint": "/api/v1/surfaces/extension/ui"
+        })
+        .to_string(),
+    )
+}
+
+pub fn extension_overlay_ui_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/extension/ui".to_string(),
+        json!({
+            "surface": ProductSurface::GitHubOverlayExtension.as_str(),
+            "view": "overlay_panel",
+            "title": "Run with DDockit",
+            "repository_context": {
+                "owner": "{owner}",
+                "repo": "{repo}",
+                "branch": "{branch}"
+            },
+            "sections": [
+                {
+                    "id": "quick_actions",
+                    "type": "button_group",
+                    "label": "Quick Actions",
+                    "actions": [
+                        {"id": "run", "label": "Run"},
+                        {"id": "instant_run", "label": "Instant Run"},
+                        {"id": "analyze", "label": "Analyze"}
+                    ]
+                },
+                {
+                    "id": "runtime",
+                    "type": "select",
+                    "label": "Runtime",
+                    "default": "auto",
+                    "options": ["auto", "local", "cloud"]
+                },
+                {
+                    "id": "latest_execution",
+                    "type": "status_card",
+                    "label": "Latest execution",
+                    "fields": ["execution_id", "status", "workspace_url", "started_at"]
+                }
+            ],
+            "actions_api": "/api/v1/surfaces/extension/actions",
+            "run_api": "/api/v1/executions"
         })
         .to_string(),
     )
@@ -5192,7 +5237,55 @@ pub fn portal_navigation_endpoint() -> (String, String) {
         json!({
             "surface": ProductSurface::Portal.as_str(),
             "navigation": portal_initial_navigation(),
-            "workspace_path": "/api/v1/executions/{id}"
+            "workspace_path": "/api/v1/executions/{id}",
+            "ui_endpoint": "/api/v1/surfaces/portal/ui"
+        })
+        .to_string(),
+    )
+}
+
+pub fn portal_ui_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/portal/ui".to_string(),
+        json!({
+            "surface": ProductSurface::Portal.as_str(),
+            "layout": {
+                "type": "shell",
+                "navigation": portal_initial_navigation(),
+                "default_view": "dashboard"
+            },
+            "views": {
+                "dashboard": {
+                    "widgets": [
+                        {"id": "active_workspaces", "type": "metric", "label": "Active workspaces"},
+                        {"id": "running_executions", "type": "metric", "label": "Running executions"},
+                        {"id": "degraded_executions", "type": "metric", "label": "Degraded executions"}
+                    ]
+                },
+                "workspaces": {
+                    "table": {
+                        "columns": ["workspace_id", "repository", "status", "runtime", "url"],
+                        "primary_action": "open_workspace"
+                    }
+                },
+                "executions": {
+                    "table": {
+                        "columns": ["execution_id", "repository", "state", "health", "agent"],
+                        "primary_action": "open_execution"
+                    }
+                },
+                "agents": {
+                    "table": {
+                        "columns": ["agent_id", "state", "tier", "last_heartbeat"],
+                        "primary_action": "open_agent"
+                    }
+                }
+            },
+            "api_bindings": {
+                "execution_status": "/api/v1/executions/{id}",
+                "execution_logs": "/api/v1/executions/{id}/logs",
+                "workspace_history": "/executions/{id}/history"
+            }
         })
         .to_string(),
     )
@@ -5207,11 +5300,13 @@ pub fn dual_surface_experience_contract_endpoint() -> (String, String) {
                     "id": ProductSurface::GitHubOverlayExtension.as_str(),
                     "role": "activation",
                     "actions": extension_overlay_actions(),
+                    "ui_endpoint": "/api/v1/surfaces/extension/ui",
                 },
                 {
                     "id": ProductSurface::Portal.as_str(),
                     "role": "management",
                     "navigation": portal_initial_navigation(),
+                    "ui_endpoint": "/api/v1/surfaces/portal/ui",
                 }
             ],
             "shared_backend": {
@@ -9027,6 +9122,8 @@ impl Default for RestApiSpec {
             "GET /api/v1/dual-surface/contract",
             "GET /api/v1/surfaces/extension/actions",
             "GET /api/v1/surfaces/portal/navigation",
+            "GET /api/v1/surfaces/extension/ui",
+            "GET /api/v1/surfaces/portal/ui",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
         Self {
@@ -12850,6 +12947,8 @@ dependencies:
         assert!(spec
             .routes
             .contains(&"GET /api/v1/surfaces/portal/navigation"));
+        assert!(spec.routes.contains(&"GET /api/v1/surfaces/extension/ui"));
+        assert!(spec.routes.contains(&"GET /api/v1/surfaces/portal/ui"));
     }
 
     #[test]
@@ -13505,6 +13604,8 @@ services:
         assert!(body.contains("\"same_execution_ids\""));
         assert!(body.contains("\"same_urls\""));
         assert!(body.contains("\"same_state\""));
+        assert!(body.contains("\"ui_endpoint\":\"/api/v1/surfaces/extension/ui\""));
+        assert!(body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
     }
 
     #[test]
@@ -13573,12 +13674,31 @@ services:
         assert!(extension_body.contains("\"run\""));
         assert!(extension_body.contains("\"instant_run\""));
         assert!(extension_body.contains("\"run_entrypoint\":\"/api/v1/executions\""));
+        assert!(extension_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/extension/ui\""));
 
         let (portal_path, portal_body) = portal_navigation_endpoint();
         assert_eq!(portal_path, "/api/v1/surfaces/portal/navigation");
         assert!(portal_body.contains("\"dashboard\""));
         assert!(portal_body.contains("\"workspaces\""));
         assert!(portal_body.contains("\"workspace_path\":\"/api/v1/executions/{id}\""));
+        assert!(portal_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
+    }
+
+    #[test]
+    fn dual_surface_ui_endpoints_expose_actual_surface_layouts() {
+        let (extension_ui_path, extension_ui_body) = extension_overlay_ui_endpoint();
+        assert_eq!(extension_ui_path, "/api/v1/surfaces/extension/ui");
+        assert!(extension_ui_body.contains("\"view\":\"overlay_panel\""));
+        assert!(extension_ui_body.contains("\"quick_actions\""));
+        assert!(extension_ui_body.contains("\"latest_execution\""));
+
+        let (portal_ui_path, portal_ui_body) = portal_ui_endpoint();
+        assert_eq!(portal_ui_path, "/api/v1/surfaces/portal/ui");
+        assert!(portal_ui_body.contains("\"layout\""));
+        assert!(portal_ui_body.contains("\"dashboard\""));
+        assert!(portal_ui_body.contains("\"workspaces\""));
+        assert!(portal_ui_body.contains("\"executions\""));
+        assert!(portal_ui_body.contains("\"agents\""));
     }
 
     #[test]
