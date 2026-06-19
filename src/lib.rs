@@ -3682,7 +3682,7 @@ fn repository_fingerprint_payload(fingerprint: &RepositoryFingerprint) -> Value 
         "repo_url": &fingerprint.repo_url,
         "languages": fingerprint.languages.iter().map(|profile| {
             json!({
-                "language": format!("{:?}", profile.language).to_lowercase(),
+                "language": language_kind_label(profile.language),
                 "confidence": profile.confidence,
                 "files_detected": &profile.files_detected,
             })
@@ -4514,10 +4514,25 @@ impl RepositoryRegistry {
 
     fn default_profile(repo_url: &str) -> ExecutionProfile {
         let fingerprint = RepositoryFingerprint {
+            spec_version: "1.0".to_string(),
             repo_id: hash_key(repo_url),
             repo_url: repo_url.to_string(),
+            languages: vec![],
+            frameworks: vec![],
+            package_managers: vec![],
+            services: vec![],
+            entrypoints: vec![],
+            dependency_graph: DependencyGraph::default(),
+            runtime_signals: RuntimeSignals::default(),
+            build_signals: BuildSignals::default(),
+            infra_signals: InfraSignals::default(),
+            confidence: 0.0,
+            confidence_model: ConfidenceModel::default(),
             repo_hash: hash_key(repo_url),
-            ..RepositoryFingerprint::default()
+            lockfile_hash: None,
+            dependency_hash: None,
+            language_signature: "unknown".to_string(),
+            framework_signature: Some("unknown".to_string()),
         };
         let classification = RepositoryClassification {
             class: RepoClass::Unknown,
