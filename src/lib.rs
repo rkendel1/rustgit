@@ -26,6 +26,7 @@ const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
+const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
@@ -522,6 +523,7 @@ pub struct ServiceDefinition {
     pub id: String,
     pub name: String,
     pub runtime: RuntimeType,
+    pub package_manager: Option<String>,
     pub working_directory: String,
     pub start_command: String,
     pub ports: Vec<u16>,
@@ -4256,7 +4258,7 @@ fn infer_application_topology(root: &Path) -> Option<ApplicationTopology> {
         }
     }
 
-    if services.len() < 2 {
+    if services.len() < MIN_SERVICES_FOR_TOPOLOGY {
         return None;
     }
 
@@ -4353,18 +4355,20 @@ fn infer_service_definition(repo_root: &Path, service_root: &Path) -> Option<Ser
     let package_manager = if service_root.join("pnpm-lock.yaml").exists()
         || package_manager_declares(&package_content, "pnpm")
     {
-        "pnpm"
+        Some("pnpm".to_string())
     } else if service_root.join("yarn.lock").exists()
         || package_manager_declares(&package_content, "yarn")
     {
-        "yarn"
+        Some("yarn".to_string())
     } else if service_root.join("bun.lockb").exists()
         || service_root.join("bun.lock").exists()
         || package_manager_declares(&package_content, "bun")
     {
-        "bun"
+        Some("bun".to_string())
+    } else if framework != Framework::Unknown {
+        Some("npm".to_string())
     } else {
-        "npm"
+        None
     };
 
     let ports = if framework == Framework::Unknown {
@@ -4376,14 +4380,19 @@ fn infer_service_definition(repo_root: &Path, service_root: &Path) -> Option<Ser
             .collect()
     };
     let readiness_checks = readiness_checks_for_service(framework, &normalized_name, &ports);
-    let start_command =
-        service_start_command(service_root, framework, package_manager, &normalized_name);
+    let start_command = service_start_command(
+        service_root,
+        framework,
+        package_manager.as_deref(),
+        &normalized_name,
+    );
     let working_directory = service_root.to_string_lossy().to_string();
 
     Some(ServiceDefinition {
         id,
         name,
         runtime: runtime_for_service(framework, &normalized_name),
+        package_manager,
         working_directory,
         start_command,
         ports,
@@ -4420,7 +4429,7 @@ fn runtime_for_service(framework: Framework, name: &str) -> RuntimeType {
 fn service_start_command(
     service_root: &Path,
     framework: Framework,
-    package_manager: &str,
+    package_manager: Option<&str>,
     normalized_name: &str,
 ) -> String {
     let root = service_root.display();
@@ -4453,7 +4462,7 @@ fn service_start_command(
         | Framework::Astro
         | Framework::Remix
         | Framework::Express
-        | Framework::NestJs => match package_manager {
+        | Framework::NestJs => match package_manager.unwrap_or("npm") {
             "pnpm" => format!("cd {root} && pnpm run dev -- --host 0.0.0.0"),
             "yarn" => format!("cd {root} && yarn dev --host 0.0.0.0"),
             "bun" => format!("cd {root} && bun run dev -- --host 0.0.0.0"),
@@ -4464,9 +4473,11 @@ fn service_start_command(
             "worker" | "celery" | "cron" => {
                 format!("cd {root} && celery -A app worker --loglevel=info")
             }
-            "db" | "database" | "postgres" => "docker run postgres".to_string(),
-            "redis" | "cache" => "docker run redis".to_string(),
-            "queue" => "docker run rabbitmq".to_string(),
+            "db" | "database" | "postgres" => {
+                "docker run -d --name rustgit-postgres postgres".to_string()
+            }
+            "redis" | "cache" => "docker run -d --name rustgit-redis redis".to_string(),
+            "queue" => "docker run -d --name rustgit-queue rabbitmq".to_string(),
             _ => format!("cd {root}"),
         },
     }
@@ -4692,7 +4703,12 @@ fn service_role(service: &ServiceDefinition) -> ServiceRole {
 fn service_install_command(service: &ServiceDefinition) -> Option<String> {
     let service_root = &service.working_directory;
     match service.runtime {
-        RuntimeType::Node => Some(format!("cd {service_root} && npm ci")),
+        RuntimeType::Node => Some(match service.package_manager.as_deref().unwrap_or("npm") {
+            "pnpm" => format!("cd {service_root} && pnpm install --frozen-lockfile"),
+            "yarn" => format!("cd {service_root} && yarn install --frozen-lockfile"),
+            "bun" => format!("cd {service_root} && bun install --frozen-lockfile"),
+            _ => format!("cd {service_root} && npm ci"),
+        }),
         RuntimeType::Python => Some(format!(
             "cd {service_root} && python -m pip install -r requirements.txt"
         )),
@@ -4703,7 +4719,12 @@ fn service_install_command(service: &ServiceDefinition) -> Option<String> {
 fn service_build_command(service: &ServiceDefinition) -> String {
     let root = &service.working_directory;
     match service.runtime {
-        RuntimeType::Node => format!("cd {root} && npm run build"),
+        RuntimeType::Node => match service.package_manager.as_deref().unwrap_or("npm") {
+            "pnpm" => format!("cd {root} && pnpm run build"),
+            "yarn" => format!("cd {root} && yarn build"),
+            "bun" => format!("cd {root} && bun run build"),
+            _ => format!("cd {root} && npm run build"),
+        },
         RuntimeType::Rust => format!("cd {root} && cargo build"),
         RuntimeType::Go => format!("cd {root} && go build ./..."),
         RuntimeType::Python => format!("cd {root} && python -m compileall ."),
