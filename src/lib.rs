@@ -5339,6 +5339,14 @@ pub fn extension_overlay_ui_endpoint() -> (String, String) {
                 "repo": "{repo}",
                 "branch": "{branch}"
             },
+            "screenshot": {
+                "id": "repository_detected_preview",
+                "shape": "orb",
+                "animation": "pulse",
+                "state": {
+                    "when_repository_detected": "pulse"
+                }
+            },
             "sections": [
                 {
                     "id": "quick_actions",
@@ -13920,6 +13928,10 @@ services:
         assert!(extension_ui_body.contains("\"latest_execution\""));
         assert!(extension_ui_body.contains("\"component_registry\""));
         assert!(extension_ui_body.contains("\"rendered\""));
+        assert!(extension_ui_body.contains("\"screenshot\""));
+        assert!(extension_ui_body.contains("\"shape\":\"orb\""));
+        assert!(extension_ui_body.contains("\"animation\":\"pulse\""));
+        assert!(extension_ui_body.contains("\"when_repository_detected\":\"pulse\""));
 
         let (portal_ui_path, portal_ui_body) = portal_ui_endpoint();
         assert_eq!(portal_ui_path, "/api/v1/surfaces/portal/ui");
