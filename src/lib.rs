@@ -28,6 +28,8 @@ const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
 const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
+const EXECUTION_IMAGE_VERSION: &str = "v1";
+const UNKNOWN_SIGNATURE: &str = "unknown";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 const LOCAL_AGENT_LOCK_POISONED: &str =
@@ -193,7 +195,7 @@ impl ExecutionMatchEngine {
         let framework = fingerprint
             .framework_signature
             .as_deref()
-            .unwrap_or("unknown")
+            .unwrap_or(UNKNOWN_SIGNATURE)
             .to_ascii_lowercase();
         let language = fingerprint.language_signature.to_ascii_lowercase();
 
@@ -222,7 +224,7 @@ impl ExecutionMatchEngine {
             runtime_type_to_agent_label(runtime),
             framework_tag(&framework)
         );
-        let version = "v1".to_string();
+        let version = EXECUTION_IMAGE_VERSION.to_string();
         let cache_key = hash_key(&format!(
             "{}:{}:{}:{}",
             image_id, fingerprint.repo_hash, fingerprint.language_signature, version
@@ -238,7 +240,7 @@ impl ExecutionMatchEngine {
                 image_id,
                 runtime,
                 language: language_kind_from_signature(&language),
-                framework: (!framework.is_empty()).then_some(framework),
+                framework: (framework != UNKNOWN_SIGNATURE).then_some(framework),
                 version,
                 base_layers,
                 preinstalled_dependencies: true,
@@ -400,13 +402,7 @@ impl WarmPoolManager {
                 cache_key: key,
                 image_id: image.image_id.clone(),
                 fingerprint_hash: fingerprint.repo_hash.clone(),
-                artifacts: vec![
-                    "node_modules".to_string(),
-                    "pip-cache".to_string(),
-                    "cargo-registry".to_string(),
-                    "build-artifacts".to_string(),
-                    "wasm-modules".to_string(),
-                ],
+                artifacts: cache_artifacts_for_image(image),
             });
     }
 
@@ -1456,9 +1452,15 @@ impl ExecutionGraph {
 
     pub fn with_cache_keys_for(mut self, fingerprint: Option<&RepositoryFingerprint>) -> Self {
         let keys = self.compute_cache_keys_with_fingerprint(fingerprint);
+        let fingerprint_binding = fingerprint
+            .map(|entry| entry.repo_hash.as_str())
+            .unwrap_or("no-fingerprint");
         for node in &mut self.nodes {
             node.cache_key = keys.get(&node.id).cloned();
-            node.cache_binding = node.cache_key.clone();
+            node.cache_binding = node
+                .cache_key
+                .as_deref()
+                .map(|key| warm_cache_binding_key(fingerprint_binding, key));
         }
         self
     }
@@ -5903,10 +5905,37 @@ fn hash_bytes(input: &[u8]) -> String {
     format!("{state:x}")
 }
 
+fn cache_artifacts_for_image(image: &ExecutionImage) -> Vec<String> {
+    let mut artifacts = vec!["build-artifacts".to_string()];
+    match image.runtime {
+        RuntimeType::Node => {
+            artifacts.push("node_modules".to_string());
+            artifacts.push("pnpm-store".to_string());
+        }
+        RuntimeType::Python => {
+            artifacts.push("pip-cache".to_string());
+            artifacts.push("site-packages".to_string());
+        }
+        RuntimeType::Rust => {
+            artifacts.push("cargo-registry".to_string());
+            artifacts.push("target-cache".to_string());
+            artifacts.push("wasm-modules".to_string());
+        }
+        RuntimeType::Wasm => {
+            artifacts.push("wasm-modules".to_string());
+        }
+        RuntimeType::Go => {
+            artifacts.push("go-mod-cache".to_string());
+        }
+        RuntimeType::Static | RuntimeType::Unknown => {}
+    }
+    artifacts
+}
+
 fn framework_tag(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return "unknown".to_string();
+        return UNKNOWN_SIGNATURE.to_string();
     }
     trimmed
         .chars()
@@ -5923,7 +5952,7 @@ fn framework_tag(value: &str) -> String {
 fn language_tag(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() {
-        "unknown".to_string()
+        UNKNOWN_SIGNATURE.to_string()
     } else {
         normalized
     }
