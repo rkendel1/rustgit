@@ -511,6 +511,42 @@ pub struct PortInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadinessCheck {
+    Port(u16),
+    Http(String),
+    Process,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDefinition {
+    pub id: String,
+    pub name: String,
+    pub runtime: RuntimeType,
+    pub working_directory: String,
+    pub start_command: String,
+    pub ports: Vec<u16>,
+    pub readiness_checks: Vec<ReadinessCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDependency {
+    pub service_id: String,
+    pub depends_on: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StartupOrder {
+    pub stages: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationTopology {
+    pub services: Vec<ServiceDefinition>,
+    pub dependencies: Vec<ServiceDependency>,
+    pub startup_order: StartupOrder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionNode {
     pub id: String,
     pub node_type: ExecutionNodeType,
@@ -902,6 +938,7 @@ pub struct RepositoryAnalysis {
     pub framework: Framework,
     pub language: Language,
     pub dependency_files: Vec<PathBuf>,
+    pub topology: Option<ApplicationTopology>,
     pub fingerprint: RepositoryFingerprint,
     pub classification: RepositoryClassification,
     pub execution_profile: ExecutionProfile,
@@ -1168,7 +1205,10 @@ impl WorkerRegistry {
         let Some(worker) = self.workers.get_mut(worker_id) else {
             return false;
         };
-        if matches!(worker.status, WorkerStatus::Offline | WorkerStatus::Unhealthy) {
+        if matches!(
+            worker.status,
+            WorkerStatus::Offline | WorkerStatus::Unhealthy
+        ) {
             worker.status = WorkerStatus::Ready;
         }
         self.heartbeats.insert(worker_id.to_string(), now);
@@ -1637,13 +1677,8 @@ impl ExecutionCoordinator {
         } else {
             self.worker_registry.snapshot_workers()
         };
-        self.scheduler.schedule_with_context(
-            graph,
-            workers,
-            &self.artifact_store,
-            config,
-            now,
-        )
+        self.scheduler
+            .schedule_with_context(graph, workers, &self.artifact_store, config, now)
     }
 
     pub fn register_worker(&mut self, worker: WorkerNode, now: u64) {
@@ -2818,9 +2853,11 @@ fn classify_repository(
             | Framework::Remix
             | Framework::Express
             | Framework::NestJs => (RepoClass::NodeApp, 0.9),
-            Framework::Rust | Framework::Axum | Framework::Actix | Framework::Rocket | Framework::Leptos => {
-                (RepoClass::RustBinary, 0.92)
-            }
+            Framework::Rust
+            | Framework::Axum
+            | Framework::Actix
+            | Framework::Rocket
+            | Framework::Leptos => (RepoClass::RustBinary, 0.92),
             Framework::Python
             | Framework::Flask
             | Framework::FastApi
@@ -2961,6 +2998,27 @@ fn runtime_for_framework(framework: Framework) -> RuntimeType {
     }
 }
 
+fn framework_for_runtime(runtime: RuntimeType) -> Framework {
+    match runtime {
+        RuntimeType::Node => Framework::Node,
+        RuntimeType::Wasm | RuntimeType::Static => Framework::StaticWeb,
+        RuntimeType::Rust => Framework::Rust,
+        RuntimeType::Go => Framework::Go,
+        RuntimeType::Python => Framework::Python,
+        RuntimeType::Unknown => Framework::Unknown,
+    }
+}
+
+fn language_for_runtime(runtime: RuntimeType) -> Language {
+    match runtime {
+        RuntimeType::Node => Language::JavaScript,
+        RuntimeType::Rust => Language::Rust,
+        RuntimeType::Go => Language::Go,
+        RuntimeType::Python => Language::Python,
+        RuntimeType::Wasm | RuntimeType::Static | RuntimeType::Unknown => Language::Unknown,
+    }
+}
+
 fn path_has_filename(path: &str, expected_file_name: &str) -> bool {
     Path::new(path)
         .file_name()
@@ -3045,12 +3103,21 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         dependency_files.push(uv_lock.clone());
     }
 
-    let (framework, language, package_content) = infer_framework_and_language(root);
+    let (mut framework, mut language, package_content) = infer_framework_and_language(root);
+    let topology = infer_application_topology(root);
 
     if framework == Framework::Unknown {
-        return Err(RuntimeError::UnsupportedRepository(
-            "unable to infer execution strategy".to_string(),
-        ));
+        if let Some(discovered) = topology
+            .as_ref()
+            .and_then(|topology| topology.services.first())
+        {
+            framework = framework_for_runtime(discovered.runtime);
+            language = language_for_runtime(discovered.runtime);
+        } else {
+            return Err(RuntimeError::UnsupportedRepository(
+                "unable to infer execution strategy".to_string(),
+            ));
+        }
     }
 
     let scripts = parse_package_scripts(&package_content);
@@ -3099,9 +3166,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         | Framework::Express
         | Framework::NestJs => vec![
             "node".to_string(),
-            package_manager
-                .clone()
-                .unwrap_or_else(|| "npm".to_string()),
+            package_manager.clone().unwrap_or_else(|| "npm".to_string()),
         ],
         Framework::Rust
         | Framework::Axum
@@ -3118,9 +3183,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         | Framework::Streamlit
         | Framework::Gradio => vec![
             "python".to_string(),
-            package_manager
-                .clone()
-                .unwrap_or_else(|| "pip".to_string()),
+            package_manager.clone().unwrap_or_else(|| "pip".to_string()),
         ],
         Framework::StaticWeb => vec!["serve".to_string()],
         Framework::Unknown => vec![],
@@ -3151,6 +3214,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         framework,
         language,
         dependency_files,
+        topology,
         fingerprint: execution_profile.fingerprint.clone(),
         classification: execution_profile.classification.clone(),
         execution_profile,
@@ -3165,6 +3229,12 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
 
 impl BuildPlanner {
     pub fn build_graph(analysis: &RepositoryAnalysis) -> ExecutionGraph {
+        if let Some(topology) = analysis.topology.as_ref() {
+            if topology.services.len() > 1 {
+                return Self::build_topology_graph(analysis, topology);
+            }
+        }
+
         let framework = analysis.framework;
         let scripts = &analysis.build_intelligence.scripts;
         let package_manager = analysis
@@ -3369,8 +3439,7 @@ impl BuildPlanner {
                     },
                 ],
             },
-            Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => {
-                ExecutionGraph {
+            Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => ExecutionGraph {
                 nodes: vec![
                     ExecutionNode {
                         id: "build".to_string(),
@@ -3410,8 +3479,7 @@ impl BuildPlanner {
                         to: "test".to_string(),
                     },
                 ],
-            }
-            }
+            },
             Framework::Python
             | Framework::Flask
             | Framework::FastApi
@@ -3486,6 +3554,100 @@ impl BuildPlanner {
             },
             Framework::Unknown => ExecutionGraph::default(),
         }
+    }
+
+    fn build_topology_graph(
+        analysis: &RepositoryAnalysis,
+        topology: &ApplicationTopology,
+    ) -> ExecutionGraph {
+        let mut nodes = vec![];
+        let mut edges = vec![];
+
+        let install_command = topology.services.iter().find_map(service_install_command);
+        if let Some(command) = install_command {
+            nodes.push(ExecutionNode {
+                id: "install".to_string(),
+                node_type: ExecutionNodeType::InstallDependencies,
+                command: Some(command),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["workspace-manifests".to_string()],
+                outputs: vec!["workspace-dependencies".to_string()],
+                cache_key: None,
+            });
+        }
+
+        nodes.push(ExecutionNode {
+            id: "shared-build".to_string(),
+            node_type: ExecutionNodeType::Build,
+            command: Some(shared_build_command(analysis)),
+            execution_mode: ExecutionMode::Native,
+            inputs: vec!["workspace-dependencies".to_string()],
+            outputs: vec!["workspace-build-cache".to_string()],
+            cache_key: None,
+        });
+        if nodes.iter().any(|node| node.id == "install") {
+            edges.push(ExecutionEdge {
+                from: "install".to_string(),
+                to: "shared-build".to_string(),
+            });
+        }
+
+        for service in &topology.services {
+            let build_id = format!("{}-build", service.id);
+            let run_id = format!("{}-run", service.id);
+            let role = service_role(service);
+            let build_node_type = if matches!(role, ServiceRole::DataStore | ServiceRole::Queue) {
+                ExecutionNodeType::CustomCommand
+            } else {
+                ExecutionNodeType::Build
+            };
+            let build_command = service_build_command(service);
+            nodes.push(ExecutionNode {
+                id: build_id.clone(),
+                node_type: build_node_type,
+                command: Some(build_command),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["workspace-build-cache".to_string()],
+                outputs: vec![format!("{}-build-output", service.id)],
+                cache_key: None,
+            });
+            edges.push(ExecutionEdge {
+                from: "shared-build".to_string(),
+                to: build_id.clone(),
+            });
+
+            let run_node_type = if matches!(role, ServiceRole::DataStore | ServiceRole::Queue) {
+                ExecutionNodeType::CustomCommand
+            } else {
+                ExecutionNodeType::DevServer
+            };
+            nodes.push(ExecutionNode {
+                id: run_id.clone(),
+                node_type: run_node_type,
+                command: Some(service.start_command.clone()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec![format!("{}-build-output", service.id)],
+                outputs: service
+                    .ports
+                    .iter()
+                    .map(|port| format!("tcp://0.0.0.0:{port}"))
+                    .collect(),
+                cache_key: None,
+            });
+            edges.push(ExecutionEdge {
+                from: build_id,
+                to: run_id,
+            });
+        }
+
+        for dependency in &topology.dependencies {
+            edges.push(ExecutionEdge {
+                from: format!("{}-run", dependency.depends_on),
+                to: format!("{}-run", dependency.service_id),
+            });
+        }
+
+        ExecutionGraph { nodes, edges }
     }
 }
 
@@ -4070,20 +4232,498 @@ fn ports_for_framework(framework: Framework) -> Vec<PortInfo> {
             protocol: "http".to_string(),
             route: "/".to_string(),
         }],
-        Framework::Python
-        | Framework::Flask
-        | Framework::FastApi
-        | Framework::Django => vec![PortInfo {
-            port: 8000,
-            protocol: "http".to_string(),
-            route: "/".to_string(),
-        }],
+        Framework::Python | Framework::Flask | Framework::FastApi | Framework::Django => {
+            vec![PortInfo {
+                port: 8000,
+                protocol: "http".to_string(),
+                route: "/".to_string(),
+            }]
+        }
         Framework::StaticWeb => vec![PortInfo {
             port: 4173,
             protocol: "http".to_string(),
             route: "/".to_string(),
         }],
         Framework::Unknown => vec![],
+    }
+}
+
+fn infer_application_topology(root: &Path) -> Option<ApplicationTopology> {
+    let mut services = vec![];
+    for service_root in discover_service_roots(root) {
+        if let Some(service) = infer_service_definition(root, &service_root) {
+            services.push(service);
+        }
+    }
+
+    if services.len() < 2 {
+        return None;
+    }
+
+    services.sort_by(|left, right| left.id.cmp(&right.id));
+    let dependencies = infer_service_dependencies(&services);
+    let startup_order = compute_startup_order(&services, &dependencies);
+    Some(ApplicationTopology {
+        services,
+        dependencies,
+        startup_order,
+    })
+}
+
+fn discover_service_roots(root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![];
+    let mut seen = HashSet::new();
+
+    let apps_root = root.join("apps");
+    if let Ok(entries) = fs::read_dir(&apps_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && seen.insert(path.clone())
+            {
+                roots.push(path);
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let normalized = name.to_ascii_lowercase();
+            let is_candidate = matches!(
+                normalized.as_str(),
+                "web"
+                    | "frontend"
+                    | "ui"
+                    | "api"
+                    | "backend"
+                    | "server"
+                    | "worker"
+                    | "celery"
+                    | "cron"
+                    | "jobs"
+                    | "db"
+                    | "database"
+                    | "postgres"
+                    | "redis"
+                    | "cache"
+                    | "queue"
+            );
+            if is_candidate && seen.insert(path.clone()) {
+                roots.push(path);
+            }
+        }
+    }
+
+    roots
+}
+
+fn infer_service_definition(repo_root: &Path, service_root: &Path) -> Option<ServiceDefinition> {
+    let relative = service_root.strip_prefix(repo_root).ok()?;
+    let relative_str = relative.to_string_lossy().replace('\\', "/");
+    let id = relative_str.replace('/', "-");
+    if id.is_empty() {
+        return None;
+    }
+    let name = service_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| id.clone());
+    let normalized_name = name.to_ascii_lowercase();
+
+    let (framework, _, package_content) = infer_framework_and_language(service_root);
+    let is_infra = matches!(
+        normalized_name.as_str(),
+        "db" | "database" | "postgres" | "redis" | "cache" | "queue"
+    );
+    let is_worker = normalized_name.contains("worker")
+        || normalized_name.contains("celery")
+        || normalized_name.contains("cron");
+    if framework == Framework::Unknown && !is_infra && !is_worker {
+        return None;
+    }
+
+    let package_manager = if service_root.join("pnpm-lock.yaml").exists()
+        || package_manager_declares(&package_content, "pnpm")
+    {
+        "pnpm"
+    } else if service_root.join("yarn.lock").exists()
+        || package_manager_declares(&package_content, "yarn")
+    {
+        "yarn"
+    } else if service_root.join("bun.lockb").exists()
+        || service_root.join("bun.lock").exists()
+        || package_manager_declares(&package_content, "bun")
+    {
+        "bun"
+    } else {
+        "npm"
+    };
+
+    let ports = if framework == Framework::Unknown {
+        infer_default_infrastructure_ports(&normalized_name)
+    } else {
+        ports_for_framework(framework)
+            .into_iter()
+            .map(|port| port.port)
+            .collect()
+    };
+    let readiness_checks = readiness_checks_for_service(framework, &normalized_name, &ports);
+    let start_command =
+        service_start_command(service_root, framework, package_manager, &normalized_name);
+    let working_directory = service_root.to_string_lossy().to_string();
+
+    Some(ServiceDefinition {
+        id,
+        name,
+        runtime: runtime_for_service(framework, &normalized_name),
+        working_directory,
+        start_command,
+        ports,
+        readiness_checks,
+    })
+}
+
+fn infer_default_infrastructure_ports(name: &str) -> Vec<u16> {
+    match name {
+        "db" | "database" | "postgres" => vec![5432],
+        "redis" | "cache" => vec![6379],
+        "queue" => vec![5672],
+        _ => vec![],
+    }
+}
+
+fn runtime_for_service(framework: Framework, name: &str) -> RuntimeType {
+    let runtime = runtime_for_framework(framework);
+    if runtime != RuntimeType::Unknown {
+        return runtime;
+    }
+    if name.contains("worker") || name.contains("celery") || name.contains("cron") {
+        RuntimeType::Python
+    } else if matches!(
+        name,
+        "db" | "database" | "postgres" | "redis" | "cache" | "queue"
+    ) {
+        RuntimeType::Static
+    } else {
+        RuntimeType::Unknown
+    }
+}
+
+fn service_start_command(
+    service_root: &Path,
+    framework: Framework,
+    package_manager: &str,
+    normalized_name: &str,
+) -> String {
+    let root = service_root.display();
+    match framework {
+        Framework::FastApi => format!("cd {root} && uvicorn app:app --host 0.0.0.0 --port 8000"),
+        Framework::Django => format!("cd {root} && python manage.py runserver 0.0.0.0:8000"),
+        Framework::Flask => format!("cd {root} && flask run --host 0.0.0.0 --port 8000"),
+        Framework::Streamlit => {
+            format!("cd {root} && streamlit run app.py --server.address 0.0.0.0 --server.port 8501")
+        }
+        Framework::Rust
+        | Framework::Axum
+        | Framework::Actix
+        | Framework::Rocket
+        | Framework::Leptos => {
+            format!("cd {root} && cargo run")
+        }
+        Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => {
+            format!("cd {root} && go run .")
+        }
+        Framework::StaticWeb => format!("cd {root} && serve ."),
+        Framework::Node
+        | Framework::React
+        | Framework::Vue
+        | Framework::Svelte
+        | Framework::SvelteKit
+        | Framework::Vite
+        | Framework::NextJs
+        | Framework::Nuxt
+        | Framework::Astro
+        | Framework::Remix
+        | Framework::Express
+        | Framework::NestJs => match package_manager {
+            "pnpm" => format!("cd {root} && pnpm run dev -- --host 0.0.0.0"),
+            "yarn" => format!("cd {root} && yarn dev --host 0.0.0.0"),
+            "bun" => format!("cd {root} && bun run dev -- --host 0.0.0.0"),
+            _ => format!("cd {root} && npm run dev -- --host 0.0.0.0"),
+        },
+        Framework::Python | Framework::Gradio => format!("cd {root} && python -m app"),
+        Framework::Unknown => match normalized_name {
+            "worker" | "celery" | "cron" => {
+                format!("cd {root} && celery -A app worker --loglevel=info")
+            }
+            "db" | "database" | "postgres" => "docker run postgres".to_string(),
+            "redis" | "cache" => "docker run redis".to_string(),
+            "queue" => "docker run rabbitmq".to_string(),
+            _ => format!("cd {root}"),
+        },
+    }
+}
+
+fn readiness_checks_for_service(
+    framework: Framework,
+    normalized_name: &str,
+    ports: &[u16],
+) -> Vec<ReadinessCheck> {
+    let mut checks = ports
+        .iter()
+        .copied()
+        .map(ReadinessCheck::Port)
+        .collect::<Vec<_>>();
+
+    match framework {
+        Framework::FastApi => checks.push(ReadinessCheck::Http("/docs".to_string())),
+        Framework::Django => checks.push(ReadinessCheck::Http("/admin".to_string())),
+        Framework::NextJs
+        | Framework::React
+        | Framework::Vue
+        | Framework::Svelte
+        | Framework::SvelteKit
+        | Framework::Vite
+        | Framework::Nuxt
+        | Framework::Astro
+        | Framework::Remix
+        | Framework::Node
+        | Framework::Express
+        | Framework::NestJs
+        | Framework::StaticWeb => checks.push(ReadinessCheck::Http("/".to_string())),
+        Framework::Unknown
+            if matches!(
+                normalized_name,
+                "db" | "database" | "postgres" | "redis" | "cache"
+            ) => {}
+        _ => {}
+    }
+    checks.push(ReadinessCheck::Process);
+    checks
+}
+
+fn infer_service_dependencies(services: &[ServiceDefinition]) -> Vec<ServiceDependency> {
+    let mut dependencies = vec![];
+    let mut dedupe = HashSet::new();
+    let backend = services
+        .iter()
+        .find(|service| matches!(service_role(service), ServiceRole::Backend))
+        .map(|service| service.id.clone());
+    let datastores = services
+        .iter()
+        .filter(|service| {
+            matches!(
+                service_role(service),
+                ServiceRole::DataStore | ServiceRole::Queue
+            )
+        })
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
+
+    for service in services {
+        let role = service_role(service);
+        match role {
+            ServiceRole::Frontend => {
+                if let Some(target) = backend.as_ref() {
+                    let key = format!("{}->{target}", service.id);
+                    if dedupe.insert(key) {
+                        dependencies.push(ServiceDependency {
+                            service_id: service.id.clone(),
+                            depends_on: target.clone(),
+                        });
+                    }
+                }
+            }
+            ServiceRole::Backend | ServiceRole::Worker => {
+                if matches!(role, ServiceRole::Worker) {
+                    if let Some(target) = backend.as_ref() {
+                        let key = format!("{}->{target}", service.id);
+                        if service.id != *target && dedupe.insert(key) {
+                            dependencies.push(ServiceDependency {
+                                service_id: service.id.clone(),
+                                depends_on: target.clone(),
+                            });
+                        }
+                    }
+                }
+                for target in &datastores {
+                    if service.id == *target {
+                        continue;
+                    }
+                    let key = format!("{}->{target}", service.id);
+                    if dedupe.insert(key) {
+                        dependencies.push(ServiceDependency {
+                            service_id: service.id.clone(),
+                            depends_on: target.clone(),
+                        });
+                    }
+                }
+            }
+            ServiceRole::DataStore | ServiceRole::Queue | ServiceRole::Other => {}
+        }
+    }
+
+    dependencies
+}
+
+fn compute_startup_order(
+    services: &[ServiceDefinition],
+    dependencies: &[ServiceDependency],
+) -> StartupOrder {
+    let mut indegree = services
+        .iter()
+        .map(|service| (service.id.clone(), 0usize))
+        .collect::<HashMap<_, _>>();
+    let mut adjacency = HashMap::<String, Vec<String>>::new();
+    for dependency in dependencies {
+        if let Some(count) = indegree.get_mut(&dependency.service_id) {
+            *count += 1;
+        }
+        adjacency
+            .entry(dependency.depends_on.clone())
+            .or_default()
+            .push(dependency.service_id.clone());
+    }
+
+    let mut stages = vec![];
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(id.clone()))
+        .collect::<BTreeSet<_>>();
+    while !ready.is_empty() {
+        let stage = ready.iter().cloned().collect::<Vec<_>>();
+        stages.push(stage.clone());
+        ready.clear();
+        for current in stage {
+            if let Some(next_ids) = adjacency.get(&current) {
+                for next in next_ids {
+                    if let Some(count) = indegree.get_mut(next) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            ready.insert(next.clone());
+                        }
+                    }
+                }
+            }
+            indegree.remove(&current);
+        }
+    }
+
+    if !indegree.is_empty() {
+        let mut unresolved = indegree.keys().cloned().collect::<Vec<_>>();
+        unresolved.sort();
+        stages.push(unresolved);
+    }
+
+    StartupOrder { stages }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceRole {
+    Frontend,
+    Backend,
+    Worker,
+    DataStore,
+    Queue,
+    Other,
+}
+
+fn service_role(service: &ServiceDefinition) -> ServiceRole {
+    let name = service.name.to_ascii_lowercase();
+    if name.contains("worker") || name.contains("celery") || name.contains("cron") {
+        return ServiceRole::Worker;
+    }
+    if name.contains("queue") {
+        return ServiceRole::Queue;
+    }
+    if name == "db"
+        || name == "database"
+        || name.contains("postgres")
+        || name.contains("redis")
+        || name.contains("cache")
+    {
+        return ServiceRole::DataStore;
+    }
+
+    match service.runtime {
+        RuntimeType::Node => {
+            if matches!(
+                name.as_str(),
+                "web" | "frontend" | "ui" | "site" | "client" | "app"
+            ) {
+                ServiceRole::Frontend
+            } else if matches!(name.as_str(), "api" | "backend" | "server") {
+                ServiceRole::Backend
+            } else if service.ports.contains(&3000) || service.ports.contains(&5173) {
+                ServiceRole::Frontend
+            } else {
+                ServiceRole::Backend
+            }
+        }
+        RuntimeType::Python | RuntimeType::Rust | RuntimeType::Go => {
+            if matches!(name.as_str(), "web" | "frontend" | "ui") {
+                ServiceRole::Frontend
+            } else {
+                ServiceRole::Backend
+            }
+        }
+        RuntimeType::Static => {
+            if matches!(
+                name.as_str(),
+                "db" | "database" | "postgres" | "redis" | "cache"
+            ) {
+                ServiceRole::DataStore
+            } else {
+                ServiceRole::Frontend
+            }
+        }
+        RuntimeType::Wasm | RuntimeType::Unknown => ServiceRole::Other,
+    }
+}
+
+fn service_install_command(service: &ServiceDefinition) -> Option<String> {
+    let service_root = &service.working_directory;
+    match service.runtime {
+        RuntimeType::Node => Some(format!("cd {service_root} && npm ci")),
+        RuntimeType::Python => Some(format!(
+            "cd {service_root} && python -m pip install -r requirements.txt"
+        )),
+        _ => None,
+    }
+}
+
+fn service_build_command(service: &ServiceDefinition) -> String {
+    let root = &service.working_directory;
+    match service.runtime {
+        RuntimeType::Node => format!("cd {root} && npm run build"),
+        RuntimeType::Rust => format!("cd {root} && cargo build"),
+        RuntimeType::Go => format!("cd {root} && go build ./..."),
+        RuntimeType::Python => format!("cd {root} && python -m compileall ."),
+        RuntimeType::Static => format!("cd {root}"),
+        RuntimeType::Wasm | RuntimeType::Unknown => format!("cd {root}"),
+    }
+}
+
+fn shared_build_command(analysis: &RepositoryAnalysis) -> String {
+    let root = analysis.root.to_string_lossy();
+    if analysis.root.join("turbo.json").exists() {
+        format!("cd {root} && turbo run build")
+    } else if analysis.root.join("nx.json").exists() {
+        format!("cd {root} && nx run-many --target=build --all")
+    } else if analysis.root.join("pnpm-workspace.yaml").exists() {
+        format!("cd {root} && pnpm -r run build")
+    } else if analysis.root.join("package.json").exists() {
+        format!("cd {root} && npm run build")
+    } else {
+        format!("cd {root}")
     }
 }
 
@@ -4137,7 +4777,8 @@ fn text_mentions_dependency(content: &str, dependency: &str) -> bool {
         }
         let left_ok = start == 0 || !is_token_char(haystack_bytes[start - 1]);
         let right_index = start + needle_bytes.len();
-        let right_ok = right_index == haystack_bytes.len() || !is_token_char(haystack_bytes[right_index]);
+        let right_ok =
+            right_index == haystack_bytes.len() || !is_token_char(haystack_bytes[right_index]);
         if left_ok && right_ok {
             return true;
         }
@@ -4296,6 +4937,7 @@ mod tests {
             framework,
             language: Language::Unknown,
             dependency_files: vec![],
+            topology: None,
             fingerprint,
             classification,
             execution_profile,
@@ -4362,7 +5004,10 @@ mod tests {
         let analysis = analyze_repository(&repo).expect("analyze repo");
         assert_eq!(analysis.framework, Framework::Axum);
         assert_eq!(analysis.language, Language::Rust);
-        assert_eq!(analysis.build_intelligence.entrypoints, vec!["http://0.0.0.0:8080/"]);
+        assert_eq!(
+            analysis.build_intelligence.entrypoints,
+            vec!["http://0.0.0.0:8080/"]
+        );
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
             Some("cargo run")
@@ -4373,8 +5018,11 @@ mod tests {
     fn detects_fastapi_framework_with_uv_package_manager() {
         let repo = temp_dir("fastapi-detect");
         fs::write(repo.join("requirements.txt"), "fastapi==0.115.0\n").expect("write requirements");
-        fs::write(repo.join("app.py"), "from fastapi import FastAPI\napp = FastAPI()\n")
-            .expect("write app.py");
+        fs::write(
+            repo.join("app.py"),
+            "from fastapi import FastAPI\napp = FastAPI()\n",
+        )
+        .expect("write app.py");
         fs::write(repo.join("uv.lock"), "version = 1").expect("write uv lock");
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
@@ -4388,6 +5036,86 @@ mod tests {
             analysis.execution_graph.primary_run_command().as_deref(),
             Some("uvicorn app:app --host 0.0.0.0 --port 8000")
         );
+    }
+
+    #[test]
+    fn analyze_repository_detects_multi_service_topology_and_orders_startup() {
+        let repo = temp_dir("multi-service-topology");
+        fs::create_dir_all(repo.join("apps/web")).expect("create apps/web");
+        fs::create_dir_all(repo.join("apps/api")).expect("create apps/api");
+        fs::write(repo.join("pnpm-workspace.yaml"), "packages:\n  - apps/*\n")
+            .expect("write workspace manifest");
+        fs::write(
+            repo.join("apps/web/package.json"),
+            r#"{"dependencies":{"next":"14.2.0","react":"18.2.0"}}"#,
+        )
+        .expect("write web package");
+        fs::write(
+            repo.join("apps/api/package.json"),
+            r#"{"dependencies":{"express":"4.0.0"}}"#,
+        )
+        .expect("write api package");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let topology = analysis.topology.expect("topology should exist");
+        assert_eq!(topology.services.len(), 2);
+        assert!(topology
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.service_id == "apps-web"
+                && dependency.depends_on == "apps-api"));
+        assert_eq!(
+            topology.startup_order.stages,
+            vec![vec!["apps-api".to_string()], vec!["apps-web".to_string()]]
+        );
+        let web = topology
+            .services
+            .iter()
+            .find(|service| service.id == "apps-web")
+            .expect("web service");
+        assert!(web
+            .readiness_checks
+            .iter()
+            .any(|check| check == &ReadinessCheck::Http("/".to_string())));
+    }
+
+    #[test]
+    fn multi_service_topology_upgrades_execution_graph() {
+        let repo = temp_dir("multi-service-graph");
+        fs::create_dir_all(repo.join("apps/web")).expect("create apps/web");
+        fs::create_dir_all(repo.join("apps/api")).expect("create apps/api");
+        fs::write(
+            repo.join("apps/web/package.json"),
+            r#"{"dependencies":{"react":"18.2.0"}}"#,
+        )
+        .expect("write web package");
+        fs::write(repo.join("apps/api/requirements.txt"), "fastapi==0.115.0\n")
+            .expect("write api requirements");
+        fs::write(
+            repo.join("apps/api/app.py"),
+            "from fastapi import FastAPI\napp = FastAPI()\n",
+        )
+        .expect("write api app");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let graph = &analysis.execution_graph;
+        assert!(graph.nodes.iter().any(|node| node.id == "shared-build"));
+        assert!(graph.nodes.iter().any(|node| node.id == "apps-web-build"));
+        assert!(graph.nodes.iter().any(|node| node.id == "apps-api-build"));
+        assert!(graph.nodes.iter().any(|node| node.id == "apps-web-run"));
+        assert!(graph.nodes.iter().any(|node| node.id == "apps-api-run"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "shared-build" && edge.to == "apps-web-build"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "shared-build" && edge.to == "apps-api-build"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "apps-api-run" && edge.to == "apps-web-run"));
     }
 
     #[test]
@@ -4535,7 +5263,10 @@ mod tests {
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
         assert_eq!(analysis.framework, Framework::Vite);
-        assert_eq!(analysis.build_intelligence.entrypoints, vec!["http://0.0.0.0:5173/"]);
+        assert_eq!(
+            analysis.build_intelligence.entrypoints,
+            vec!["http://0.0.0.0:5173/"]
+        );
     }
 
     #[test]
@@ -5068,7 +5799,9 @@ mod tests {
         let reassigned = plan.reassign_stale_assignments(&workers, 30, 10);
         assert_eq!(reassigned, vec!["node-a"]);
         assert_eq!(
-            plan.leases.get("node-a").map(|lease| lease.worker_id.as_str()),
+            plan.leases
+                .get("node-a")
+                .map(|lease| lease.worker_id.as_str()),
             Some("worker-b")
         );
         assert_eq!(plan.assignments[0].worker_id, "worker-b");
@@ -5301,7 +6034,8 @@ mod tests {
             edges: vec![],
         }
         .with_cache_keys();
-        let mut analysis = test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Rust);
+        let mut analysis =
+            test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Rust);
         analysis.execution_profile.runtime_affinity = RuntimeAffinity {
             preferred_provider: "NodeRuntimeProvider".to_string(),
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
