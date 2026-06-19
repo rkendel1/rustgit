@@ -5940,10 +5940,16 @@ fn parse_badge_repository_context(repo_url: &str) -> Option<OverlayRepositoryCon
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
     let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
     let without_suffix = without_query.trim_end_matches('/').trim_end_matches(".git");
-    let normalized = without_suffix.replacen("http://github.com/", "https://github.com/", 1);
-    if !normalized.starts_with("https://github.com/") {
+    let without_scheme = without_suffix
+        .strip_prefix("https://")
+        .or_else(|| without_suffix.strip_prefix("http://"))
+        .unwrap_or(without_suffix);
+    let (host, path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let host = host.to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
         return None;
     }
+    let normalized = format!("https://github.com/{}", path.trim_start_matches('/'));
     detect_overlay_repository_context(&normalized)
 }
 
@@ -5997,11 +6003,12 @@ pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, Strin
     let owner = context.owner;
     let repo = context.repo;
     let canonical_repo_url = format!("https://github.com/{owner}/{repo}");
-    let profile = RepositoryRegistry::get_or_compute(&canonical_repo_url);
+    let execution_profile_id = hash_key(&canonical_repo_url);
     let badge_url = format!("https://cdn.trythissoftware.com/badge/{owner}/{repo}.svg");
     let seed_url = format!("https://trythissoftware.com/seed/{owner}/{repo}");
-    let markdown_embed = format!("[<img src=\"{badge_url}\">]({seed_url})");
-    let html_embed = format!("<a href=\"{seed_url}\">\n  <img src=\"{badge_url}\">\n</a>");
+    let alt_text = format!("{owner}/{repo} execution status badge");
+    let markdown_embed = format!("[<img src=\"{badge_url}\" alt=\"{alt_text}\">]({seed_url})");
+    let html_embed = format!("<a href=\"{seed_url}\">\n  <img src=\"{badge_url}\" alt=\"{alt_text}\">\n</a>");
 
     (
         endpoint,
@@ -6025,9 +6032,11 @@ pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, Strin
                 "seed_link": seed_url
             },
             "execution_profile": {
-                "repo_id": profile.fingerprint.repo_id,
-                "runtime": format!("{:?}", profile.classification.primary_runtime).to_ascii_lowercase(),
-                "graph_strategy": format!("{:?}", profile.recommended_graph_strategy).to_ascii_lowercase()
+                "repo_id": execution_profile_id,
+                "repo_url": canonical_repo_url,
+                "runtime_preference": mode,
+                "analysis_status": "pending",
+                "analyze_endpoint": "/api/v1/repositories/analyze"
             },
             "config_variants": {
                 "runtime_preference": ["auto", "wasm", "docker"],
@@ -7068,8 +7077,8 @@ pub fn portal_ui_endpoint() -> (String, String) {
                 }
             },
             "output": {
-                "markdown": "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\">](https://trythissoftware.com/seed/vercel/next.js)",
-                "html": "<a href=\"https://trythissoftware.com/seed/vercel/next.js\"><img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\"></a>",
+                "markdown": "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)",
+                "html": "<a href=\"https://trythissoftware.com/seed/vercel/next.js\"><img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\"></a>",
                 "badge_url": "https://cdn.trythissoftware.com/badge/vercel/next.js.svg",
                 "seed_link": "https://trythissoftware.com/seed/vercel/next.js"
             },
@@ -16492,7 +16501,7 @@ services:
                 .and_then(|snippets| snippets.get("markdown"))
                 .and_then(Value::as_str),
             Some(
-                "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\">](https://trythissoftware.com/seed/vercel/next.js)"
+                "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)"
             )
         );
         assert_eq!(
