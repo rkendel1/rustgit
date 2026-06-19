@@ -962,7 +962,7 @@ pub struct WorkspaceSession {
     pub coordinator_endpoint: String,
     pub sync_state: WorkspaceSessionSyncState,
     pub graph_events: VecDeque<GraphEvent>,
-    pub worker_events: Vec<WorkerEvent>,
+    pub worker_events: VecDeque<WorkerEvent>,
 }
 
 impl WorkspaceSession {
@@ -979,7 +979,7 @@ impl WorkspaceSession {
             coordinator_endpoint: coordinator_endpoint.into(),
             sync_state: WorkspaceSessionSyncState::Connecting,
             graph_events: VecDeque::new(),
-            worker_events: Vec::new(),
+            worker_events: VecDeque::new(),
         }
     }
 
@@ -1000,9 +1000,9 @@ impl WorkspaceSession {
 
     pub fn record_worker_event(&mut self, event: WorkerEvent) {
         if self.worker_events.len() >= SESSION_WORKER_EVENT_BUFFER_LIMIT {
-            self.worker_events.remove(0);
+            self.worker_events.pop_front();
         }
-        self.worker_events.push(event);
+        self.worker_events.push_back(event);
     }
 
     pub fn apply_control(&mut self, control: ExecutionControl) {
@@ -3676,7 +3676,10 @@ mod tests {
             Some("node-1")
         );
         assert_eq!(
-            session.worker_events.first().map(|event| event.message.as_str()),
+            session
+                .worker_events
+                .front()
+                .map(|event| event.message.as_str()),
             Some("event-1")
         );
     }
