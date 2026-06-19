@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Linker, Module, Store};
 
 const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
 const WASM_FULL_CPU_LIMIT_UNITS: u32 = 1_000;
@@ -177,8 +177,45 @@ pub struct WasmExecutionResult {
     pub exported_functions: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmModule {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmExecutionEnvironment {
+    pub workspace_id: String,
+    pub repo_path: String,
+    pub resources: ResourceQuotas,
+    pub network: NetworkPolicy,
+}
+
+impl WasmExecutionEnvironment {
+    fn from_execution_context(ctx: &ExecutionContext) -> Self {
+        Self {
+            workspace_id: ctx.workspace_id.clone(),
+            repo_path: ctx.repo_path.clone(),
+            resources: ctx.resources.clone(),
+            network: ctx.network.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmExecutionContext {
+    pub node_id: String,
+    pub module: WasmModule,
+    pub wasi: WasiContext,
+    pub env: WasmExecutionEnvironment,
+    pub sandbox: WasmSandbox,
+    pub spec: WasmRuntimeSpec,
+}
+
 pub struct WasmRuntimeEngine {
     engine: Engine,
+    linker: Linker<()>,
 }
 
 impl WasmRuntimeEngine {
@@ -187,33 +224,31 @@ impl WasmRuntimeEngine {
         config.consume_fuel(true);
         let engine = Engine::new(&config)
             .map_err(|err| RuntimeError::WasmRuntime(format!("failed to initialize engine: {err}")))?;
-        Ok(Self { engine })
+        let linker = Linker::new(&engine);
+        Ok(Self { engine, linker })
     }
 
-    pub fn execute_module(
-        &self,
-        wasm_bytes: &[u8],
-        spec: &WasmRuntimeSpec,
-        wasi: &WasiContext,
-    ) -> Result<WasmExecutionResult> {
-        if !spec.enabled {
+    pub fn instantiate(&self, ctx: &WasmExecutionContext) -> Result<WasmExecutionResult> {
+        if !ctx.spec.enabled {
             return Err(RuntimeError::WasmRuntime(
                 "attempted to execute disabled wasm runtime spec".to_string(),
             ));
         }
 
-        let module = Module::from_binary(&self.engine, wasm_bytes)
+        let module = Module::from_binary(&self.engine, &ctx.module.bytes)
             .map_err(|err| RuntimeError::WasmRuntime(format!("module compilation failed: {err}")))?;
-        self.enforce_memory_limits(&module, spec)?;
+        self.enforce_memory_limits(&module, &ctx.spec)?;
 
         let mut store = Store::new(&self.engine, ());
         store
-            .set_fuel(u64::from(spec.cpu_limit_units))
+            .set_fuel(u64::from(ctx.spec.cpu_limit_units))
             .map_err(|err| RuntimeError::WasmRuntime(format!("failed to set fuel limits: {err}")))?;
-        let instance = Instance::new(&mut store, &module, &[])
+        let instance = self
+            .linker
+            .instantiate(&mut store, &module)
             .map_err(|err| RuntimeError::WasmRuntime(format!("module instantiation failed: {err}")))?;
 
-        if let Some(entrypoint) = instance.get_typed_func::<(), ()>(&mut store, "_start").ok() {
+        if let Ok(entrypoint) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
             entrypoint
                 .call(&mut store, ())
                 .map_err(|err| RuntimeError::WasmRuntime(format!("module execution failed: {err}")))?;
@@ -226,8 +261,44 @@ impl WasmRuntimeEngine {
             }
         }
 
-        let _ = wasi;
+        let _ = (&ctx.node_id, &ctx.wasi, &ctx.env, &ctx.sandbox);
         Ok(WasmExecutionResult { exported_functions })
+    }
+
+    pub fn execute_module(
+        &self,
+        wasm_bytes: &[u8],
+        spec: &WasmRuntimeSpec,
+        wasi: &WasiContext,
+    ) -> Result<WasmExecutionResult> {
+        let context = WasmExecutionContext {
+            node_id: "inline".to_string(),
+            module: WasmModule {
+                path: "<inline>".to_string(),
+                bytes: wasm_bytes.to_vec(),
+                hash: hash_bytes(wasm_bytes),
+            },
+            wasi: wasi.clone(),
+            env: WasmExecutionEnvironment {
+                workspace_id: "inline".to_string(),
+                repo_path: "/".to_string(),
+                resources: ResourceQuotas {
+                    max_memory_mb: spec.memory_limit_mb as u32,
+                    max_cpu_millis: spec.cpu_limit_units,
+                },
+                network: NetworkPolicy {
+                    allow_outbound: false,
+                    allowed_hosts: vec![],
+                },
+            },
+            sandbox: WasmSandbox {
+                memory_limit: spec.memory_limit_mb.saturating_mul(BYTES_PER_MB),
+                time_limit_ms: u64::from(spec.cpu_limit_units).saturating_mul(CPU_UNIT_TO_TIME_LIMIT_MS),
+                filesystem_scope: vec!["/".to_string()],
+            },
+            spec: spec.clone(),
+        };
+        self.instantiate(&context)
     }
 
     fn enforce_memory_limits(&self, module: &Module, spec: &WasmRuntimeSpec) -> Result<()> {
@@ -392,6 +463,7 @@ pub struct ExecutionEdge {
 pub enum ExecutionNodeType {
     InstallDependencies,
     Build,
+    WasmCompile,
     DevServer,
     Test,
     StaticServe,
@@ -671,6 +743,21 @@ pub struct ExecutionArtifact {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmArtifact {
+    pub node_id: String,
+    pub module_path: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmArtifactBinding {
+    pub node_id: String,
+    pub artifact_key: String,
+    pub build_fingerprint: String,
+    pub source_files_hash: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactType {
     FileSystemSnapshot,
@@ -749,8 +836,86 @@ impl ArtifactStore {
         self.path_for(key).exists()
     }
 
+    pub fn register_wasm_artifact(&self, artifact: WasmArtifact) {
+        let path = self.wasm_artifact_path(&artifact.node_id);
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "failed to create wasm artifact parent directory {}: {err}; wasm artifact registration skipped",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        let payload = json!({
+            "node_id": artifact.node_id,
+            "module_path": artifact.module_path,
+            "hash": artifact.hash,
+        });
+        if let Err(err) = fs::write(&path, payload.to_string()) {
+            eprintln!(
+                "failed to write wasm artifact metadata {}: {err}; wasm artifact registration skipped",
+                path.display()
+            );
+        }
+    }
+
+    pub fn get_wasm_artifact(&self, node_id: &str) -> Option<WasmArtifact> {
+        let content = fs::read_to_string(self.wasm_artifact_path(node_id)).ok()?;
+        let value = serde_json::from_str::<Value>(&content).ok()?;
+        Some(WasmArtifact {
+            node_id: value.get("node_id")?.as_str()?.to_string(),
+            module_path: value.get("module_path")?.as_str()?.to_string(),
+            hash: value.get("hash")?.as_str()?.to_string(),
+        })
+    }
+
+    pub fn register_wasm_artifact_binding(&self, binding: WasmArtifactBinding) {
+        let path = self.wasm_binding_path(&binding.node_id);
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "failed to create wasm binding parent directory {}: {err}; wasm binding registration skipped",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        let payload = json!({
+            "node_id": binding.node_id,
+            "artifact_key": binding.artifact_key,
+            "build_fingerprint": binding.build_fingerprint,
+            "source_files_hash": binding.source_files_hash,
+        });
+        if let Err(err) = fs::write(&path, payload.to_string()) {
+            eprintln!(
+                "failed to write wasm binding metadata {}: {err}; wasm binding registration skipped",
+                path.display()
+            );
+        }
+    }
+
+    pub fn get_wasm_artifact_binding(&self, node_id: &str) -> Option<WasmArtifactBinding> {
+        let content = fs::read_to_string(self.wasm_binding_path(node_id)).ok()?;
+        let value = serde_json::from_str::<Value>(&content).ok()?;
+        Some(WasmArtifactBinding {
+            node_id: value.get("node_id")?.as_str()?.to_string(),
+            artifact_key: value.get("artifact_key")?.as_str()?.to_string(),
+            build_fingerprint: value.get("build_fingerprint")?.as_str()?.to_string(),
+            source_files_hash: value.get("source_files_hash")?.as_str()?.to_string(),
+        })
+    }
+
     fn path_for(&self, key: &str) -> PathBuf {
         self.root.join(format!("{key}.json"))
+    }
+
+    fn wasm_artifact_path(&self, node_id: &str) -> PathBuf {
+        self.root.join("wasm").join(format!("{node_id}.artifact.json"))
+    }
+
+    fn wasm_binding_path(&self, node_id: &str) -> PathBuf {
+        self.root.join("wasm").join(format!("{node_id}.binding.json"))
     }
 }
 
@@ -1530,6 +1695,20 @@ impl ExecutionEngine {
                     .unwrap_or_default()
                     .as_secs(),
             });
+            if matches!(
+                ExecutionRouter::route(node, &ctx.analysis.execution_profile),
+                ExecutionTarget::Wasm(_)
+            ) {
+                self.artifact_store
+                    .register_wasm_artifact_binding(wasm_artifact_binding(ctx, node, key));
+                if let Ok(module) = load_compiled_wasm_module(ctx, node) {
+                    self.artifact_store.register_wasm_artifact(WasmArtifact {
+                        node_id: node.id.clone(),
+                        module_path: module.path,
+                        hash: module.hash,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -2667,16 +2846,30 @@ impl BuildPlanner {
                 ],
             },
             Framework::StaticWeb => ExecutionGraph {
-                nodes: vec![ExecutionNode {
-                    id: "serve".to_string(),
-                    node_type: ExecutionNodeType::StaticServe,
-                    command: Some("serve .".to_string()),
-                    execution_mode: ExecutionMode::Wasm,
-                    inputs: vec!["index.html".to_string()],
-                    outputs: vec!["http://0.0.0.0:4173/".to_string()],
-                    cache_key: None,
+                nodes: vec![
+                    ExecutionNode {
+                        id: "wasm-compile".to_string(),
+                        node_type: ExecutionNodeType::WasmCompile,
+                        command: Some("wasm-pack build --target web".to_string()),
+                        execution_mode: ExecutionMode::Native,
+                        inputs: vec!["index.html|src".to_string()],
+                        outputs: vec!["pkg/app_bg.wasm".to_string()],
+                        cache_key: None,
+                    },
+                    ExecutionNode {
+                        id: "serve".to_string(),
+                        node_type: ExecutionNodeType::StaticServe,
+                        command: Some("serve .".to_string()),
+                        execution_mode: ExecutionMode::Wasm,
+                        inputs: vec!["pkg/app_bg.wasm".to_string()],
+                        outputs: vec!["http://0.0.0.0:4173/".to_string()],
+                        cache_key: None,
+                    },
+                ],
+                edges: vec![ExecutionEdge {
+                    from: "wasm-compile".to_string(),
+                    to: "serve".to_string(),
                 }],
-                edges: vec![],
             },
             Framework::Unknown => ExecutionGraph::default(),
         }
@@ -2768,7 +2961,7 @@ struct StaticRuntimeProvider;
 impl ExecutionProvider for WasmExecutionProvider {
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
         !ctx.execution_graph.nodes.is_empty()
-            && ctx.execution_graph.nodes.iter().all(|node| {
+            && ctx.execution_graph.nodes.iter().any(|node| {
                 matches!(
                     ExecutionRouter::route(node, &ctx.analysis.execution_profile),
                     ExecutionTarget::Wasm(_)
@@ -2789,20 +2982,59 @@ impl ExecutionProvider for WasmExecutionProvider {
     }
 
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
-        let bridge = HybridExecutionBridge::new()?;
+        let runtime = WasmRuntimeEngine::new()?;
+        let native = NativeRuntimeEngine;
         let wasi = WasiContext {
             env: HashMap::from([("RUSTGIT_WORKSPACE_ID".to_string(), ctx.workspace_id.clone())]),
             args: vec!["rustgit-runtime".to_string()],
         };
         let ordered_ids = ctx.execution_graph.ordered_node_ids();
+        let keys = ctx.execution_graph.compute_cache_keys();
         let mut last_handle = None;
         for node_id in ordered_ids {
             let Some(node) = ctx.execution_graph.nodes.iter().find(|node| node.id == node_id) else {
                 continue;
             };
-            let wasm_module = load_compiled_wasm_module(ctx, node)?;
-            let handle = bridge.dispatch(node, ctx, &wasi, &wasm_module)?;
-            last_handle = Some(handle);
+            match ExecutionRouter::route(node, &ctx.analysis.execution_profile) {
+                ExecutionTarget::Wasm(spec) => {
+                    let module = load_compiled_wasm_module(ctx, node)?;
+                    let artifact_key = node
+                        .cache_key
+                        .clone()
+                        .or_else(|| keys.get(&node.id).cloned())
+                        .unwrap_or_else(|| hash_key(&node.id));
+                    let binding = wasm_artifact_binding(ctx, node, &artifact_key);
+                    let sandbox = ctx
+                        .wasm_sandbox
+                        .clone()
+                        .unwrap_or_else(|| wasm_sandbox_for(&spec, &ctx.repo_path));
+                    let execution_context = WasmExecutionContext {
+                        node_id: node.id.clone(),
+                        module: module.clone(),
+                        wasi: wasi.clone(),
+                        env: WasmExecutionEnvironment::from_execution_context(ctx),
+                        sandbox,
+                        spec,
+                    };
+                    runtime.instantiate(&execution_context)?;
+                    last_handle = Some(ProcessHandle {
+                        pid_hint: format!("wasm:{}:{}", binding.node_id, binding.artifact_key),
+                    });
+                }
+                ExecutionTarget::Native | ExecutionTarget::Static => {
+                    let handle = native.execute(
+                        &NativeExecutionRequest {
+                            command: node.command.clone().unwrap_or_else(|| "noop".to_string()),
+                            args: vec![],
+                            cwd: ctx.repo_path.clone(),
+                            env: HashMap::new(),
+                        },
+                        &ctx.resources,
+                        &ctx.network,
+                    )?;
+                    last_handle = Some(handle);
+                }
+            }
         }
         last_handle.ok_or_else(|| {
             RuntimeError::CommandFailed("execution graph contains no dispatchable nodes".to_string())
@@ -2955,6 +3187,7 @@ fn node_type_name(node_type: ExecutionNodeType) -> &'static str {
     match node_type {
         ExecutionNodeType::InstallDependencies => "install-dependencies",
         ExecutionNodeType::Build => "build",
+        ExecutionNodeType::WasmCompile => "wasm-compile",
         ExecutionNodeType::DevServer => "dev-server",
         ExecutionNodeType::Test => "test",
         ExecutionNodeType::StaticServe => "static-serve",
@@ -2970,18 +3203,18 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
     }
 }
 
-fn load_compiled_wasm_module(ctx: &ExecutionContext, node: &ExecutionNode) -> Result<Vec<u8>> {
+fn load_compiled_wasm_module(ctx: &ExecutionContext, node: &ExecutionNode) -> Result<WasmModule> {
     let repo_root = Path::new(&ctx.repo_path);
     if !repo_root.is_absolute() {
         return Err(RuntimeError::InvalidPath(ctx.repo_path.clone()));
     }
 
     let mut search_roots = vec![];
-    for output in &node.outputs {
-        if output.contains("://") {
+    for location in node.outputs.iter().chain(node.inputs.iter()) {
+        if location.contains("://") {
             continue;
         }
-        search_roots.push(repo_root.join(output));
+        search_roots.push(repo_root.join(location));
     }
     search_roots.push(repo_root.to_path_buf());
 
@@ -2989,13 +3222,34 @@ fn load_compiled_wasm_module(ctx: &ExecutionContext, node: &ExecutionNode) -> Re
         let Some(module_path) = first_wasm_module_in(&root)? else {
             continue;
         };
-        return fs::read(&module_path).map_err(RuntimeError::from);
+        let bytes = fs::read(&module_path)?;
+        return Ok(WasmModule {
+            path: module_path.to_string_lossy().to_string(),
+            hash: hash_bytes(&bytes),
+            bytes,
+        });
     }
 
     Err(RuntimeError::WasmRuntime(format!(
         "no compiled wasm artifact found for node {}",
         node.id
     )))
+}
+
+fn wasm_artifact_binding(
+    ctx: &ExecutionContext,
+    node: &ExecutionNode,
+    artifact_key: &str,
+) -> WasmArtifactBinding {
+    let mut inputs = node.inputs.clone();
+    inputs.sort();
+    let source_files_hash = hash_key(&inputs.join("|"));
+    WasmArtifactBinding {
+        node_id: node.id.clone(),
+        artifact_key: artifact_key.to_string(),
+        build_fingerprint: ctx.analysis.fingerprint.repo_hash.clone(),
+        source_files_hash,
+    }
 }
 
 fn first_wasm_module_in(root: &Path) -> Result<Option<PathBuf>> {
@@ -3359,6 +3613,24 @@ mod tests {
     }
 
     #[test]
+    fn static_web_graph_includes_wasm_compile_binding_step() {
+        let repo = temp_dir("static-web-graph");
+        fs::write(repo.join("index.html"), "<!doctype html><title>static</title>")
+            .expect("write index.html");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let graph = &analysis.execution_graph;
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == ExecutionNodeType::WasmCompile));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "wasm-compile" && edge.to == "serve"));
+    }
+
+    #[test]
     fn js_graph_uses_detected_package_manager_commands() {
         let repo = temp_dir("js-pnpm-graph");
         fs::write(
@@ -3643,6 +3915,42 @@ mod tests {
 
         assert!(store.exists("cache-key"));
         assert_eq!(store.get("cache-key"), Some(artifact));
+    }
+
+    #[test]
+    fn artifact_store_registers_wasm_artifact_and_binding() {
+        let root = temp_dir("artifact-store-wasm");
+        let store = ArtifactStore::new(root);
+
+        store.register_wasm_artifact(WasmArtifact {
+            node_id: "serve".to_string(),
+            module_path: "/repo/pkg/app_bg.wasm".to_string(),
+            hash: "abc123".to_string(),
+        });
+        store.register_wasm_artifact_binding(WasmArtifactBinding {
+            node_id: "serve".to_string(),
+            artifact_key: "cache-key".to_string(),
+            build_fingerprint: "repo-fp".to_string(),
+            source_files_hash: "src-fp".to_string(),
+        });
+
+        assert_eq!(
+            store.get_wasm_artifact("serve"),
+            Some(WasmArtifact {
+                node_id: "serve".to_string(),
+                module_path: "/repo/pkg/app_bg.wasm".to_string(),
+                hash: "abc123".to_string(),
+            })
+        );
+        assert_eq!(
+            store.get_wasm_artifact_binding("serve"),
+            Some(WasmArtifactBinding {
+                node_id: "serve".to_string(),
+                artifact_key: "cache-key".to_string(),
+                build_fingerprint: "repo-fp".to_string(),
+                source_files_hash: "src-fp".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -4017,6 +4325,65 @@ mod tests {
         let provider = WasmExecutionProvider;
         let handle = provider.start(&ctx).expect("start wasm provider");
         assert!(handle.pid_hint.starts_with("wasm:"));
+    }
+
+    #[test]
+    fn wasm_execution_provider_handles_wasm_compile_then_serve_graph() {
+        let repo_root = temp_dir("wasm-provider-compile-then-serve");
+        let pkg = repo_root.join("pkg");
+        fs::create_dir_all(&pkg).expect("create wasm output dir");
+        let wasm_bytes = parse_str("(module (func (export \"run\")))").expect("compile wat");
+        fs::write(pkg.join("app_bg.wasm"), wasm_bytes).expect("write wasm artifact");
+
+        let graph = ExecutionGraph {
+            nodes: vec![
+                ExecutionNode {
+                    id: "wasm-compile".to_string(),
+                    node_type: ExecutionNodeType::WasmCompile,
+                    command: Some("wasm-pack build --target web".to_string()),
+                    execution_mode: ExecutionMode::Native,
+                    inputs: vec!["src".to_string()],
+                    outputs: vec!["pkg/app_bg.wasm".to_string()],
+                    cache_key: None,
+                },
+                ExecutionNode {
+                    id: "serve".to_string(),
+                    node_type: ExecutionNodeType::StaticServe,
+                    command: Some("serve .".to_string()),
+                    execution_mode: ExecutionMode::Wasm,
+                    inputs: vec!["pkg/app_bg.wasm".to_string()],
+                    outputs: vec!["http://0.0.0.0:4173/".to_string()],
+                    cache_key: None,
+                },
+            ],
+            edges: vec![ExecutionEdge {
+                from: "wasm-compile".to_string(),
+                to: "serve".to_string(),
+            }],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-1".to_string(),
+            repo_path: repo_root.to_string_lossy().to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let provider = WasmExecutionProvider;
+        assert!(provider.can_handle(&ctx));
+        let handle = provider
+            .start(&ctx)
+            .expect("start mixed wasm compile/serve provider");
+        assert!(handle.pid_hint.starts_with("wasm:serve:"));
     }
 
     #[test]
