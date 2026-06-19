@@ -112,7 +112,7 @@ pub enum Framework {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     JavaScript,
     TypeScript,
@@ -152,13 +152,53 @@ pub enum GraphStrategy {
     MonorepoSegmented,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryFingerprint {
+    pub spec_version: String,
+    pub repo_id: String,
+    pub repo_url: String,
+    pub languages: Vec<LanguageProfile>,
+    pub frameworks: Vec<FrameworkProfile>,
+    pub package_managers: Vec<String>,
+    pub services: Vec<ServiceFingerprint>,
+    pub entrypoints: Vec<EntryPoint>,
+    pub dependency_graph: DependencyGraph,
+    pub runtime_signals: RuntimeSignals,
+    pub build_signals: BuildSignals,
+    pub infra_signals: InfraSignals,
+    pub confidence: f32,
+    pub confidence_model: ConfidenceModel,
     pub repo_hash: String,
     pub lockfile_hash: Option<String>,
     pub dependency_hash: Option<String>,
     pub language_signature: String,
     pub framework_signature: Option<String>,
+}
+
+impl Default for RepositoryFingerprint {
+    fn default() -> Self {
+        Self {
+            spec_version: "1.0".to_string(),
+            repo_id: "unknown".to_string(),
+            repo_url: "unknown".to_string(),
+            languages: vec![],
+            frameworks: vec![],
+            package_managers: vec![],
+            services: vec![],
+            entrypoints: vec![],
+            dependency_graph: DependencyGraph::default(),
+            runtime_signals: RuntimeSignals::default(),
+            build_signals: BuildSignals::default(),
+            infra_signals: InfraSignals::default(),
+            confidence: 0.0,
+            confidence_model: ConfidenceModel::default(),
+            repo_hash: hash_key("unknown"),
+            lockfile_hash: None,
+            dependency_hash: None,
+            language_signature: "unknown".to_string(),
+            framework_signature: Some("unknown".to_string()),
+        }
+    }
 }
 
 pub type LanguageKind = Language;
@@ -207,6 +247,107 @@ pub enum PackageManagerKind {
     Pip,
     Uv,
     Poetry,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageProfile {
+    pub language: LanguageKind,
+    pub confidence: f32,
+    pub files_detected: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameworkProfile {
+    pub framework: String,
+    pub version: Option<String>,
+    pub confidence: f32,
+    pub detection_signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceType {
+    Frontend,
+    Backend,
+    Worker,
+    Database,
+    SharedLibrary,
+    CLI,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BuildContext {
+    pub install_command: Option<String>,
+    pub build_command: Option<String>,
+    pub package_manager: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFingerprint {
+    pub service_name: String,
+    pub service_type: ServiceType,
+    pub root_path: String,
+    pub runtime_hint: RuntimeKind,
+    pub framework: Option<String>,
+    pub entry_file: Option<String>,
+    pub build_context: BuildContext,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntryPoint {
+    pub path: String,
+    pub command: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyNode {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyEdge {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DependencyGraph {
+    pub nodes: Vec<DependencyNode>,
+    pub edges: Vec<DependencyEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeSignals {
+    pub node_detected: bool,
+    pub python_detected: bool,
+    pub rust_detected: bool,
+    pub bun_detected: bool,
+    pub dockerfile_present: bool,
+    pub compose_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BuildSignals {
+    pub has_lockfile: bool,
+    pub lockfile_type: Option<String>,
+    pub build_scripts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InfraSignals {
+    pub uses_database: bool,
+    pub uses_redis: bool,
+    pub uses_queue: bool,
+    pub docker_required: bool,
+    pub cloud_native: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConfidenceModel {
+    pub overall: f32,
+    pub framework_confidence: f32,
+    pub runtime_confidence: f32,
+    pub topology_confidence: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3484,6 +3625,42 @@ pub fn execution_image_compile_endpoint(
     )
 }
 
+pub fn fingerprint_generate_endpoint(fingerprint: &RepositoryFingerprint) -> (String, String) {
+    (
+        "/fingerprint/generate".to_string(),
+        json!({
+            "status": "generated",
+            "fingerprint": repository_fingerprint_payload(fingerprint),
+        })
+        .to_string(),
+    )
+}
+
+pub fn fingerprint_get_endpoint(
+    repo_id: &str,
+    fingerprint: &RepositoryFingerprint,
+) -> (String, String) {
+    (
+        format!("/fingerprint/{repo_id}"),
+        json!({
+            "repo_id": repo_id,
+            "fingerprint": repository_fingerprint_payload(fingerprint),
+        })
+        .to_string(),
+    )
+}
+
+pub fn fingerprint_recompute_endpoint(fingerprint: &RepositoryFingerprint) -> (String, String) {
+    (
+        "/fingerprint/recompute".to_string(),
+        json!({
+            "status": "recomputed",
+            "fingerprint": repository_fingerprint_payload(fingerprint),
+        })
+        .to_string(),
+    )
+}
+
 pub fn warm_pool_status_endpoint(manager: &WarmPoolManager) -> (String, String) {
     let status = manager.status();
     (
@@ -3496,6 +3673,106 @@ pub fn warm_pool_status_endpoint(manager: &WarmPoolManager) -> (String, String) 
         })
         .to_string(),
     )
+}
+
+fn repository_fingerprint_payload(fingerprint: &RepositoryFingerprint) -> Value {
+    json!({
+        "spec_version": &fingerprint.spec_version,
+        "repo_id": &fingerprint.repo_id,
+        "repo_url": &fingerprint.repo_url,
+        "languages": fingerprint.languages.iter().map(|profile| {
+            json!({
+                "language": format!("{:?}", profile.language).to_lowercase(),
+                "confidence": profile.confidence,
+                "files_detected": &profile.files_detected,
+            })
+        }).collect::<Vec<_>>(),
+        "frameworks": fingerprint.frameworks.iter().map(|profile| {
+            json!({
+                "framework": profile.framework.to_ascii_lowercase(),
+                "version": &profile.version,
+                "confidence": profile.confidence,
+                "detection_signals": &profile.detection_signals,
+            })
+        }).collect::<Vec<_>>(),
+        "package_managers": &fingerprint.package_managers,
+        "services": fingerprint.services.iter().map(|service| {
+            json!({
+                "service_name": &service.service_name,
+                "service_type": service_type_label(service.service_type),
+                "root_path": &service.root_path,
+                "runtime_hint": runtime_kind_label(service.runtime_hint),
+                "framework": &service.framework,
+                "entry_file": &service.entry_file,
+                "build_context": {
+                    "install_command": &service.build_context.install_command,
+                    "build_command": &service.build_context.build_command,
+                    "package_manager": &service.build_context.package_manager,
+                }
+            })
+        }).collect::<Vec<_>>(),
+        "entrypoints": fingerprint.entrypoints.iter().map(|entry| {
+            json!({
+                "path": &entry.path,
+                "command": &entry.command,
+                "confidence": entry.confidence,
+            })
+        }).collect::<Vec<_>>(),
+        "dependency_graph": {
+            "nodes": fingerprint.dependency_graph.nodes.iter().map(|node| json!({"id": &node.id})).collect::<Vec<_>>(),
+            "edges": fingerprint.dependency_graph.edges.iter().map(|edge| json!({"from": &edge.from, "to": &edge.to})).collect::<Vec<_>>(),
+        },
+        "runtime_signals": {
+            "node_detected": fingerprint.runtime_signals.node_detected,
+            "python_detected": fingerprint.runtime_signals.python_detected,
+            "rust_detected": fingerprint.runtime_signals.rust_detected,
+            "bun_detected": fingerprint.runtime_signals.bun_detected,
+            "dockerfile_present": fingerprint.runtime_signals.dockerfile_present,
+            "compose_present": fingerprint.runtime_signals.compose_present,
+        },
+        "build_signals": {
+            "has_lockfile": fingerprint.build_signals.has_lockfile,
+            "lockfile_type": fingerprint.build_signals.lockfile_type,
+            "build_scripts": fingerprint.build_signals.build_scripts,
+        },
+        "infra_signals": {
+            "uses_database": fingerprint.infra_signals.uses_database,
+            "uses_redis": fingerprint.infra_signals.uses_redis,
+            "uses_queue": fingerprint.infra_signals.uses_queue,
+            "docker_required": fingerprint.infra_signals.docker_required,
+            "cloud_native": fingerprint.infra_signals.cloud_native,
+        },
+        "confidence": fingerprint.confidence,
+        "confidence_model": {
+            "overall": fingerprint.confidence_model.overall,
+            "framework_confidence": fingerprint.confidence_model.framework_confidence,
+            "runtime_confidence": fingerprint.confidence_model.runtime_confidence,
+            "topology_confidence": fingerprint.confidence_model.topology_confidence,
+        },
+    })
+}
+
+fn service_type_label(service_type: ServiceType) -> &'static str {
+    match service_type {
+        ServiceType::Frontend => "frontend",
+        ServiceType::Backend => "backend",
+        ServiceType::Worker => "worker",
+        ServiceType::Database => "database",
+        ServiceType::SharedLibrary => "shared-library",
+        ServiceType::CLI => "cli",
+    }
+}
+
+fn runtime_kind_label(runtime_kind: RuntimeKind) -> &'static str {
+    match runtime_kind {
+        RuntimeKind::Node => "node",
+        RuntimeKind::Python => "python",
+        RuntimeKind::Rust => "rust",
+        RuntimeKind::Go => "go",
+        RuntimeKind::Wasm => "wasm",
+        RuntimeKind::Static => "static",
+        RuntimeKind::Unknown => "unknown",
+    }
 }
 
 pub fn warm_pool_prewarm_endpoint(
@@ -4157,23 +4434,36 @@ impl RepositoryRegistry {
 
         let snapshot = collect_repository_snapshot(root);
         let (framework, language, package_content) = infer_framework_and_language(root);
+        let topology = infer_application_topology(root);
         Self::compute_and_cache_profile(
             repo_reference,
+            root,
             snapshot,
             framework,
             language,
             &package_content,
+            topology.as_ref(),
         )
     }
 
     fn compute_and_cache_profile(
         repo_reference: &str,
+        root: &Path,
         snapshot: HashMap<String, String>,
         framework: Framework,
         language: Language,
         package_content: &str,
+        topology: Option<&ApplicationTopology>,
     ) -> ExecutionProfile {
-        let fingerprint = build_repository_fingerprint(&snapshot, framework, language);
+        let fingerprint = build_repository_fingerprint(
+            repo_reference,
+            root,
+            &snapshot,
+            framework,
+            language,
+            package_content,
+            topology,
+        );
 
         let mut state = REPOSITORY_REGISTRY
             .get_or_init(|| Mutex::new(RepositoryRegistryState::default()))
@@ -4224,11 +4514,10 @@ impl RepositoryRegistry {
 
     fn default_profile(repo_url: &str) -> ExecutionProfile {
         let fingerprint = RepositoryFingerprint {
+            repo_id: hash_key(repo_url),
+            repo_url: repo_url.to_string(),
             repo_hash: hash_key(repo_url),
-            lockfile_hash: None,
-            dependency_hash: None,
-            language_signature: "unknown".to_string(),
-            framework_signature: Some("unknown".to_string()),
+            ..RepositoryFingerprint::default()
         };
         let classification = RepositoryClassification {
             class: RepoClass::Unknown,
@@ -4459,9 +4748,13 @@ fn should_ignore_path(relative: &str, patterns: &[String]) -> bool {
 }
 
 fn build_repository_fingerprint(
+    repo_reference: &str,
+    root: &Path,
     snapshot: &HashMap<String, String>,
     framework: Framework,
     language: Language,
+    package_content: &str,
+    topology: Option<&ApplicationTopology>,
 ) -> RepositoryFingerprint {
     let mut normalized = snapshot
         .iter()
@@ -4491,13 +4784,500 @@ fn build_repository_fingerprint(
             "go.mod",
         ],
     );
+    let package_managers = infer_package_managers(snapshot);
+    let runtime_signals = infer_runtime_signals(snapshot, language, &package_managers);
+    let entrypoints = infer_entrypoints(root, package_content, language, &package_managers);
+    let build_signals = infer_build_signals(
+        snapshot,
+        package_managers.first().cloned(),
+        parse_package_scripts(package_content),
+    );
+    let service_fingerprints = infer_service_fingerprints(root, topology, &package_managers);
+    let dependency_graph = infer_dependency_graph(topology);
+    let infra_signals = infer_infra_signals(snapshot, topology);
+    let languages = infer_language_profiles(snapshot, language);
+    let frameworks = infer_framework_profiles(framework, snapshot);
+    let confidence_model = compute_confidence_model(framework, &runtime_signals, topology);
 
     RepositoryFingerprint {
+        spec_version: "1.0".to_string(),
+        repo_id: hash_key(repo_reference),
+        repo_url: repo_reference.to_string(),
+        languages,
+        frameworks,
+        package_managers,
+        services: service_fingerprints,
+        entrypoints,
+        dependency_graph,
+        runtime_signals,
+        build_signals,
+        infra_signals,
+        confidence: confidence_model.overall,
+        confidence_model,
         repo_hash: hash_key(&normalized.join("|")),
         lockfile_hash,
         dependency_hash,
         language_signature: language_signature(snapshot, language),
         framework_signature: Some(format!("{framework:?}")),
+    }
+}
+
+fn infer_package_managers(snapshot: &HashMap<String, String>) -> Vec<String> {
+    let mut managers = vec![];
+    if snapshot.contains_key("pnpm-lock.yaml") {
+        managers.push("pnpm".to_string());
+    }
+    if snapshot.contains_key("yarn.lock") {
+        managers.push("yarn".to_string());
+    }
+    if snapshot.contains_key("bun.lockb") || snapshot.contains_key("bun.lock") {
+        managers.push("bun".to_string());
+    }
+    if snapshot.contains_key("Cargo.toml") {
+        managers.push("cargo".to_string());
+    }
+    if snapshot.contains_key("poetry.lock") {
+        managers.push("poetry".to_string());
+    }
+    if snapshot.contains_key("uv.lock") {
+        managers.push("uv".to_string());
+    }
+    if snapshot.contains_key("Pipfile") || snapshot.contains_key("Pipfile.lock") {
+        managers.push("pipenv".to_string());
+    }
+    if snapshot.contains_key("requirements.txt") || snapshot.contains_key("pyproject.toml") {
+        managers.push("pip".to_string());
+    }
+    if snapshot.contains_key("package.json") && managers.is_empty() {
+        managers.push("npm".to_string());
+    }
+    managers
+}
+
+fn infer_runtime_signals(
+    snapshot: &HashMap<String, String>,
+    language: Language,
+    package_managers: &[String],
+) -> RuntimeSignals {
+    RuntimeSignals {
+        node_detected: matches!(language, Language::JavaScript | Language::TypeScript)
+            || snapshot.contains_key("package.json"),
+        python_detected: language == Language::Python
+            || snapshot.contains_key("requirements.txt")
+            || snapshot.contains_key("pyproject.toml"),
+        rust_detected: language == Language::Rust || snapshot.contains_key("Cargo.toml"),
+        bun_detected: package_managers.iter().any(|manager| manager == "bun"),
+        dockerfile_present: snapshot
+            .keys()
+            .any(|path| path.eq_ignore_ascii_case("dockerfile") || path.ends_with("/Dockerfile")),
+        compose_present: snapshot.contains_key("docker-compose.yml")
+            || snapshot.contains_key("docker-compose.yaml")
+            || snapshot.contains_key("compose.yml")
+            || snapshot.contains_key("compose.yaml"),
+    }
+}
+
+fn infer_entrypoints(
+    root: &Path,
+    package_content: &str,
+    language: Language,
+    package_managers: &[String],
+) -> Vec<EntryPoint> {
+    let scripts = parse_package_scripts(package_content);
+    let mut entrypoints = vec![];
+    for script in ["dev", "start", "build"] {
+        if scripts.contains_key(script) {
+            entrypoints.push(EntryPoint {
+                path: "package.json".to_string(),
+                command: script.to_string(),
+                confidence: 0.95,
+            });
+        }
+    }
+    if entrypoints.is_empty()
+        && matches!(language, Language::JavaScript | Language::TypeScript)
+        && root.join("package.json").exists()
+    {
+        entrypoints.push(EntryPoint {
+            path: "package.json".to_string(),
+            command: "dev".to_string(),
+            confidence: 0.7,
+        });
+    }
+    if language == Language::Python {
+        if root.join("main.py").exists() || root.join("app.py").exists() {
+            let (entry_file, module) = if root.join("main.py").exists() {
+                ("main.py", "main:app")
+            } else {
+                ("app.py", "app:app")
+            };
+            entrypoints.push(EntryPoint {
+                path: entry_file.to_string(),
+                command: format!("uvicorn {module}"),
+                confidence: 0.9,
+            });
+        }
+    } else if language == Language::Rust && root.join("Cargo.toml").exists() {
+        entrypoints.push(EntryPoint {
+            path: "Cargo.toml".to_string(),
+            command: "cargo run".to_string(),
+            confidence: 0.9,
+        });
+    }
+    if package_managers.iter().any(|manager| manager == "bun") {
+        entrypoints.push(EntryPoint {
+            path: "package.json".to_string(),
+            command: "bun run dev".to_string(),
+            confidence: 0.85,
+        });
+    }
+    entrypoints
+}
+
+fn infer_build_signals(
+    snapshot: &HashMap<String, String>,
+    lockfile_type: Option<String>,
+    scripts: HashMap<String, String>,
+) -> BuildSignals {
+    let mut build_scripts = scripts.keys().cloned().collect::<Vec<_>>();
+    build_scripts.sort();
+    BuildSignals {
+        has_lockfile: snapshot.contains_key("package-lock.json")
+            || snapshot.contains_key("pnpm-lock.yaml")
+            || snapshot.contains_key("yarn.lock")
+            || snapshot.contains_key("Cargo.lock")
+            || snapshot.contains_key("poetry.lock")
+            || snapshot.contains_key("Pipfile.lock")
+            || snapshot.contains_key("uv.lock")
+            || snapshot.contains_key("go.sum"),
+        lockfile_type,
+        build_scripts,
+    }
+}
+
+fn infer_service_fingerprints(
+    root: &Path,
+    topology: Option<&ApplicationTopology>,
+    package_managers: &[String],
+) -> Vec<ServiceFingerprint> {
+    if let Some(topology) = topology {
+        let mut services = topology
+            .services
+            .iter()
+            .map(|service| {
+                let service_root = Path::new(&service.working_directory);
+                let (framework, _, _) = infer_framework_and_language(service_root);
+                ServiceFingerprint {
+                    service_name: service.name.clone(),
+                    service_type: infer_service_type(service),
+                    root_path: Path::new(&service.working_directory)
+                        .strip_prefix(root)
+                        .map(|value| value.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| service.working_directory.clone()),
+                    runtime_hint: runtime_kind_from_runtime_type(service.runtime),
+                    framework: (framework != Framework::Unknown)
+                        .then_some(format!("{framework:?}")),
+                    entry_file: infer_entry_file(service_root),
+                    build_context: BuildContext {
+                        install_command: infer_install_command(
+                            package_managers.first().map(String::as_str),
+                            service.runtime,
+                        ),
+                        build_command: infer_build_command(
+                            package_managers.first().map(String::as_str),
+                            service.runtime,
+                        ),
+                        package_manager: service.package_manager.clone(),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        services.sort_by(|left, right| left.root_path.cmp(&right.root_path));
+        return services;
+    }
+
+    vec![ServiceFingerprint {
+        service_name: "root".to_string(),
+        service_type: ServiceType::CLI,
+        root_path: ".".to_string(),
+        runtime_hint: RuntimeKind::Unknown,
+        framework: None,
+        entry_file: infer_entry_file(root),
+        build_context: BuildContext::default(),
+    }]
+}
+
+fn infer_service_type(service: &ServiceDefinition) -> ServiceType {
+    let normalized = service.name.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "db" | "database" | "postgres" | "redis" | "cache" | "queue"
+    ) {
+        ServiceType::Database
+    } else if normalized.contains("worker")
+        || normalized.contains("celery")
+        || normalized.contains("cron")
+        || normalized.contains("job")
+    {
+        ServiceType::Worker
+    } else if normalized.contains("web")
+        || normalized.contains("frontend")
+        || normalized.contains("ui")
+    {
+        ServiceType::Frontend
+    } else if normalized.contains("lib") {
+        ServiceType::SharedLibrary
+    } else if service.runtime == RuntimeType::Unknown {
+        ServiceType::CLI
+    } else {
+        ServiceType::Backend
+    }
+}
+
+fn infer_entry_file(root: &Path) -> Option<String> {
+    for candidate in [
+        "src/main.rs",
+        "main.rs",
+        "main.py",
+        "app.py",
+        "src/main.ts",
+        "src/index.ts",
+        "src/main.js",
+        "index.js",
+    ] {
+        if root.join(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn infer_install_command(package_manager: Option<&str>, runtime: RuntimeType) -> Option<String> {
+    match (package_manager, runtime) {
+        (Some("pnpm"), _) => Some("pnpm install --frozen-lockfile".to_string()),
+        (Some("yarn"), _) => Some("yarn install --frozen-lockfile".to_string()),
+        (Some("bun"), _) => Some("bun install --frozen-lockfile".to_string()),
+        (Some("npm"), _) => Some("npm ci".to_string()),
+        (Some("cargo"), RuntimeType::Rust) => Some("cargo fetch".to_string()),
+        (Some("poetry"), RuntimeType::Python) => Some("poetry install".to_string()),
+        (Some("uv"), RuntimeType::Python) => Some("uv sync".to_string()),
+        (Some("pipenv"), RuntimeType::Python) => Some("pipenv install --dev".to_string()),
+        (Some("pip"), RuntimeType::Python) => {
+            Some("python -m pip install -r requirements.txt".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn infer_build_command(package_manager: Option<&str>, runtime: RuntimeType) -> Option<String> {
+    match (package_manager, runtime) {
+        (Some("pnpm"), _) => Some("pnpm run build".to_string()),
+        (Some("yarn"), _) => Some("yarn build".to_string()),
+        (Some("bun"), _) => Some("bun run build".to_string()),
+        (Some("npm"), _) => Some("npm run build".to_string()),
+        (Some("cargo"), RuntimeType::Rust) => Some("cargo build".to_string()),
+        (Some("go"), RuntimeType::Go) => Some("go build ./...".to_string()),
+        _ => None,
+    }
+}
+
+fn infer_dependency_graph(topology: Option<&ApplicationTopology>) -> DependencyGraph {
+    if let Some(topology) = topology {
+        return DependencyGraph {
+            nodes: topology
+                .services
+                .iter()
+                .map(|service| DependencyNode {
+                    id: service.id.clone(),
+                })
+                .collect(),
+            edges: topology
+                .dependencies
+                .iter()
+                .map(|dependency| DependencyEdge {
+                    from: dependency.service_id.clone(),
+                    to: dependency.depends_on.clone(),
+                })
+                .collect(),
+        };
+    }
+
+    DependencyGraph {
+        nodes: vec![DependencyNode {
+            id: "root".to_string(),
+        }],
+        edges: vec![],
+    }
+}
+
+fn infer_infra_signals(
+    snapshot: &HashMap<String, String>,
+    topology: Option<&ApplicationTopology>,
+) -> InfraSignals {
+    let services = topology.map(|topology| &topology.services);
+    let uses_database = services
+        .map(|services| {
+            services.iter().any(|service| {
+                let name = service.name.to_ascii_lowercase();
+                matches!(name.as_str(), "db" | "database" | "postgres")
+            })
+        })
+        .unwrap_or(false)
+        || snapshot.keys().any(|path| path.contains("migrations/"));
+    let uses_redis = services
+        .map(|services| {
+            services
+                .iter()
+                .any(|service| service.name.eq_ignore_ascii_case("redis"))
+        })
+        .unwrap_or(false);
+    let uses_queue = services
+        .map(|services| {
+            services.iter().any(|service| {
+                let name = service.name.to_ascii_lowercase();
+                name == "queue" || name.contains("worker")
+            })
+        })
+        .unwrap_or(false);
+    let docker_required = snapshot
+        .keys()
+        .any(|path| path.eq_ignore_ascii_case("dockerfile") || path.ends_with("/Dockerfile"));
+    let cloud_native = snapshot.contains_key("k8s/deployment.yaml")
+        || snapshot.contains_key("kubernetes/deployment.yaml")
+        || snapshot
+            .keys()
+            .any(|path| path.ends_with(".tf") || path.contains("helm/"));
+
+    InfraSignals {
+        uses_database,
+        uses_redis,
+        uses_queue,
+        docker_required,
+        cloud_native,
+    }
+}
+
+fn infer_language_profiles(
+    snapshot: &HashMap<String, String>,
+    primary_language: Language,
+) -> Vec<LanguageProfile> {
+    let mut ext_counts = HashMap::<Language, usize>::new();
+    for path in snapshot.keys() {
+        if path.ends_with(".rs") {
+            *ext_counts.entry(Language::Rust).or_default() += 1;
+        } else if path.ends_with(".py") {
+            *ext_counts.entry(Language::Python).or_default() += 1;
+        } else if path.ends_with(".go") {
+            *ext_counts.entry(Language::Go).or_default() += 1;
+        } else if path.ends_with(".ts") || path.ends_with(".tsx") {
+            *ext_counts.entry(Language::TypeScript).or_default() += 1;
+        } else if path.ends_with(".js") || path.ends_with(".jsx") {
+            *ext_counts.entry(Language::JavaScript).or_default() += 1;
+        }
+    }
+    if ext_counts.is_empty() {
+        ext_counts.insert(primary_language, 1);
+    }
+    let total = ext_counts.values().sum::<usize>().max(1) as f32;
+    let mut profiles = ext_counts
+        .into_iter()
+        .map(|(language, count)| LanguageProfile {
+            language,
+            confidence: (count as f32 / total).clamp(0.0, 1.0),
+            files_detected: snapshot
+                .keys()
+                .filter(|path| match language {
+                    Language::Rust => path.ends_with(".rs"),
+                    Language::Python => path.ends_with(".py"),
+                    Language::Go => path.ends_with(".go"),
+                    Language::TypeScript => path.ends_with(".ts") || path.ends_with(".tsx"),
+                    Language::JavaScript => path.ends_with(".js") || path.ends_with(".jsx"),
+                    Language::Unknown => false,
+                })
+                .cloned()
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    profiles
+}
+
+fn infer_framework_profiles(
+    framework: Framework,
+    snapshot: &HashMap<String, String>,
+) -> Vec<FrameworkProfile> {
+    if framework == Framework::Unknown {
+        return vec![];
+    }
+    let mut signals = vec![format!("framework:{framework:?}")];
+    for path in ["package.json", "pyproject.toml", "Cargo.toml", "go.mod"] {
+        if snapshot.contains_key(path) {
+            signals.push(path.to_string());
+        }
+    }
+    vec![FrameworkProfile {
+        framework: format!("{framework:?}"),
+        version: None,
+        confidence: 0.9,
+        detection_signals: signals,
+    }]
+}
+
+fn compute_confidence_model(
+    framework: Framework,
+    runtime_signals: &RuntimeSignals,
+    topology: Option<&ApplicationTopology>,
+) -> ConfidenceModel {
+    let framework_confidence: f32 = if framework == Framework::Unknown {
+        0.4
+    } else {
+        0.95
+    };
+    let runtime_signal_count = [
+        runtime_signals.node_detected,
+        runtime_signals.python_detected,
+        runtime_signals.rust_detected,
+        runtime_signals.bun_detected,
+    ]
+    .into_iter()
+    .filter(|signal| *signal)
+    .count();
+    let runtime_confidence: f32 = if runtime_signal_count == 0 {
+        0.35
+    } else if runtime_signal_count == 1 {
+        0.9
+    } else {
+        0.75
+    };
+    let topology_confidence: f32 = match topology {
+        Some(topology) if topology.services.len() > 1 => 0.9,
+        Some(_) => 0.7,
+        None => 0.6,
+    };
+    let overall = ((framework_confidence + runtime_confidence + topology_confidence) / 3.0_f32)
+        .clamp(0.0_f32, 1.0_f32);
+    ConfidenceModel {
+        overall,
+        framework_confidence,
+        runtime_confidence,
+        topology_confidence,
+    }
+}
+
+fn runtime_kind_from_runtime_type(runtime: RuntimeType) -> RuntimeKind {
+    match runtime {
+        RuntimeType::Node => RuntimeKind::Node,
+        RuntimeType::Rust => RuntimeKind::Rust,
+        RuntimeType::Go => RuntimeKind::Go,
+        RuntimeType::Python => RuntimeKind::Python,
+        RuntimeType::Wasm => RuntimeKind::Wasm,
+        RuntimeType::Static => RuntimeKind::Static,
+        RuntimeType::Unknown => RuntimeKind::Unknown,
     }
 }
 
@@ -4932,10 +5712,12 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     let snapshot = collect_repository_snapshot(root);
     let execution_profile = RepositoryRegistry::compute_and_cache_profile(
         &repo_reference,
+        root,
         snapshot,
         framework,
         language,
         &package_content,
+        topology.as_ref(),
     );
     let image_match = EXECUTION_IMAGE_REGISTRY
         .get_or_init(|| Mutex::new(ExecutionImageRegistry::default()))
@@ -5508,6 +6290,9 @@ impl Default for RestApiSpec {
                 "GET /workspaces/{id}/filesystem/*path",
                 "POST /execution-image/compile",
                 "GET /execution-image/{repo_id}",
+                "POST /fingerprint/generate",
+                "GET /fingerprint/{repo_id}",
+                "POST /fingerprint/recompute",
                 "GET /warm-pool/status",
                 "POST /warm-pool/prewarm",
             ],
@@ -6522,7 +7307,9 @@ fn sandbox_model_label(model: SandboxModel) -> &'static str {
 
 fn repository_fingerprint_material(fingerprint: &RepositoryFingerprint) -> String {
     format!(
-        "repo={}|lock={}|deps={}|lang={}|framework={}",
+        "spec={}|repo_id={}|repo={}|lock={}|deps={}|lang={}|framework={}|services={}",
+        fingerprint.spec_version,
+        fingerprint.repo_id,
         fingerprint.repo_hash,
         fingerprint
             .lockfile_hash
@@ -6537,7 +7324,8 @@ fn repository_fingerprint_material(fingerprint: &RepositoryFingerprint) -> Strin
             .framework_signature
             .as_deref()
             .unwrap_or(UNKNOWN_SIGNATURE)
-            .to_ascii_lowercase()
+            .to_ascii_lowercase(),
+        fingerprint.services.len()
     )
 }
 
@@ -7417,11 +8205,14 @@ mod tests {
         framework: Framework,
     ) -> RepositoryAnalysis {
         let fingerprint = RepositoryFingerprint {
+            repo_id: "repo".to_string(),
+            repo_url: "/tmp/repo".to_string(),
             repo_hash: "repo".to_string(),
             lockfile_hash: None,
             dependency_hash: None,
             language_signature: "Unknown".to_string(),
             framework_signature: Some(format!("{framework:?}")),
+            ..RepositoryFingerprint::default()
         };
         let classification = RepositoryClassification {
             class: RepoClass::StaticSite,
@@ -7587,6 +8378,14 @@ mod tests {
             .readiness_checks
             .iter()
             .any(|check| check == &ReadinessCheck::Http("/".to_string())));
+        assert_eq!(analysis.fingerprint.spec_version, "1.0");
+        assert_eq!(analysis.fingerprint.services.len(), 2);
+        assert!(analysis
+            .fingerprint
+            .dependency_graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "apps-web" && edge.to == "apps-api"));
     }
 
     #[test]
@@ -7940,18 +8739,24 @@ mod tests {
             edges: vec![],
         };
         let first = graph.compute_cache_keys_with_fingerprint(Some(&RepositoryFingerprint {
+            repo_id: "repo-a".to_string(),
+            repo_url: "repo-a".to_string(),
             repo_hash: "repo-a".to_string(),
             lockfile_hash: None,
             dependency_hash: None,
             language_signature: "Rust".to_string(),
             framework_signature: Some("Rust".to_string()),
+            ..RepositoryFingerprint::default()
         }));
         let second = graph.compute_cache_keys_with_fingerprint(Some(&RepositoryFingerprint {
+            repo_id: "repo-b".to_string(),
+            repo_url: "repo-b".to_string(),
             repo_hash: "repo-b".to_string(),
             lockfile_hash: None,
             dependency_hash: None,
             language_signature: "Rust".to_string(),
             framework_signature: Some("Rust".to_string()),
+            ..RepositoryFingerprint::default()
         }));
 
         assert_ne!(first.get("build"), second.get("build"));
@@ -8015,6 +8820,15 @@ mod tests {
             analysis.execution_profile.wasm_compatibility,
             WasmCompatibility::Partial
         );
+        assert!(!analysis.fingerprint.repo_id.is_empty());
+        assert_eq!(analysis.fingerprint.spec_version, "1.0");
+        assert!(analysis.fingerprint.runtime_signals.node_detected);
+        assert!(analysis
+            .fingerprint
+            .entrypoints
+            .iter()
+            .any(|entry| entry.path == "package.json"));
+        assert!(!analysis.fingerprint.build_signals.has_lockfile);
     }
 
     #[test]
@@ -8465,11 +9279,14 @@ mod tests {
     fn static_site_routes_to_wasm_target() {
         let profile = ExecutionProfile {
             fingerprint: RepositoryFingerprint {
+                repo_id: "repo".to_string(),
+                repo_url: "repo".to_string(),
                 repo_hash: "repo".to_string(),
                 lockfile_hash: None,
                 dependency_hash: None,
                 language_signature: "Unknown".to_string(),
                 framework_signature: Some("StaticWeb".to_string()),
+                ..RepositoryFingerprint::default()
             },
             classification: RepositoryClassification {
                 class: RepoClass::StaticSite,
@@ -9475,11 +10292,14 @@ mod tests {
     #[test]
     fn execution_match_engine_assigns_framework_image_with_confidence() {
         let fingerprint = RepositoryFingerprint {
+            repo_id: "repo-next".to_string(),
+            repo_url: "repo-next".to_string(),
             repo_hash: "repo-next".to_string(),
             lockfile_hash: Some("lock".to_string()),
             dependency_hash: Some("deps".to_string()),
             language_signature: "javascript".to_string(),
             framework_signature: Some("nextjs".to_string()),
+            ..RepositoryFingerprint::default()
         };
 
         let matched = ExecutionMatchEngine::match_repository(&fingerprint);
@@ -9491,11 +10311,14 @@ mod tests {
     #[test]
     fn execution_image_compiler_emits_deterministic_eis_spec() {
         let fingerprint = RepositoryFingerprint {
+            repo_id: "repo-next".to_string(),
+            repo_url: "repo-next".to_string(),
             repo_hash: "repo-next".to_string(),
             lockfile_hash: Some("pnpm-lock".to_string()),
             dependency_hash: Some("deps".to_string()),
             language_signature: "javascript".to_string(),
             framework_signature: Some("nextjs".to_string()),
+            ..RepositoryFingerprint::default()
         };
 
         let compiled = ExecutionImageCompiler::compile(&fingerprint);
@@ -9522,11 +10345,14 @@ mod tests {
     #[test]
     fn execution_image_compile_endpoint_returns_compiled_spec_payload() {
         let fingerprint = RepositoryFingerprint {
+            repo_id: "repo-fastapi".to_string(),
+            repo_url: "repo-fastapi".to_string(),
             repo_hash: "repo-fastapi".to_string(),
             lockfile_hash: Some("uv-lock".to_string()),
             dependency_hash: Some("deps".to_string()),
             language_signature: "python".to_string(),
             framework_signature: Some("fastapi".to_string()),
+            ..RepositoryFingerprint::default()
         };
 
         let (path, body) = execution_image_compile_endpoint(
@@ -9543,11 +10369,14 @@ mod tests {
     #[test]
     fn warm_pool_manager_tracks_prewarm_allocation_release_and_cache_binding() {
         let fingerprint = RepositoryFingerprint {
+            repo_id: "repo-fastapi".to_string(),
+            repo_url: "repo-fastapi".to_string(),
             repo_hash: "repo-fastapi".to_string(),
             lockfile_hash: Some("uv-lock".to_string()),
             dependency_hash: Some("deps".to_string()),
             language_signature: "python".to_string(),
             framework_signature: Some("fastapi".to_string()),
+            ..RepositoryFingerprint::default()
         };
         let image = ExecutionMatchEngine::match_repository(&fingerprint).image;
 
@@ -9573,11 +10402,14 @@ mod tests {
     #[test]
     fn warm_runtime_endpoints_expose_execution_image_and_pool_status() {
         let fingerprint = RepositoryFingerprint {
+            repo_id: "repo-rust".to_string(),
+            repo_url: "repo-rust".to_string(),
             repo_hash: "repo-rust".to_string(),
             lockfile_hash: Some("cargo-lock".to_string()),
             dependency_hash: Some("deps".to_string()),
             language_signature: "rust".to_string(),
             framework_signature: Some("rust".to_string()),
+            ..RepositoryFingerprint::default()
         };
         let mut registry = ExecutionImageRegistry::default();
         let (image_path, image_body) =
@@ -9607,9 +10439,97 @@ mod tests {
             .contains(&"GET /execution-image/{repo_id}"));
         assert!(RestApiSpec::default()
             .routes
+            .contains(&"POST /fingerprint/generate"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"GET /fingerprint/{repo_id}"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"POST /fingerprint/recompute"));
+        assert!(RestApiSpec::default()
+            .routes
             .contains(&"GET /warm-pool/status"));
         assert!(RestApiSpec::default()
             .routes
             .contains(&"POST /warm-pool/prewarm"));
+    }
+
+    #[test]
+    fn fingerprint_endpoints_expose_urfs_payload() {
+        let fingerprint = RepositoryFingerprint {
+            spec_version: "1.0".to_string(),
+            repo_id: "repo-id".to_string(),
+            repo_url: "https://github.com/rkendel1/rustgit-".to_string(),
+            languages: vec![LanguageProfile {
+                language: Language::Rust,
+                confidence: 0.9,
+                files_detected: vec!["src/lib.rs".to_string()],
+            }],
+            frameworks: vec![FrameworkProfile {
+                framework: "Rust".to_string(),
+                version: None,
+                confidence: 0.8,
+                detection_signals: vec!["Cargo.toml".to_string()],
+            }],
+            package_managers: vec!["cargo".to_string()],
+            services: vec![ServiceFingerprint {
+                service_name: "api".to_string(),
+                service_type: ServiceType::Backend,
+                root_path: ".".to_string(),
+                runtime_hint: RuntimeKind::Rust,
+                framework: Some("Rust".to_string()),
+                entry_file: Some("src/main.rs".to_string()),
+                build_context: BuildContext {
+                    install_command: Some("cargo fetch".to_string()),
+                    build_command: Some("cargo build".to_string()),
+                    package_manager: Some("cargo".to_string()),
+                },
+            }],
+            entrypoints: vec![EntryPoint {
+                path: "Cargo.toml".to_string(),
+                command: "cargo run".to_string(),
+                confidence: 0.9,
+            }],
+            dependency_graph: DependencyGraph {
+                nodes: vec![DependencyNode {
+                    id: "api".to_string(),
+                }],
+                edges: vec![],
+            },
+            runtime_signals: RuntimeSignals {
+                rust_detected: true,
+                ..RuntimeSignals::default()
+            },
+            build_signals: BuildSignals {
+                has_lockfile: true,
+                lockfile_type: Some("cargo".to_string()),
+                build_scripts: vec!["build".to_string()],
+            },
+            infra_signals: InfraSignals::default(),
+            confidence: 0.88,
+            confidence_model: ConfidenceModel {
+                overall: 0.88,
+                framework_confidence: 0.85,
+                runtime_confidence: 0.9,
+                topology_confidence: 0.9,
+            },
+            repo_hash: "hash".to_string(),
+            lockfile_hash: Some("lock".to_string()),
+            dependency_hash: Some("deps".to_string()),
+            language_signature: "rust".to_string(),
+            framework_signature: Some("rust".to_string()),
+        };
+        let (generate_path, generate_body) = fingerprint_generate_endpoint(&fingerprint);
+        assert_eq!(generate_path, "/fingerprint/generate");
+        assert!(generate_body.contains("\"spec_version\":\"1.0\""));
+        assert!(generate_body.contains("\"service_type\":\"backend\""));
+
+        let (get_path, get_body) = fingerprint_get_endpoint("repo-id", &fingerprint);
+        assert_eq!(get_path, "/fingerprint/repo-id");
+        assert!(get_body.contains("\"repo_id\":\"repo-id\""));
+
+        let (recompute_path, recompute_body) = fingerprint_recompute_endpoint(&fingerprint);
+        assert_eq!(recompute_path, "/fingerprint/recompute");
+        assert!(recompute_body.contains("\"status\":\"recomputed\""));
     }
 }
