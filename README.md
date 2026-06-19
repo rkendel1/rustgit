@@ -26,6 +26,12 @@ Both surfaces route through the same backend primitives:
 - Shared **Control Plane**
 - Shared execution IDs, URLs, and runtime state
 
+Surface UI contracts are rendered through a shared Surface Rendering System (SRS):
+
+- Shared DDockit design system component model
+- Shared component registry for contract-to-component mapping
+- Unified renderer output for Portal shell and GitHub overlay shell
+
 ## Quick start
 
 ```bash
