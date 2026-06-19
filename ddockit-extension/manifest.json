@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "DDockit",
+  "version": "1.0.0",
+  "description": "Run GitHub repositories instantly with DDockit",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "sidePanel",
+    "notifications",
+    "identity"
+  ],
+  "host_permissions": [
+    "https://github.com/*",
+    "https://api.github.com/*",
+    "https://*.ddockit.dev/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://github.com/*"
+      ],
+      "js": [
+        "content/github-detector.js",
+        "content/github-overlay.js"
+      ],
+      "css": [
+        "styles/shared.css"
+      ]
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "action": {
+    "default_popup": "popup/popup.html"
+  },
+  "icons": {
+    "16": "assets/icon16.png",
+    "32": "assets/icon32.png",
+    "48": "assets/icon48.png",
+    "128": "assets/icon128.png"
+  }
+}
