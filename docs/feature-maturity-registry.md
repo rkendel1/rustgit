@@ -14,13 +14,17 @@ This document is the canonical inventory of implemented system features in this 
 
 | Level | Count |
 |---|---:|
-| 0 | 1 |
+| 0 | 0 |
 | 1 | 0 |
 | 2 | 5 |
 | 3 | 14 |
 | 4 | 2 |
 
+- Last verified: 2026-06-19
+
 ## Feature inventory
+
+The following sections enumerate each implemented system feature with direct code evidence, architecture-readiness status, execution-readiness status, and maturity grade.
 
 ## Feature: Repository analysis and classification
 - **Code evidence:** `src/lib.rs` (`analyze_repository`, `build_repository_fingerprint`, `classify_repository`), tests `detects_*`, `analyze_repository_emits_execution_profile`
@@ -169,15 +173,12 @@ This document is the canonical inventory of implemented system features in this 
 - **Maturity:** **Level 4 — Production Ready**
 - **Gap notes:** Catalog breadth can continue to expand.
 
-## Feature: Feature maturity registry automation
-- **Code evidence:** Architectural generation tooling exists (`src/architecture_docs.rs`, `tools/generate_docs.rs`) but no auto-generated maturity registry
-- **Architectural readiness:** Partial foundation in generated architecture docs
-- **Execution readiness:** Manual-only maturity process
-- **Maturity:** **Level 0 — Not Implemented**
-- **Gap notes:** No code path currently generates this registry automatically.
-
 ## Designed vs implemented gap highlights
 
 1. **Control plane and auth are contract-strong but integration-light** (mostly validated by route/payload tests).
 2. **Healing and native runtime paths are architecturally present but less execution-complete than wasm/eidb paths.**
 3. **Feature maturity tracking itself is currently manual** (this document is canonical but not auto-generated).
+
+## Registry maintenance note
+
+- The maturity counts above are a point-in-time snapshot and must be re-verified on every registry update until automation exists.
