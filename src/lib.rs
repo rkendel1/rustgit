@@ -6457,6 +6457,160 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BadgeRuntimeState {
+    Ready,
+    NeedsSetup,
+    Broken,
+    Healed,
+    NotTested,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BadgeExecutionSnapshot {
+    pub health_score: f32,
+    pub execution_readiness: f32,
+    pub last_run_status: String,
+    pub has_execution_history: bool,
+    pub healed_artifact_available: bool,
+}
+
+fn badge_state_label(state: BadgeRuntimeState) -> (&'static str, &'static str, &'static str) {
+    match state {
+        BadgeRuntimeState::Ready => ("Ready", "#22c55e", "🟢"),
+        BadgeRuntimeState::NeedsSetup => ("Needs setup", "#facc15", "🟡"),
+        BadgeRuntimeState::Broken => ("Broken", "#ef4444", "🔴"),
+        BadgeRuntimeState::Healed => ("Healed", "#38bdf8", "🔵"),
+        BadgeRuntimeState::NotTested => ("Not tested", "#94a3b8", "⚪"),
+    }
+}
+
+fn escape_svg_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+pub fn derive_badge_runtime_state(snapshot: &BadgeExecutionSnapshot) -> BadgeRuntimeState {
+    if snapshot.healed_artifact_available {
+        return BadgeRuntimeState::Healed;
+    }
+    if !snapshot.has_execution_history {
+        return BadgeRuntimeState::NotTested;
+    }
+    if snapshot.last_run_status.eq_ignore_ascii_case("success") {
+        return BadgeRuntimeState::Ready;
+    }
+    if snapshot.execution_readiness < 0.7 {
+        BadgeRuntimeState::NeedsSetup
+    } else {
+        BadgeRuntimeState::Broken
+    }
+}
+
+pub fn badge_svg_endpoint(owner: &str, repo: &str, snapshot: &BadgeExecutionSnapshot) -> (String, String) {
+    let state = derive_badge_runtime_state(snapshot);
+    let (label, color, emoji) = badge_state_label(state);
+    let repo_name = escape_svg_text(&format!("{owner}/{repo}"));
+    let status_text = escape_svg_text(&format!("{emoji} {label}"));
+    let health = snapshot.health_score.clamp(0.0, 100.0);
+    let left_width = 32 + (repo_name.chars().count() as i32 * 6).max(48);
+    let right_width = 32 + (status_text.chars().count() as i32 * 6).max(78);
+    let total_width = left_width + right_width;
+
+    (
+        format!("/badge/{owner}/{repo}.svg"),
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{total_width}" height="20" role="img" aria-label="{repo_name}: {label}">
+  <linearGradient id="badge-fill" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <rect rx="3" width="{total_width}" height="20" fill="#1f2937"/>
+  <rect rx="3" x="{left_width}" width="{right_width}" height="20" fill="{color}"/>
+  <path fill="{color}" d="M{left_width} 0h4v20h-4z"/>
+  <rect rx="3" width="{total_width}" height="20" fill="url(#badge-fill)"/>
+  <g fill="#fff" text-anchor="middle" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" text-rendering="geometricPrecision" font-size="11">
+    <text x="{left_text_x}" y="15" fill="#fff">{repo_name}</text>
+    <text x="{right_text_x}" y="15" fill="#fff">{status_text}</text>
+  </g>
+  <title>{repo_name} - {label} ({health:.1} health)</title>
+</svg>"##,
+            left_text_x = left_width / 2,
+            right_text_x = left_width + (right_width / 2),
+        ),
+    )
+}
+
+pub fn healed_badge_svg_endpoint(owner: &str, repo: &str) -> (String, String) {
+    badge_svg_endpoint(
+        owner,
+        repo,
+        &BadgeExecutionSnapshot {
+            health_score: 100.0,
+            execution_readiness: 1.0,
+            last_run_status: "success".to_string(),
+            has_execution_history: true,
+            healed_artifact_available: true,
+        },
+    )
+}
+
+pub fn badge_seed_launch_endpoint(owner: &str, repo: &str, branch: Option<&str>) -> (String, String) {
+    let normalized_branch = branch.unwrap_or("main");
+    let repo_url = format!("https://github.com/{owner}/{repo}");
+    let (execution_path, execution_body) = executions_start_endpoint(&ExecutionStartRequest {
+        org_id: None,
+        user_id: None,
+        anon_user_id: Some(format!("anon-seed-{}", hash_key(&repo_url)[..12].to_string())),
+        anon_session_id: Some(format!(
+            "seed-{}",
+            hash_key(&format!("{repo_url}:{normalized_branch}"))[..12].to_string()
+        )),
+        device_fingerprint: Some("readme-badge-seed".to_string()),
+        repo_url: repo_url.clone(),
+        branch: Some(normalized_branch.to_string()),
+        commit: None,
+    });
+
+    let execution_payload: Value =
+        serde_json::from_str(&execution_body).unwrap_or_else(|_| json!({ "raw": execution_body }));
+
+    (
+        format!("/seed/{owner}/{repo}"),
+        json!({
+            "entrypoint": "readme_badge",
+            "repo": {
+                "owner": owner,
+                "name": repo,
+                "url": repo_url,
+                "branch": normalized_branch
+            },
+            "pipeline": {
+                "analyze_endpoint": "/api/v1/repositories/analyze",
+                "execution_plan_endpoint": "/api/v1/execution/plan",
+                "execution_start_endpoint": execution_path,
+                "execution_graph": "generated",
+                "healing_enabled": true
+            },
+            "session": {
+                "identity_type": "anonymous",
+                "ownership_transfer": ["fork_pr_back", "user_adoption_fork", "hosted_variant"]
+            },
+            "execution": execution_payload
+        })
+        .to_string(),
+    )
+}
+
+pub fn healed_badge_variant_endpoint(owner: &str, repo: &str) -> (String, String) {
+    let (_, body) = healed_badge_svg_endpoint(owner, repo);
+    (format!("/badge/healed/{owner}/{repo}.svg"), body)
+}
+
 pub fn executions_list_endpoint(org_id: &str, executions: &[EidbExecutionRecord]) -> (String, String) {
     let scoped = executions
         .iter()
@@ -11155,6 +11309,9 @@ impl Default for RestApiSpec {
             "GET /api/v1/surfaces/portal/navigation",
             "GET /api/v1/surfaces/extension/ui",
             "GET /api/v1/surfaces/portal/ui",
+            "GET /badge/{owner}/{repo}.svg",
+            "GET /badge/healed/{owner}/{repo}.svg",
+            "GET /seed/{owner}/{repo}",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
         Self { routes }
@@ -15263,6 +15420,11 @@ dependencies:
             .contains(&"GET /api/v1/surfaces/portal/navigation"));
         assert!(spec.routes.contains(&"GET /api/v1/surfaces/extension/ui"));
         assert!(spec.routes.contains(&"GET /api/v1/surfaces/portal/ui"));
+        assert!(spec.routes.contains(&"GET /badge/{owner}/{repo}.svg"));
+        assert!(spec
+            .routes
+            .contains(&"GET /badge/healed/{owner}/{repo}.svg"));
+        assert!(spec.routes.contains(&"GET /seed/{owner}/{repo}"));
     }
 
     #[test]
@@ -16071,6 +16233,37 @@ services:
             format!("/workspaces/{}", workspace.workspace_id)
         );
         assert!(workspace_delete_body.contains("\"status\":\"deleted\""));
+    }
+
+    #[test]
+    fn badge_seed_endpoints_emit_runtime_state_and_seed_pipeline_payloads() {
+        let (badge_path, badge_body) = badge_svg_endpoint(
+            "octocat",
+            "hello-world",
+            &BadgeExecutionSnapshot {
+                health_score: 98.5,
+                execution_readiness: 0.92,
+                last_run_status: "success".to_string(),
+                has_execution_history: true,
+                healed_artifact_available: false,
+            },
+        );
+        assert_eq!(badge_path, "/badge/octocat/hello-world.svg");
+        assert!(badge_body.contains("<svg"));
+        assert!(badge_body.contains("🟢 Ready"));
+        assert!(badge_body.contains("octocat/hello-world"));
+
+        let (healed_path, healed_body) = healed_badge_variant_endpoint("octocat", "hello-world");
+        assert_eq!(healed_path, "/badge/healed/octocat/hello-world.svg");
+        assert!(healed_body.contains("🔵 Healed"));
+
+        let (seed_path, seed_body) = badge_seed_launch_endpoint("octocat", "hello-world", None);
+        assert_eq!(seed_path, "/seed/octocat/hello-world");
+        assert!(seed_body.contains("\"entrypoint\":\"readme_badge\""));
+        assert!(seed_body.contains("\"analyze_endpoint\":\"/api/v1/repositories/analyze\""));
+        assert!(seed_body.contains("\"execution_start_endpoint\":\"/api/v1/executions\""));
+        assert!(seed_body.contains("\"ownership_transfer\""));
+        assert!(seed_body.contains("\"workspace_url\":\"https://workspace-"));
     }
 
     #[test]
