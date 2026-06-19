@@ -1089,9 +1089,10 @@ impl TemporalExecutionRouter {
         }
 
         let selected = match strategy {
-            RecoveryStrategy::LastKnownGood => self
-                .navigator
-                .recover_from_failure(graph, head_commit, &self.policy),
+            RecoveryStrategy::LastKnownGood => {
+                self.navigator
+                    .recover_from_failure(graph, head_commit, &self.policy)
+            }
             RecoveryStrategy::BestRunnable => self.navigator.find_best_runnable_commit(graph),
         }?;
         Some(selected.commit_hash.clone())
@@ -1161,7 +1162,11 @@ pub struct FailureSignal {
 pub struct FailureClassifier;
 
 impl FailureClassifier {
-    pub fn classify(&self, failure: &FailureSignal, fingerprint: &RepositoryFingerprint) -> FailureClass {
+    pub fn classify(
+        &self,
+        failure: &FailureSignal,
+        fingerprint: &RepositoryFingerprint,
+    ) -> FailureClass {
         let message = failure.message.to_ascii_lowercase();
         let attempted_command = failure
             .attempted_command
@@ -1500,7 +1505,9 @@ impl HealingCoordinator {
         head_commit: &str,
     ) -> HealingDecision {
         let failure_class = self.classifier.classify(failure, fingerprint);
-        let strategy = self.catalog.strategy_for(failure_class, failure, fingerprint);
+        let strategy = self
+            .catalog
+            .strategy_for(failure_class, failure, fingerprint);
         if let Some(result) = self
             .engine
             .execute_plan(&strategy, runtime, &self.validator)
@@ -1518,7 +1525,9 @@ impl HealingCoordinator {
             };
         }
 
-        if let Some(commit) = temporal_router.route(graph, head_commit, RecoveryStrategy::LastKnownGood) {
+        if let Some(commit) =
+            temporal_router.route(graph, head_commit, RecoveryStrategy::LastKnownGood)
+        {
             self.journal.record(
                 repo_id,
                 failure_class,
@@ -4904,8 +4913,11 @@ pub fn compute_customer_journey_metrics(results: &[JourneyResult]) -> CustomerJo
         })
         .count() as f32;
     let url_successes = results.iter().filter(|result| result.url_success).count() as f32;
-    let average_startup_time =
-        results.iter().map(|result| result.startup_time_ms as f32).sum::<f32>() / total;
+    let average_startup_time = results
+        .iter()
+        .map(|result| result.startup_time_ms as f32)
+        .sum::<f32>()
+        / total;
 
     let mut framework_totals: HashMap<String, (u32, u32)> = HashMap::new();
     for result in results {
@@ -4936,7 +4948,10 @@ pub fn compute_customer_journey_metrics(results: &[JourneyResult]) -> CustomerJo
         .iter()
         .filter(|result| result.journey_kind == CustomerJourneyKind::HealingRepairAndRetry)
         .count() as f32;
-    let healing_successes = results.iter().filter(|result| result.healing_success).count() as f32;
+    let healing_successes = results
+        .iter()
+        .filter(|result| result.healing_success)
+        .count() as f32;
     let fallback_candidates = results
         .iter()
         .filter(|result| result.journey_kind == CustomerJourneyKind::BrokenHeadCommitFallback)
@@ -7737,9 +7752,12 @@ impl DdockitRuntime {
 
 /// Loads DES from `.ddockit/ddockit.yaml` first, then falls back to `ddockit.yaml`.
 fn load_ddockit_execution_spec(root: &Path) -> Result<Option<DdockitExecutionSpecification>> {
-    let candidate = [root.join(".ddockit").join("ddockit.yaml"), root.join("ddockit.yaml")]
-        .into_iter()
-        .find(|path| path.exists());
+    let candidate = [
+        root.join(".ddockit").join("ddockit.yaml"),
+        root.join("ddockit.yaml"),
+    ]
+    .into_iter()
+    .find(|path| path.exists());
     let Some(path) = candidate else {
         return Ok(None);
     };
@@ -7764,7 +7782,9 @@ fn runtime_for_ddockit_service(service: &DdockitServiceSpecification) -> Runtime
     service.runtime.as_runtime_type()
 }
 
-fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -> Vec<ReadinessCheck> {
+fn readiness_checks_for_ddockit_service(
+    service: &DdockitServiceSpecification,
+) -> Vec<ReadinessCheck> {
     let mut checks = vec![];
     if let Some(port) = service.port {
         checks.push(ReadinessCheck::Port(port));
@@ -7772,10 +7792,7 @@ fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -
     if let Some(healthcheck) = service.healthcheck.as_ref() {
         match healthcheck.check_type {
             DdockitHealthcheckType::Http => checks.push(ReadinessCheck::Http(
-                healthcheck
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| "/".to_string()),
+                healthcheck.path.clone().unwrap_or_else(|| "/".to_string()),
             )),
             DdockitHealthcheckType::Tcp => {
                 if let Some(port) = healthcheck.port.or(service.port) {
@@ -7785,7 +7802,10 @@ fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -
             DdockitHealthcheckType::Process => checks.push(ReadinessCheck::Process),
         }
     }
-    if !checks.iter().any(|entry| matches!(entry, ReadinessCheck::Process)) {
+    if !checks
+        .iter()
+        .any(|entry| matches!(entry, ReadinessCheck::Process))
+    {
         checks.push(ReadinessCheck::Process);
     }
     checks
@@ -7835,7 +7855,10 @@ fn service_definition_from_ddockit(
     }
 }
 
-fn topology_from_ddockit_spec(root: &Path, spec: &DdockitExecutionSpecification) -> ApplicationTopology {
+fn topology_from_ddockit_spec(
+    root: &Path,
+    spec: &DdockitExecutionSpecification,
+) -> ApplicationTopology {
     let mut service_ids = spec.services.keys().cloned().collect::<Vec<_>>();
     service_ids.sort();
     let services = service_ids
@@ -9052,7 +9075,9 @@ pub mod ucpe_ti {
                     execution_id,
                     state,
                 } => {
-                    self.state.executions.insert(execution_id.clone(), state.clone());
+                    self.state
+                        .executions
+                        .insert(execution_id.clone(), state.clone());
                     self.registry.executions.insert(execution_id, state);
                 }
                 ControlPlaneEvent::ExecutionFailed { execution_id } => {
@@ -9126,9 +9151,7 @@ impl Default for RestApiSpec {
             "GET /api/v1/surfaces/portal/ui",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
-        Self {
-            routes,
-        }
+        Self { routes }
     }
 }
 
@@ -11300,18 +11323,11 @@ mod tests {
             topology.startup_order.stages
         );
         assert!(topology.startup_strategy.enforce_dependencies);
-        assert!(
-            topology
-                .global_network
-                .service_dns
-                .contains_key("apps-web")
-        );
-        assert!(
-            topology
-                .health_policy
-                .service_checks
-                .contains_key("apps-web")
-        );
+        assert!(topology.global_network.service_dns.contains_key("apps-web"));
+        assert!(topology
+            .health_policy
+            .service_checks
+            .contains_key("apps-web"));
         assert!(topology.health_policy.require_healthy_dependencies);
         assert_eq!(analysis.fingerprint.spec_version, "1.0");
         assert_eq!(analysis.fingerprint.services.len(), 2);
@@ -11420,7 +11436,8 @@ dependencies:
         assert!(topology
             .dependencies
             .iter()
-            .any(|dependency| dependency.service_id == "frontend" && dependency.depends_on == "backend"));
+            .any(|dependency| dependency.service_id == "frontend"
+                && dependency.depends_on == "backend"));
         assert_eq!(
             topology.startup_order.stages,
             vec![vec!["backend".to_string()], vec!["frontend".to_string()]]
@@ -12931,16 +12948,18 @@ dependencies:
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
         assert!(spec.routes.contains(&"GET /api/v1/executions/{id}"));
         assert!(spec.routes.contains(&"GET /api/v1/executions/{id}/logs"));
-        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/restart"));
+        assert!(spec
+            .routes
+            .contains(&"POST /api/v1/executions/{id}/restart"));
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/stop"));
-        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/migrate"));
+        assert!(spec
+            .routes
+            .contains(&"POST /api/v1/executions/{id}/migrate"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/history"));
         assert!(spec.routes.contains(&"GET /executions/{id}/history"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/healing"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/last-good"));
-        assert!(spec
-            .routes
-            .contains(&"GET /api/v1/dual-surface/contract"));
+        assert!(spec.routes.contains(&"GET /api/v1/dual-surface/contract"));
         assert!(spec
             .routes
             .contains(&"GET /api/v1/surfaces/extension/actions"));
@@ -13097,10 +13116,7 @@ dependencies:
             .state
             .topology_graphs
             .contains_key("topology-ucpe"));
-        assert!(control_plane
-            .state
-            .agent_states
-            .contains_key("agent-ucpe"));
+        assert!(control_plane.state.agent_states.contains_key("agent-ucpe"));
         assert_eq!(
             control_plane
                 .state
@@ -13707,13 +13723,29 @@ services:
             .join("tests")
             .join("golden_repos")
             .join("catalog.yaml");
-        let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        let catalog =
+            load_golden_repository_catalog(&path).expect("load golden repository catalog");
         assert_eq!(catalog.schema_version, "2");
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "node"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "python"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "rust"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "go"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "bun"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "node"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "python"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "rust"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "go"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "bun"));
         assert!(catalog
             .repositories
             .iter()
@@ -13754,7 +13786,8 @@ services:
             .join("tests")
             .join("golden_repos")
             .join("catalog.yaml");
-        let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        let catalog =
+            load_golden_repository_catalog(&path).expect("load golden repository catalog");
         let runner = CustomerJourneyRunner::new(catalog);
         let results = runner.run_default_suite();
         assert_eq!(results.len(), 10);
@@ -14093,10 +14126,8 @@ services:
     #[test]
     fn environment_resolver_only_generates_known_safe_defaults() {
         let resolver = EnvironmentResolver;
-        let defaults = resolver.defaults_for(&[
-            "DATABASE_URL".to_string(),
-            "SECRET_TOKEN".to_string(),
-        ]);
+        let defaults =
+            resolver.defaults_for(&["DATABASE_URL".to_string(), "SECRET_TOKEN".to_string()]);
         assert_eq!(
             defaults,
             vec![("DATABASE_URL".to_string(), "database.internal".to_string())]
@@ -14367,7 +14398,8 @@ services:
             recorded_at: 12,
         });
 
-        let (repo_history_path, repo_history_body) = repository_history_endpoint("repo-eidb", &database);
+        let (repo_history_path, repo_history_body) =
+            repository_history_endpoint("repo-eidb", &database);
         assert_eq!(repo_history_path, "/repositories/repo-eidb/history");
         assert!(repo_history_body.contains("\"commit_hash\":\"aaaaaaa\""));
 
@@ -14377,11 +14409,13 @@ services:
         assert!(execution_history_body.contains("\"event_type\":\"STARTED\""));
         assert!(execution_history_body.contains("workspace-1.ddockit.dev"));
 
-        let (healing_path, healing_body) = repository_healing_history_endpoint("repo-eidb", &database);
+        let (healing_path, healing_body) =
+            repository_healing_history_endpoint("repo-eidb", &database);
         assert_eq!(healing_path, "/repositories/repo-eidb/healing");
         assert!(healing_body.contains("\"failure_class\":\"WrongPackageManager\""));
 
-        let (last_good_path, last_good_body) = repository_last_good_commit_endpoint("repo-eidb", &database);
+        let (last_good_path, last_good_body) =
+            repository_last_good_commit_endpoint("repo-eidb", &database);
         assert_eq!(last_good_path, "/repositories/repo-eidb/last-good");
         assert!(last_good_body.contains("\"commit_hash\":\"aaaaaaa\""));
     }
