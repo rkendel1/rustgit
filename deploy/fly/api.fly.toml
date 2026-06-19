@@ -4,7 +4,6 @@ app = "trythissoftware-api"
   dockerfile = "Dockerfile"
 
 [env]
-  DATABASE_URL = "postgres://..."
   BASE_DOMAIN = "trythissoftware.com"
 
 [http_service]
