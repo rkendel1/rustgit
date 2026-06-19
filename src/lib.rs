@@ -5985,7 +5985,8 @@ fn oauth_redirect_targets(token: &str, extension_id: Option<&str>) -> (String, O
         .map(|value| format!("chrome-extension://{value}/auth/success?token={token}"));
     let portal_redirect = format!("https://trythissoftware.com/auth/success?token={token}");
     let selected_redirect = extension_redirect
-        .clone()
+        .as_deref()
+        .map(str::to_string)
         .unwrap_or_else(|| portal_redirect.clone());
     (selected_redirect, extension_redirect, portal_redirect)
 }
@@ -6078,12 +6079,12 @@ pub fn google_oauth_callback_endpoint(request: &GoogleOAuthCallbackRequest) -> (
         .clone()
         .unwrap_or_else(|| format!("user-goog-{}", hash_key(&request.google_sub)));
     let user_created = request.existing_user_id.is_none();
-    let org_prefix = request
-        .google_email
-        .split('@')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&request.google_name);
+    let email_prefix = request.google_email.split('@').next().unwrap_or_default();
+    let org_prefix = if email_prefix.is_empty() {
+        request.google_name.as_str()
+    } else {
+        email_prefix
+    };
     let org_name = format!("{org_prefix}-org");
     let org_slug = oauth_org_slug(&org_name);
     let org_id = request.existing_org_id.clone().unwrap_or_else(|| {
