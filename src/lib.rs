@@ -3222,12 +3222,30 @@ impl BuildPlanner {
             "pipenv" => "pipenv run pytest".to_string(),
             _ => "python -m pytest".to_string(),
         };
+        let fastapi_app_path = if analysis.root.join("main.py").exists() {
+            "main:app"
+        } else if analysis.root.join("app.py").exists() {
+            "app:app"
+        } else {
+            "main:app"
+        };
+        let streamlit_entry = if analysis.root.join("streamlit_app.py").exists() {
+            "streamlit_app.py"
+        } else if analysis.root.join("main.py").exists() {
+            "main.py"
+        } else {
+            "app.py"
+        };
         let py_dev = match framework {
-            Framework::FastApi => "uvicorn app:app --host 0.0.0.0 --port 8000".to_string(),
+            Framework::FastApi => {
+                format!("uvicorn {fastapi_app_path} --host 0.0.0.0 --port 8000")
+            }
             Framework::Django => "python manage.py runserver 0.0.0.0:8000".to_string(),
             Framework::Flask => "flask run --host 0.0.0.0 --port 8000".to_string(),
             Framework::Streamlit => {
-                "streamlit run app.py --server.address 0.0.0.0 --server.port 8501".to_string()
+                format!(
+                    "streamlit run {streamlit_entry} --server.address 0.0.0.0 --server.port 8501"
+                )
             }
             _ => "python -m app".to_string(),
         };
@@ -4345,12 +4363,18 @@ mod tests {
         assert_eq!(analysis.framework, Framework::Axum);
         assert_eq!(analysis.language, Language::Rust);
         assert_eq!(analysis.build_intelligence.entrypoints, vec!["http://0.0.0.0:8080/"]);
+        assert_eq!(
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("cargo run")
+        );
     }
 
     #[test]
     fn detects_fastapi_framework_with_uv_package_manager() {
         let repo = temp_dir("fastapi-detect");
         fs::write(repo.join("requirements.txt"), "fastapi==0.115.0\n").expect("write requirements");
+        fs::write(repo.join("app.py"), "from fastapi import FastAPI\napp = FastAPI()\n")
+            .expect("write app.py");
         fs::write(repo.join("uv.lock"), "version = 1").expect("write uv lock");
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
