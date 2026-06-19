@@ -227,7 +227,7 @@ repositories:
 
   - id: ddockit-golden-broken-head
     category: special
-    framework: tre
+    framework: temporal-repository-execution
     repo_url: https://github.com/ddockit/ddockit-golden-broken-head
     commit: 60a8e4ac2929b5e1f2f7f6e2fba57fd4cc91d07f
     execution_profile: tre
@@ -238,13 +238,13 @@ repositories:
       health_expectation: healthy
     certification:
       last_verified: "2026-06-19"
-      framework: tre
+      framework: temporal-repository-execution
       startup_time: 19
       success_rate: 96.7
 
   - id: ddockit-golden-healing
     category: special
-    framework: ahes
+    framework: auto-healing-execution-system
     repo_url: https://github.com/ddockit/ddockit-golden-healing
     commit: f2a4c9232f4f3d11af3eb3123ca70f8f7246eb9e
     execution_profile: ahes
@@ -255,13 +255,13 @@ repositories:
       health_expectation: healthy
     certification:
       last_verified: "2026-06-19"
-      framework: ahes
+      framework: auto-healing-execution-system
       startup_time: 24
       success_rate: 95.9
 
   - id: ddockit-golden-dea
     category: special
-    framework: dea
+    framework: distributed-execution-agent
     repo_url: https://github.com/ddockit/ddockit-golden-dea
     commit: 3c6c2b79d4dbe21ca7cbf3d6f6ce1b82e8dc430f
     execution_profile: dea
@@ -272,6 +272,6 @@ repositories:
       health_expectation: healthy
     certification:
       last_verified: "2026-06-19"
-      framework: dea
+      framework: distributed-execution-agent
       startup_time: 21
       success_rate: 96.8
