@@ -6461,14 +6461,16 @@ pub mod ucpe_ti {
         }
 
         pub fn routing_hint(&self, framework_signature: Option<&str>) -> Option<ExecutionTier> {
-            let signature = framework_signature?.to_ascii_lowercase();
-            if signature.contains("next") {
-                return Some(ExecutionTier::LocalDocker);
+            let normalized = framework_signature?
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            match normalized.as_str() {
+                "nextjs" => Some(ExecutionTier::LocalDocker),
+                "fastapi" => Some(ExecutionTier::LocalMachine),
+                _ => None,
             }
-            if signature.contains("fastapi") {
-                return Some(ExecutionTier::LocalMachine);
-            }
-            None
         }
     }
 
@@ -10544,6 +10546,37 @@ mod tests {
     }
 
     #[test]
+    fn ucpe_ti_migration_engine_moves_execution_to_new_agent() {
+        let fingerprint = RepositoryFingerprint::default();
+        let image_spec = ExecutionImageCompiler::compile(&fingerprint).image_spec;
+        let mut execution = ucpe_ti::ExecutionState {
+            urfs: fingerprint,
+            topology: test_topology("migration-topology"),
+            execution_image: image_spec,
+            selected_agent: AgentIdentity {
+                agent_id: "agent-1".to_string(),
+                device_fingerprint: "device-1".to_string(),
+                public_key: "pk-1".to_string(),
+                trusted: true,
+            },
+            runtime_status: ucpe_ti::RuntimeState::Running,
+        };
+
+        ucpe_ti::ExecutionMigrationEngine::migrate(
+            &mut execution,
+            AgentIdentity {
+                agent_id: "agent-2".to_string(),
+                device_fingerprint: "device-2".to_string(),
+                public_key: "pk-2".to_string(),
+                trusted: true,
+            },
+        );
+
+        assert_eq!(execution.selected_agent.agent_id, "agent-2");
+        assert_eq!(execution.runtime_status, ucpe_ti::RuntimeState::Migrated);
+    }
+
+    #[test]
     fn ucpe_ti_control_plane_applies_events_to_single_state_of_truth() {
         let router = ExecutionRouter::new(vec![Box::new(StaticRuntimeProvider)]);
         let mut control_plane = ucpe_ti::ControlPlane::new(router);
@@ -10630,6 +10663,26 @@ mod tests {
                 .get("exec-ucpe")
                 .map(|state| state.runtime_status),
             Some(ucpe_ti::RuntimeState::Migrated)
+        );
+
+        control_plane.apply_event(ucpe_ti::ControlPlaneEvent::ExecutionFailed {
+            execution_id: "exec-ucpe".to_string(),
+        });
+        assert_eq!(
+            control_plane
+                .state
+                .executions
+                .get("exec-ucpe")
+                .map(|state| state.runtime_status),
+            Some(ucpe_ti::RuntimeState::Failed)
+        );
+        assert_eq!(
+            control_plane
+                .registry
+                .executions
+                .get("exec-ucpe")
+                .map(|state| state.runtime_status),
+            Some(ucpe_ti::RuntimeState::Failed)
         );
     }
 
