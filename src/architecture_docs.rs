@@ -92,20 +92,27 @@ pub fn analyze_architecture_from_source(source: &str) -> ArchitectureSnapshot {
         source,
         &mut edges,
         "ExecutionEngine::start",
+        "ExecutionRouter::dispatch_start",
+        "self.router.dispatch_start(ctx)",
+    );
+    add_call_edge_if_present(
+        source,
+        &mut edges,
+        "ExecutionRouter::dispatch_start",
         "ExecutionProvider::prepare",
         "provider.prepare(ctx)?",
     );
     add_call_edge_if_present(
         source,
         &mut edges,
-        "ExecutionEngine::start",
+        "ExecutionRouter::dispatch_start",
         "ExecutionProvider::start",
         "provider.start(ctx)?",
     );
     add_call_edge_if_present(
         source,
         &mut edges,
-        "ExecutionEngine::start",
+        "ExecutionRouter::dispatch_start",
         "ExecutionProvider::health",
         "provider.health(&handle)?",
     );
@@ -175,8 +182,8 @@ pub fn extract_execution_flow_from_source(source: &str) -> ExecutionFlowGraph {
     add_runtime_call_if_present(
         source,
         &mut runtime_calls,
-        "provider.can_handle(ctx)",
-        "ExecutionProvider is selected via can_handle()",
+        "self.select(ctx)",
+        "ExecutionRouter selects runtime ownership",
     );
     add_runtime_call_if_present(
         source,
@@ -225,7 +232,7 @@ pub fn generate_grounded_docs(
 ## 5. Runtime abstraction truth\n\
 - WasmExecutionProvider: {}\n\
 - NativeRuntimeEngine: {}\n\
-- ExecutionDispatcher: {}\n\
+- ExecutionRouter: {}\n\
 \nAll statements above are derived from declarations or call patterns in `src/lib.rs` only.",
         snapshot.modules.join(", "),
         component_status(source, "struct ExecutionEngine", "impl ExecutionEngine"),
@@ -269,8 +276,8 @@ pub fn generate_grounded_docs(
         ),
         component_status(
             source,
-            "struct ExecutionDispatcher",
-            "impl ExecutionDispatcher"
+            "struct ExecutionRouter",
+            "impl ExecutionRouter"
         ),
     );
 
@@ -512,7 +519,7 @@ mod tests {
         let flow = extract_execution_flow_from_source(SOURCE);
         assert!(flow
             .runtime_calls
-            .contains(&"ExecutionProvider is selected via can_handle()".to_string()));
+            .contains(&"ExecutionRouter selects runtime ownership".to_string()));
         assert!(flow
             .transitions
             .contains(&"Created -> Materializing".to_string()));
@@ -525,7 +532,7 @@ mod tests {
         let docs = generate_grounded_docs(&snapshot, &flow, SOURCE);
         assert!(docs
             .system_architecture
-            .contains("ExecutionDispatcher: NOT PRESENT IN CODEBASE"));
+            .contains("ExecutionRouter: IMPLEMENTED"));
         assert!(docs
             .execution_flow
             .contains("Workspace state machine transitions"));
