@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-label="User journey step 3 screenshot">
+  <rect width="1200" height="700" fill="#0f172a"/>
+  <rect x="40" y="40" width="1120" height="620" rx="14" fill="#111827" stroke="#334155"/>
+  <text x="80" y="105" fill="#e2e8f0" font-size="36" font-family="Arial, sans-serif" font-weight="700">Step 3 — Heal Failed Execution</text>
+  <rect x="80" y="150" width="520" height="420" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="115" y="205" fill="#fecaca" font-size="26" font-family="Arial, sans-serif" font-weight="700">Failure detected: Dependency</text>
+  <text x="115" y="250" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">Classify  →  Repair Plan  →  Execute  →  Validate</text>
+  <rect x="115" y="280" width="450" height="55" rx="8" fill="#1e293b" stroke="#475569"/>
+  <text x="145" y="316" fill="#f8fafc" font-size="22" font-family="Arial, sans-serif">Repair: pin package version</text>
+  <rect x="115" y="355" width="220" height="56" rx="8" fill="#22c55e"/>
+  <text x="170" y="390" fill="#052e16" font-size="24" font-family="Arial, sans-serif" font-weight="700">Heal Now</text>
+  <rect x="640" y="150" width="480" height="420" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="675" y="205" fill="#bae6fd" font-size="28" font-family="Arial, sans-serif" font-weight="700">Healing Timeline</text>
+  <text x="675" y="250" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">Attempt #12 • success</text>
+  <text x="675" y="290" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">Failure class: Dependency</text>
+  <text x="675" y="330" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">Execution score: 92</text>
+  <text x="675" y="370" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">Runtime: WASM</text>
+</svg>

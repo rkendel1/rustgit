@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-label="User journey step 4 screenshot">
+  <rect width="1200" height="700" fill="#0f172a"/>
+  <rect x="40" y="40" width="1120" height="620" rx="14" fill="#111827" stroke="#334155"/>
+  <text x="80" y="105" fill="#e2e8f0" font-size="36" font-family="Arial, sans-serif" font-weight="700">Step 4 — Adopt Workspace</text>
+  <rect x="80" y="150" width="1040" height="420" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="120" y="210" fill="#f8fafc" font-size="28" font-family="Arial, sans-serif" font-weight="700">Adoption Actions</text>
+  <text x="120" y="260" fill="#cbd5e1" font-size="24" font-family="Arial, sans-serif">• Fork Repository</text>
+  <text x="120" y="300" fill="#cbd5e1" font-size="24" font-family="Arial, sans-serif">• Apply Repair</text>
+  <text x="120" y="340" fill="#cbd5e1" font-size="24" font-family="Arial, sans-serif">• Open Pull Request</text>
+  <text x="120" y="400" fill="#bbf7d0" font-size="24" font-family="Arial, sans-serif">Adopted Workspace: project.trythissoftware.com</text>
+  <rect x="800" y="440" width="280" height="70" rx="8" fill="#22c55e"/>
+  <text x="860" y="485" fill="#052e16" font-size="26" font-family="Arial, sans-serif" font-weight="700">Adopt</text>
+</svg>

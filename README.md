@@ -36,10 +36,11 @@ Surface UI contracts are rendered through a shared Surface Rendering System (SRS
 
 The API surface now includes a badge-driven execution seed flow:
 
-- `POST /api/badge/generate` — portal badge generator for markdown, HTML, badge URL, and seed trigger snippets
-- `GET /badge/{owner}/{repo}.svg` — dynamic runtime status badge (ready / needs setup / broken / healed / not tested)
+- `POST /api/badges/generate` — portal badge generator for markdown, HTML, badge URL, and seed trigger snippets
+- `GET /badge/{owner}/{repo}.svg` — dynamic runtime status badge (untested / runnable / verified / healed / production ready)
 - `GET /badge/healed/{owner}/{repo}.svg` — healed badge variant
 - `GET /seed/{owner}/{repo}` — badge click bootstrap into anonymous execution + analyze/plan/start pipeline
+- `GET /api/repositories/{id}/intelligence` — repository intelligence panel data (execution score, runtime, launch/heal/adopt actions)
 
 Example badge embed:
 
@@ -55,6 +56,25 @@ Badge screenshots:
 ![Healed badge screenshot](https://cdn.trythissoftware.com/badge/healed/vercel/next.js.svg)
 
 This badge updates automatically based on repository execution health.
+
+## User journey screenshots
+
+End-to-end GitHub-native execution flywheel journey:
+
+1) Visit GitHub repository and see the TryThisSoftware badge  
+![User journey step 1](docs/screenshots/user-journey-1-github-repo.svg)
+
+2) Click badge to launch via `/seed/{owner}/{repo}`  
+![User journey step 2](docs/screenshots/user-journey-2-seed-launch.svg)
+
+3) Heal failures with classify → repair → validate flow  
+![User journey step 3](docs/screenshots/user-journey-3-heal.svg)
+
+4) Adopt the healed workspace  
+![User journey step 4](docs/screenshots/user-journey-4-adopt.svg)
+
+5) Publish runtime and republish a stronger badge state  
+![User journey step 5](docs/screenshots/user-journey-5-publish.svg)
 
 ## Quick start
 

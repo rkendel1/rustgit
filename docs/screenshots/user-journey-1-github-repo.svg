@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-label="User journey step 1 screenshot">
+  <rect width="1200" height="700" fill="#0f172a"/>
+  <rect x="40" y="40" width="1120" height="620" rx="14" fill="#111827" stroke="#334155"/>
+  <text x="80" y="105" fill="#e2e8f0" font-size="36" font-family="Arial, sans-serif" font-weight="700">Step 1 — Visit GitHub Repository</text>
+  <rect x="80" y="140" width="1040" height="72" rx="8" fill="#1f2937" stroke="#475569"/>
+  <text x="110" y="186" fill="#93c5fd" font-size="28" font-family="Arial, sans-serif">https://github.com/octocat/hello-world</text>
+  <rect x="80" y="245" width="700" height="330" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="110" y="290" fill="#e5e7eb" font-size="26" font-family="Arial, sans-serif" font-weight="700">README.md</text>
+  <text x="110" y="335" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">[![Run with TryThisSoftware]</text>
+  <text x="110" y="370" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">(https://cdn.trythissoftware.com/badge/octocat/hello-world.svg)]</text>
+  <text x="110" y="405" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">(https://trythissoftware.com/seed/octocat/hello-world)</text>
+  <rect x="820" y="245" width="300" height="120" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="850" y="290" fill="#e2e8f0" font-size="23" font-family="Arial, sans-serif">Badge</text>
+  <rect x="850" y="305" width="230" height="38" rx="5" fill="#1e293b" stroke="#475569"/>
+  <text x="867" y="331" fill="#f8fafc" font-size="18" font-family="Arial, sans-serif">octocat/hello-world | Verified</text>
+</svg>
