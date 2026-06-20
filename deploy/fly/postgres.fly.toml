@@ -1,0 +1,24 @@
+app = "trythissoftware-db"
+primary_region = "iad"
+
+[build]
+  image = "postgres:17"
+
+[env]
+  POSTGRES_DB = "rustgit"
+  POSTGRES_USER = "postgres"
+  PGDATA = "/data/pgdata"
+
+[[mounts]]
+  source = "pgdata"
+  destination = "/data/pgdata"
+
+[http_service]
+  internal_port = 5432
+  auto_stop_machines = "off"
+  auto_start_machines = true
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

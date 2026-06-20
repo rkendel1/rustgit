@@ -95,6 +95,7 @@ Fly.io app configs are checked in under `deploy/fly/`:
 - `api.fly.toml` (`trythissoftware-api`)
 - `portal.fly.toml` (`trythissoftware-portal`)
 - `workspaces.fly.toml` (`trythissoftware-workspaces`)
+- `postgres.fly.toml` (`trythissoftware-db`) — self-managed Postgres, runs on Fly's private network
 
 Required runtime environment variables:
 
@@ -106,7 +107,28 @@ OAuth callback endpoints (API):
 - `GET https://api.trythissoftware.com/auth/github/callback`
 - `GET https://api.trythissoftware.com/auth/google/callback`
 
-Store API credentials/secrets (`DATABASE_URL`, `REDIS_URL`, GitHub OAuth secrets, `JWT_SECRET`) as Fly secrets (`fly secrets set ...`) instead of committing them to Fly config files.
+Store API credentials/secrets as Fly secrets instead of committing them to config files:
+
+```bash
+# Deploy Postgres first
+fly deploy --config deploy/fly/postgres.fly.toml
+
+# Set the DATABASE_URL pointing to Fly's private network (.flycast)
+fly secrets set --app trythissoftware-api \
+  DATABASE_URL="postgresql://postgres:<password>@trythissoftware-db.flycast:5432/rustgit" \
+  GITHUB_CLIENT_ID=<your-github-client-id> \
+  GITHUB_CLIENT_SECRET=<your-github-client-secret> \
+  JWT_SECRET=<your-jwt-secret>
+
+# Deploy the API
+fly deploy --config deploy/fly/api.fly.toml
+```
+
+`POSTGRES_PASSWORD` must be set as a secret on the Postgres app before first deploy:
+
+```bash
+fly secrets set --app trythissoftware-db POSTGRES_PASSWORD=<password>
+```
 
 ### Local initialization example
 

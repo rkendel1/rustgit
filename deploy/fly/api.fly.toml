@@ -1,11 +1,21 @@
 app = "trythissoftware-api"
+primary_region = "iad"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   BASE_DOMAIN = "trythissoftware.com"
+  # DATABASE_URL, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, JWT_SECRET set via:
+  # fly secrets set --app trythissoftware-api KEY=value
 
 [http_service]
   internal_port = 8080
   force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
