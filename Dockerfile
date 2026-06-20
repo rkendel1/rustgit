@@ -13,8 +13,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --bin wasm-workspace-cli
 
-# We do not need the Rust toolchain to run the binary!
-FROM debian:bookworm-slim AS runtime
+# Keep runtime glibc aligned with the build image to avoid libc symbol mismatches.
+FROM chef AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/release/wasm-workspace-cli /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/wasm-workspace-cli"]
