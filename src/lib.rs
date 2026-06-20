@@ -6585,6 +6585,7 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BadgeRuntimeState {
     Runnable,
     Verified,
@@ -6594,6 +6595,7 @@ pub enum BadgeRuntimeState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VerificationState {
     Unverified,
     Verified,
