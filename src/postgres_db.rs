@@ -1,7 +1,8 @@
 use crate::{
     EidbCommitExecutionResultRecord, EidbCommitRecord, EidbExecutionEventRecord, EidbExecutionRecord,
-    EidbHealingAttemptRecord, EidbJourneyResultRecord, EidbRepositoryRecord, EidbUrlAllocationRecord,
-    EidbWarmPoolUsageRecord, EidbBillingEventRecord, ExecutionIntelligenceDatabase,
+    EidbHealingAttemptRecord, EidbJourneyResultRecord, EidbRepositoryAnswerRecord,
+    EidbRepositoryContextSnapshotRecord, EidbRepositoryQuestionRecord, EidbRepositoryRecord,
+    EidbUrlAllocationRecord, EidbWarmPoolUsageRecord, EidbBillingEventRecord, ExecutionIntelligenceDatabase,
 };
 use postgres::NoTls;
 use r2d2::Pool;
@@ -94,6 +95,11 @@ const MIGRATIONS: &[Migration] = &[
         version: "0006",
         name: "repository_identity_and_healing_repairs",
         sql: include_str!("../migrations/0006_repository_identity_and_healing_repairs.sql"),
+    },
+    Migration {
+        version: "0007",
+        name: "repository_intelligence_rag",
+        sql: include_str!("../migrations/0007_repository_intelligence_rag.sql"),
     },
 ];
 
@@ -306,6 +312,10 @@ impl ExecutionIntelligencePostgresStore {
             client.batch_execute(
                 "
                 DROP TABLE IF EXISTS commit_execution_results CASCADE;
+                DROP TABLE IF EXISTS repository_answers CASCADE;
+                DROP TABLE IF EXISTS repository_questions CASCADE;
+                DROP TABLE IF EXISTS repository_context_snapshots CASCADE;
+                DROP TABLE IF EXISTS repository_embeddings CASCADE;
                 DROP TABLE IF EXISTS audit_logs CASCADE;
                 DROP TABLE IF EXISTS journey_results CASCADE;
                 DROP TABLE IF EXISTS agents CASCADE;
@@ -622,6 +632,122 @@ impl ExecutionIntelligencePostgresStore {
                     &record.success,
                     &(record.startup_time_ms as f64),
                     &(record.recorded_at as f64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_repository_context_snapshot(
+        &self,
+        record: &EidbRepositoryContextSnapshotRecord,
+    ) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            client.execute(
+                "INSERT INTO repository_context_snapshots (snapshot_id, repository_id, context_payload, captured_at)
+                 VALUES ($1, $2, $3, to_timestamp($4::double precision))
+                 ON CONFLICT (snapshot_id)
+                 DO UPDATE SET
+                    repository_id = EXCLUDED.repository_id,
+                    context_payload = EXCLUDED.context_payload,
+                    captured_at = EXCLUDED.captured_at",
+                &[
+                    &record.snapshot_id,
+                    &record.repository_id,
+                    &record.context_payload,
+                    &(record.captured_at as f64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_repository_question(
+        &self,
+        record: &EidbRepositoryQuestionRecord,
+    ) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            client.execute(
+                "INSERT INTO repository_questions (question_id, repository_id, question, context_snapshot_id, asked_at)
+                 VALUES ($1, $2, $3, $4, to_timestamp($5::double precision))
+                 ON CONFLICT (question_id)
+                 DO UPDATE SET
+                    repository_id = EXCLUDED.repository_id,
+                    question = EXCLUDED.question,
+                    context_snapshot_id = EXCLUDED.context_snapshot_id,
+                    asked_at = EXCLUDED.asked_at",
+                &[
+                    &record.question_id,
+                    &record.repository_id,
+                    &record.question,
+                    &record.context_snapshot_id,
+                    &(record.asked_at as f64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_repository_answer(&self, record: &EidbRepositoryAnswerRecord) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            client.execute(
+                "INSERT INTO repository_answers (answer_id, question_id, answer, confidence, outcome, created_at)
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision))
+                 ON CONFLICT (answer_id)
+                 DO UPDATE SET
+                    question_id = EXCLUDED.question_id,
+                    answer = EXCLUDED.answer,
+                    confidence = EXCLUDED.confidence,
+                    outcome = EXCLUDED.outcome,
+                    created_at = EXCLUDED.created_at",
+                &[
+                    &record.answer_id,
+                    &record.question_id,
+                    &record.answer,
+                    &record.confidence,
+                    &record.outcome,
+                    &(record.created_at as f64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn upsert_repository_embedding(
+        &self,
+        embedding_id: &str,
+        repository_id: &str,
+        artifact_kind: &str,
+        artifact_id: &str,
+        content: &str,
+        embedding_literal: &str,
+        metadata: &Value,
+        created_at: u64,
+    ) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            client.execute(
+                "INSERT INTO repository_embeddings (
+                    embedding_id, repository_id, artifact_kind, artifact_id, content, embedding, metadata, created_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6::vector, $7, to_timestamp($8::double precision))
+                 ON CONFLICT (embedding_id)
+                 DO UPDATE SET
+                    repository_id = EXCLUDED.repository_id,
+                    artifact_kind = EXCLUDED.artifact_kind,
+                    artifact_id = EXCLUDED.artifact_id,
+                    content = EXCLUDED.content,
+                    embedding = EXCLUDED.embedding,
+                    metadata = EXCLUDED.metadata,
+                    created_at = EXCLUDED.created_at",
+                &[
+                    &embedding_id,
+                    &repository_id,
+                    &artifact_kind,
+                    &artifact_id,
+                    &content,
+                    &embedding_literal,
+                    &metadata,
+                    &(created_at as f64),
                 ],
             )?;
             Ok(())
