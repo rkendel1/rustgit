@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? "https://api.trythissoftware.com";
+  process.env.NEXT_PUBLIC_API_URL ??
+  (process.env.NODE_ENV === "development"
+    ? "http://localhost:8080"
+    : "https://api.trythissoftware.com");
 
 async function proxyRequest(
   request: NextRequest,

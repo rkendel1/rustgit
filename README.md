@@ -73,6 +73,22 @@ npm install
 npm run dev
 ```
 
+### Local platform development
+
+Run the API and portal together in separate terminals:
+
+```bash
+# Terminal 1 (API)
+cargo run --bin server
+
+# Terminal 2 (Portal)
+cd portal
+npm install
+npm run dev
+```
+
+By default, the portal uses `http://localhost:8080` for API requests in development.
+
 Production/Fly deploy for the portal uses `portal/Dockerfile` through `deploy/fly/portal.fly.toml`.
 
 Portal screenshot:

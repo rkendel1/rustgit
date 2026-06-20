@@ -1,5 +1,8 @@
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? "https://api.trythissoftware.com";
+  process.env.NEXT_PUBLIC_API_URL ??
+  (process.env.NODE_ENV === "development"
+    ? "http://localhost:8080"
+    : "https://api.trythissoftware.com");
 
 export default function Home() {
   return (
@@ -19,6 +22,7 @@ export default function Home() {
           borderRadius: "0.75rem",
           padding: "1.5rem",
           background: "#ffffff",
+          color: "#0f172a",
         }}
       >
         <h1 style={{ marginBottom: "0.75rem" }}>TryThisSoftware Portal</h1>
