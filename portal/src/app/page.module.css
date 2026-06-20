@@ -1,0 +1,175 @@
+.page {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.header {
+  background: #101623;
+  color: #eef2ff;
+  border-radius: 0.75rem;
+  padding: 1rem;
+}
+
+.header p {
+  margin-top: 0.5rem;
+  color: #bfdbfe;
+}
+
+.summaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.card {
+  border: 1px solid #dbeafe;
+  border-radius: 0.75rem;
+  background: #f8fbff;
+  padding: 0.75rem;
+}
+
+.card h2 {
+  font-size: 0.85rem;
+  color: #475569;
+  margin-bottom: 0.4rem;
+}
+
+.card strong {
+  font-size: 1rem;
+}
+
+.apiBase {
+  word-break: break-word;
+}
+
+.contextPanel,
+.groupCard,
+.responsePanel {
+  border: 1px solid #dbeafe;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  padding: 0.9rem;
+}
+
+.inputGrid {
+  margin-top: 0.75rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.75rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.field span {
+  font-size: 0.85rem;
+  color: #334155;
+}
+
+.field input {
+  border: 1px solid #bfdbfe;
+  border-radius: 0.5rem;
+  padding: 0.45rem;
+  font: inherit;
+}
+
+.groups {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.groupCard h2 {
+  margin-bottom: 0.35rem;
+}
+
+.groupCard p {
+  color: #475569;
+  margin-bottom: 0.75rem;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.55rem;
+}
+
+.actions button {
+  border: 1px solid #bfdbfe;
+  border-radius: 0.6rem;
+  background: #eff6ff;
+  padding: 0.65rem;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  cursor: pointer;
+}
+
+.actions button:hover {
+  background: #dbeafe;
+}
+
+.actions small {
+  color: #334155;
+  word-break: break-word;
+}
+
+.responsePanel pre {
+  margin-top: 0.6rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 0.6rem;
+  padding: 0.75rem;
+  max-height: 420px;
+  overflow: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .header {
+    background: #0f172a;
+  }
+
+  .card,
+  .contextPanel,
+  .groupCard,
+  .responsePanel {
+    border-color: #334155;
+    background: #111827;
+    color: #e5e7eb;
+  }
+
+  .groupCard p,
+  .field span,
+  .actions small,
+  .card h2 {
+    color: #cbd5e1;
+  }
+
+  .actions button {
+    border-color: #475569;
+    background: #1e293b;
+    color: #e2e8f0;
+  }
+
+  .actions button:hover {
+    background: #334155;
+  }
+
+  .field input {
+    border-color: #475569;
+    background: #0f172a;
+    color: #e2e8f0;
+  }
+}
