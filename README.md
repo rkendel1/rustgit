@@ -63,6 +63,22 @@ cargo test
 cargo run --bin wasm-workspace-cli -- launch /absolute/path/to/repo
 ```
 
+## Portal (Next.js)
+
+The management portal now lives in `./portal` as a standalone Next.js app.
+
+```bash
+cd portal
+npm install
+npm run dev
+```
+
+Production/Fly deploy for the portal uses `portal/Dockerfile` through `deploy/fly/portal.fly.toml`.
+
+Portal screenshot:
+
+![TryThisSoftware portal](docs/screenshots/portal-home.png)
+
 ## PostgreSQL persistence
 
 This repository now includes SQL migrations and a production-style PostgreSQL persistence layer for Execution Intelligence history.
