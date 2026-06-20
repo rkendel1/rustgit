@@ -13,8 +13,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --bin wasm-workspace-cli
 
-# Keep runtime glibc aligned with the build image to avoid libc symbol mismatches.
-FROM chef AS runtime
+# Use a runtime base with glibc >= 2.39 so the built binary starts on Fly.
+FROM debian:trixie-slim AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/release/wasm-workspace-cli /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/wasm-workspace-cli"]
