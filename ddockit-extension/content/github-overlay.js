@@ -1,7 +1,8 @@
 const BUTTON_ID = "ddockit-run-button";
+const ASK_BUTTON_ID = "ddockit-ask-repository-button";
 
 function ensureButton() {
-  if (document.getElementById(BUTTON_ID)) {
+  if (document.getElementById(BUTTON_ID) && document.getElementById(ASK_BUTTON_ID)) {
     return;
   }
 
@@ -10,12 +11,12 @@ function ensureButton() {
     return;
   }
 
-  const button = document.createElement("button");
-  button.id = BUTTON_ID;
-  button.type = "button";
-  button.className = "ddockit-button";
-  button.textContent = "Run with TryThisSoftware";
-  button.addEventListener("click", async () => {
+  const runButton = document.createElement("button");
+  runButton.id = BUTTON_ID;
+  runButton.type = "button";
+  runButton.className = "ddockit-button";
+  runButton.textContent = "Run with TryThisSoftware";
+  runButton.addEventListener("click", async () => {
     const payload = window.__ddockitRepositoryContext;
     if (!payload?.owner || !payload?.repo) {
       console.warn("TryThisSoftware repository context unavailable on this page.");
@@ -25,7 +26,18 @@ function ensureButton() {
     await chrome.runtime.sendMessage({ type: "DDOCKIT_DETECTED_REPOSITORY", payload });
   });
 
-  toolbar.appendChild(button);
+  const askButton = document.createElement("button");
+  askButton.id = ASK_BUTTON_ID;
+  askButton.type = "button";
+  askButton.className = "ddockit-button";
+  askButton.style.marginLeft = "0.5rem";
+  askButton.textContent = "Ask Repository";
+  askButton.addEventListener("click", async () => {
+    await chrome.runtime.sendMessage({ type: "DDOCKIT_OPEN_SIDEPANEL" });
+  });
+
+  toolbar.appendChild(runButton);
+  toolbar.appendChild(askButton);
 }
 
 if (document.readyState === "loading") {

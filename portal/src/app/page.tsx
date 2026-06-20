@@ -35,6 +35,26 @@ export default function Home() {
         <p>
           Health check: <a href="/api/health">/api/health</a>
         </p>
+        <section
+          style={{
+            marginTop: "1.25rem",
+            borderTop: "1px solid #e2e8f0",
+            paddingTop: "1rem",
+          }}
+        >
+          <h2 style={{ marginBottom: "0.5rem" }}>Repository Intelligence</h2>
+          <p style={{ marginBottom: "0.5rem" }}>
+            Ask Repository: <code>POST /api/repositories/{`{id}`}/ask</code>
+          </p>
+          <p style={{ marginBottom: "0.5rem" }}>Recent Questions: Coming from EIDB knowledge history.</p>
+          <ul style={{ margin: 0, paddingLeft: "1.25rem" }}>
+            <li>Can this repository run?</li>
+            <li>Why did the last build fail?</li>
+            <li>What runtime performs best?</li>
+            <li>How can this be healed?</li>
+            <li>What changed since the last successful run?</li>
+          </ul>
+        </section>
       </section>
     </main>
   );

@@ -13,6 +13,10 @@ use wasmtime::{Config, Engine, Linker, Module, Store};
 
 mod architecture_docs;
 mod postgres_db;
+mod repository_context_builder;
+mod repository_embeddings;
+mod repository_intelligence_service;
+mod repository_knowledge_graph;
 
 pub use architecture_docs::{
     analyze_architecture_from_source, extract_execution_flow_from_source, generate_grounded_docs,
@@ -21,6 +25,17 @@ pub use architecture_docs::{
 pub use postgres_db::{
     deserialize_string_array, infer_repository_from_commits, ExecutionIntelligencePersistenceError,
     ExecutionIntelligencePostgresStore, ExecutionIntelligenceReadStore, PersistenceResult,
+};
+pub use repository_context_builder::{RepositoryContextBuilder, RepositoryQueryContext};
+pub use repository_embeddings::{
+    OpenAiEmbeddingClient, RepositoryEmbedding, RepositoryEmbeddingError, RepositoryEmbeddingPipeline,
+};
+pub use repository_intelligence_service::{
+    RepairKnowledgeProvider, RepairPlan, RepositoryAnswer, RepositoryEvidence, RepositoryIntelligenceService,
+};
+pub use repository_knowledge_graph::{
+    ArchitectureEdge, ArchitectureGraph, ArchitectureNode, RepositoryFailureRecord,
+    RepositoryKnowledgeGraph, RepositoryRuntimeRecord, TemporalRecoveryRecord,
 };
 
 const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
@@ -6844,7 +6859,14 @@ pub fn detect_overlay_repository_context(url: &str) -> Option<OverlayRepositoryC
     })
 }
 
-const OVERLAY_EXTENSION_ACTIONS: &[&str] = &["run", "instant_run", "analyze", "runtime", "commits"];
+const OVERLAY_EXTENSION_ACTIONS: &[&str] = &[
+    "run",
+    "instant_run",
+    "analyze",
+    "runtime",
+    "commits",
+    "ask_repository",
+];
 const SHARED_SURFACE_COMPONENTS: &[&str] = &[
     "Button",
     "Card",
@@ -6969,7 +6991,7 @@ pub fn extension_overlay_ui_endpoint() -> (String, String) {
         json!({
             "id": "overlay_actions",
             "type": "button",
-            "actions": ["run", "instant_run", "analyze"]
+            "actions": ["run", "instant_run", "analyze", "ask_repository"]
         }),
         json!({
             "id": "run_flow",
@@ -7722,6 +7744,33 @@ pub struct EidbCommitExecutionResultRecord {
     pub recorded_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbRepositoryContextSnapshotRecord {
+    pub snapshot_id: String,
+    pub repository_id: String,
+    pub context_payload: Value,
+    pub captured_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EidbRepositoryQuestionRecord {
+    pub question_id: String,
+    pub repository_id: String,
+    pub question: String,
+    pub context_snapshot_id: Option<String>,
+    pub asked_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbRepositoryAnswerRecord {
+    pub answer_id: String,
+    pub question_id: String,
+    pub answer: String,
+    pub confidence: f64,
+    pub outcome: Option<String>,
+    pub created_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IdentityMergeEngine;
 
@@ -7764,6 +7813,9 @@ pub struct ExecutionIntelligenceDatabase {
     pub agents: HashMap<String, EidbAgentRecord>,
     pub journey_results: Vec<EidbJourneyResultRecord>,
     pub commit_execution_results: Vec<EidbCommitExecutionResultRecord>,
+    pub repository_context_snapshots: Vec<EidbRepositoryContextSnapshotRecord>,
+    pub repository_questions: Vec<EidbRepositoryQuestionRecord>,
+    pub repository_answers: Vec<EidbRepositoryAnswerRecord>,
 }
 
 impl ExecutionIntelligenceDatabase {
@@ -7775,6 +7827,7 @@ impl ExecutionIntelligenceDatabase {
             include_str!("../migrations/0004_billing_metering.sql"),
             include_str!("../migrations/0005_anonymous_execution_identity.sql"),
             include_str!("../migrations/0006_repository_identity_and_healing_repairs.sql"),
+            include_str!("../migrations/0007_repository_intelligence_rag.sql"),
         ]
     }
 
@@ -7800,6 +7853,18 @@ impl ExecutionIntelligenceDatabase {
 
     pub fn record_commit_execution_result(&mut self, result: EidbCommitExecutionResultRecord) {
         self.commit_execution_results.push(result);
+    }
+
+    pub fn record_repository_context_snapshot(&mut self, snapshot: EidbRepositoryContextSnapshotRecord) {
+        self.repository_context_snapshots.push(snapshot);
+    }
+
+    pub fn record_repository_question(&mut self, question: EidbRepositoryQuestionRecord) {
+        self.repository_questions.push(question);
+    }
+
+    pub fn record_repository_answer(&mut self, answer: EidbRepositoryAnswerRecord) {
+        self.repository_answers.push(answer);
     }
 
     pub fn last_good_commit_for_repository(&self, repository_id: &str) -> Option<&str> {
@@ -8031,6 +8096,51 @@ pub fn repository_intelligence_endpoint_with_store(
                 "heal": format!("/repositories/{repository_id}/healing"),
                 "adopt": format!("/api/repositories/{repository_id}/adopt")
             }
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_ask_endpoint(
+    repository_id: &str,
+    question: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_ask_endpoint_with_store(repository_id, question, Path::new("."), database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_ask_endpoint_with_store(
+    repository_id: &str,
+    question: &str,
+    repository_root: &Path,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let fingerprint = if let Some(repository) = store.repository(repository_id)? {
+        RepositoryFingerprint {
+            repo_id: repository.repo_id,
+            repo_url: repository.repo_url,
+            ..RepositoryFingerprint::default()
+        }
+    } else {
+        RepositoryFingerprint {
+            repo_id: repository_id.to_string(),
+            ..RepositoryFingerprint::default()
+        }
+    };
+    let knowledge_graph =
+        RepositoryKnowledgeGraph::from_store(repository_id, fingerprint, &ExecutionGraph::default(), store)?;
+    let answer =
+        RepositoryIntelligenceService::default().answer_repository_question(question, &knowledge_graph, repository_root);
+    Ok((
+        format!("/api/repositories/{repository_id}/ask"),
+        json!({
+            "answer": answer.answer,
+            "confidence": answer.confidence,
+            "evidence": answer.evidence,
+            "related_executions": answer.related_executions,
+            "related_failures": answer.related_failures,
+            "related_healings": answer.related_healings
         })
         .to_string(),
     ))
@@ -11601,6 +11711,7 @@ impl Default for RestApiSpec {
             "GET /repositories/{id}/healing",
             "GET /repositories/{id}/last-good",
             "GET /api/repositories/{id}/intelligence",
+            "POST /api/repositories/{id}/ask",
             "GET /billing/usage?org_id={org_id}",
             "GET /billing/summary",
             "POST /billing/invoice",
@@ -15713,6 +15824,7 @@ dependencies:
         assert!(spec
             .routes
             .contains(&"GET /api/repositories/{id}/intelligence"));
+        assert!(spec.routes.contains(&"POST /api/repositories/{id}/ask"));
         assert!(spec.routes.contains(&"GET /billing/usage?org_id={org_id}"));
         assert!(spec.routes.contains(&"GET /billing/summary"));
         assert!(spec.routes.contains(&"POST /billing/invoice"));
@@ -16950,6 +17062,7 @@ services:
         assert_eq!(extension_path, "/api/v1/surfaces/extension/actions");
         assert!(extension_body.contains("\"run\""));
         assert!(extension_body.contains("\"instant_run\""));
+        assert!(extension_body.contains("\"ask_repository\""));
         assert!(extension_body.contains("\"run_entrypoint\":\"/api/v1/executions\""));
         assert!(extension_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/extension/ui\""));
 
@@ -17663,6 +17776,11 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS agents"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS journey_results"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS commit_execution_results"));
+        assert!(schema.contains("CREATE EXTENSION IF NOT EXISTS vector"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_context_snapshots"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_questions"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_answers"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_embeddings"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS audit_logs"));
     }
 
@@ -17809,6 +17927,53 @@ services:
         assert!(body.contains("\"launch\":\"/seed/{owner}/{repo}\""));
         assert!(body.contains("\"heal\":\"/repositories/repo-id/healing\""));
         assert!(body.contains("\"adopt\":\"/api/repositories/repo-id/adopt\""));
+    }
+
+    #[test]
+    fn repository_ask_endpoint_returns_execution_aware_answer_with_evidence() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.repositories.insert(
+            "repo-id".to_string(),
+            EidbRepositoryRecord {
+                repo_id: "repo-id".to_string(),
+                repo_url: "https://github.com/octocat/hello-world".to_string(),
+                default_branch: "main".to_string(),
+                first_seen: 1,
+                last_seen: 2,
+            },
+        );
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-1".to_string(),
+            org_id: None,
+            user_id: None,
+            anon_user_id: Some("anon".to_string()),
+            workspace_id: "ws-1".to_string(),
+            repository_id: "repo-id".to_string(),
+            commit_hash: "aaaaaaa".to_string(),
+            started_at: 1,
+            completed_at: Some(2),
+            status: "failed".to_string(),
+            execution_tier: "WASM".to_string(),
+        });
+        database.record_healing_attempt(EidbHealingAttemptRecord {
+            repository_id: "repo-id".to_string(),
+            execution_id: "exec-1".to_string(),
+            failure_class: "WrongPackageManager".to_string(),
+            repair_strategy: "switch-pnpm".to_string(),
+            success: true,
+            created_at: 3,
+        });
+
+        let (path, body) = repository_ask_endpoint(
+            "repo-id",
+            "Why is this repository failing?",
+            &database,
+        );
+        assert_eq!(path, "/api/repositories/repo-id/ask");
+        assert!(body.contains("\"answer\""));
+        assert!(body.contains("\"evidence\""));
+        assert!(body.contains("\"related_failures\""));
+        assert!(body.contains("\"related_healings\""));
     }
 
     #[test]
