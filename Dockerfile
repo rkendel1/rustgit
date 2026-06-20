@@ -11,10 +11,10 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY . .
-RUN cargo build --release --bin rustgit_wasm_runtime
+RUN cargo build --release --bin wasm-workspace-cli
 
 # We do not need the Rust toolchain to run the binary!
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
-COPY --from=builder /app/target/release/rustgit_wasm_runtime /usr/local/bin
-ENTRYPOINT ["/usr/local/bin/rustgit_wasm_runtime"]
+COPY --from=builder /app/target/release/wasm-workspace-cli /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/wasm-workspace-cli"]
