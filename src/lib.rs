@@ -7559,22 +7559,16 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
     let should_fallback_to_derivation = discovered_execution_spec
         .as_ref()
         .map_or(true, |spec| spec.decision == "repair");
-    let derived_execution_specification = should_fallback_to_derivation.then(|| {
-        preparation::execution_spec_builder::build_execution_spec(
-            analysis,
-            &existing_configuration_files,
-            &ci_files,
-            &environment_graph,
-            &expected_failures,
-        )
-    });
+    let derived_execution_specification = preparation::execution_spec_builder::build_execution_spec(
+        analysis,
+        &existing_configuration_files,
+        &ci_files,
+        &environment_graph,
+        &expected_failures,
+    );
     let execution_specification = if should_fallback_to_derivation {
         serde_json::to_value(
-            derived_execution_specification
-                .as_ref()
-                .expect(
-                    "Expected derived execution specification to exist when fallback is required",
-                ),
+            &derived_execution_specification,
         )
         .expect("Failed to serialize derived execution specification to JSON")
     } else {
@@ -7585,13 +7579,7 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             .clone()
     };
     let portable_execution_toml = if should_fallback_to_derivation {
-        preparation::synthesis_engine::portable_execution_toml(
-            derived_execution_specification
-                .as_ref()
-                .expect(
-                    "Expected derived execution specification to exist when fallback is required",
-                ),
-        )
+        preparation::synthesis_engine::portable_execution_toml(&derived_execution_specification)
     } else {
         discovered_execution_spec
             .as_ref()
@@ -7599,6 +7587,13 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             .portable_execution_toml
             .clone()
     };
+    let deterministic_execution_artifacts =
+        preparation::synthesis_engine::deterministic_execution_artifacts(
+            &derived_execution_specification,
+            &analysis.fingerprint.repo_hash,
+            &analysis.compiled_runtime.component_graph,
+            &analysis.compiled_runtime.environment_id,
+        );
 
     json!({
         "pipeline": [
@@ -7663,7 +7658,14 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
                 })
             }),
         "execution_specification": execution_specification,
-        "portable_execution_toml": portable_execution_toml
+            "portable_execution_toml": portable_execution_toml,
+            "execution_lock": deterministic_execution_artifacts.execution_lock,
+            "runtime_graph_json": deterministic_execution_artifacts.runtime_graph_json,
+            "capabilities_toml": deterministic_execution_artifacts.capabilities_toml,
+            "environment_schema_json": deterministic_execution_artifacts.environment_schema_json,
+            "provenance_json": deterministic_execution_artifacts.provenance_json,
+            "healing_patch": deterministic_execution_artifacts.healing_patch,
+            "execution_fingerprint": deterministic_execution_artifacts.execution_fingerprint
     })
 }
 
@@ -21352,6 +21354,34 @@ services:
             .and_then(Value::as_str)
             .is_some_and(|toml| toml.contains("[runtime]")));
         assert!(preflight
+            .get("execution_lock")
+            .and_then(Value::as_str)
+            .is_some_and(|lock| lock.contains("runtime_hash = \"sha256:")));
+        assert!(preflight
+            .get("runtime_graph_json")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("capabilities_toml")
+            .and_then(Value::as_str)
+            .is_some_and(|caps| caps.contains("[capabilities]")));
+        assert!(preflight
+            .get("environment_schema_json")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("provenance_json")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("healing_patch")
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(preflight
+            .get("execution_fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
+        assert!(preflight
             .get("environment_graph")
             .and_then(Value::as_array)
             .expect("environment graph")
@@ -21441,6 +21471,14 @@ all = ["network"]
             .get("portable_execution_toml")
             .and_then(Value::as_str)
             .is_some_and(|toml| toml.contains("[runtime]")));
+        assert!(preflight
+            .get("execution_lock")
+            .and_then(Value::as_str)
+            .is_some_and(|lock| lock.contains("execution_fingerprint = \"sha256:")));
+        assert!(preflight
+            .get("execution_fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
     }
 
     #[test]
