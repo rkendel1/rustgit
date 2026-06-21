@@ -16,6 +16,9 @@ const PORTAL_NAME = "RustGit Portal";
 const NO_REPOSITORY_SELECTED = "No repository selected";
 const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
+const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
+const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
+const ANALYZE_WORKSPACES_FALLBACK_PATH = "/api/proxy/workspaces";
 
 type RepoContext = {
   owner: string;
@@ -209,14 +212,10 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      const analyzePaths = [
-        "/api/proxy/api/v1/repositories/analyze",
-        "/api/proxy/api/repositories/analyze",
-        "/api/proxy/workspaces",
-      ];
+      const analyzePaths = [ANALYZE_V1_PATH, ANALYZE_LEGACY_PATH, ANALYZE_WORKSPACES_FALLBACK_PATH];
       let analyzeResponse: Response | null = null;
       let analyzePath: string | null = null;
-      let lastFailure = "no response body";
+      let lastFailure = "No endpoints responded successfully";
 
       for (const path of analyzePaths) {
         try {
@@ -238,7 +237,7 @@ export default function Home() {
       }
 
       const analyzed =
-        analyzePath === "/api/proxy/workspaces"
+        analyzePath === ANALYZE_WORKSPACES_FALLBACK_PATH
           ? {
               repo_url:
                 (await readJsonResponse<WorkspaceLaunchResponse>(analyzeResponse)).repo_url ??
