@@ -205,9 +205,9 @@ export default function Home() {
       const analyzeResponse = await (async () => {
         try {
           const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
-          return analyzeV1Response.status === 404
-            ? fetch(analyzeFallbackPath, analyzeRequest)
-            : analyzeV1Response;
+          return analyzeV1Response.ok
+            ? analyzeV1Response
+            : await fetch(analyzeFallbackPath, analyzeRequest);
         } catch (primaryError) {
           try {
             return await fetch(analyzeFallbackPath, analyzeRequest);
