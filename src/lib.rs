@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
@@ -57,6 +57,10 @@ const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
 const WASM_FULL_CPU_LIMIT_UNITS: u32 = 1_000;
 const WASM_PARTIAL_MEMORY_LIMIT_MB: u64 = 256;
 const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
+const RUNTIME_SPEC_DEFAULT_MEMORY_LIMIT_MB: u32 = 768;
+const RUNTIME_SPEC_DEFAULT_CPU_LIMIT_UNITS: u32 = 2_000;
+const UNINITIALIZED_RESOURCE_LIMIT: u32 = 0;
+const ENVIRONMENT_ID_PREFIX_LENGTH: usize = 12;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -2863,8 +2867,8 @@ impl ExecutionRouter {
             WasmCompatibility::NotSupported => WasmRuntimeSpec {
                 enabled: false,
                 wasi: false,
-                memory_limit_mb: 0,
-                cpu_limit_units: 0,
+                memory_limit_mb: u64::from(UNINITIALIZED_RESOURCE_LIMIT),
+                cpu_limit_units: UNINITIALIZED_RESOURCE_LIMIT,
                 allowed_syscalls: vec![],
             },
         }
@@ -3050,6 +3054,62 @@ pub struct BuildIntelligence {
     pub scripts: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilesystemPlan {
+    pub read_only_layers: Vec<String>,
+    pub dependency_cache_layer: String,
+    pub build_cache_layer: String,
+    pub execution_layer: String,
+    pub temporary_layer: String,
+    pub copy_on_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeServicePlan {
+    pub id: String,
+    pub runtime: String,
+    pub framework: Option<String>,
+    pub working_directory: String,
+    pub start_command: String,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRuntimeSpec {
+    pub language: String,
+    pub framework: String,
+    pub package_manager: Option<String>,
+    pub dependencies: Vec<String>,
+    pub filesystem: RuntimeFilesystemPlan,
+    pub network_policy: NetworkPolicy,
+    pub memory_limit_mb: u32,
+    pub cpu_limit_units: u32,
+    pub cache_layers: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub ports: Vec<u16>,
+    pub services: Vec<RuntimeServicePlan>,
+    pub build_steps: Vec<String>,
+    pub execution_steps: Vec<String>,
+    pub health_checks: Vec<String>,
+    pub recovery_steps: Vec<String>,
+    pub requires_wasm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledWasmExecutionEnvironment {
+    pub environment_id: String,
+    pub spec_fingerprint: String,
+    pub warm_pool_key: String,
+    pub deterministic: bool,
+    pub component_graph: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WasmRuntimeCompiler;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionRuntimeSpecCompiler;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryAnalysis {
     pub root: PathBuf,
@@ -3065,6 +3125,8 @@ pub struct RepositoryAnalysis {
     pub execution_graph: ExecutionGraph,
     pub execution_image: ExecutionImage,
     pub image_match_confidence: u8,
+    pub runtime_spec: ExecutionRuntimeSpec,
+    pub compiled_runtime: CompiledWasmExecutionEnvironment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9824,6 +9886,8 @@ pub struct ExecutionContext {
     pub repo_path: String,
     pub analysis: RepositoryAnalysis,
     pub execution_graph: ExecutionGraph,
+    pub runtime_spec: ExecutionRuntimeSpec,
+    pub compiled_runtime: CompiledWasmExecutionEnvironment,
     pub wasm_sandbox: Option<WasmSandbox>,
     pub resources: ResourceQuotas,
     pub network: NetworkPolicy,
@@ -10150,9 +10214,14 @@ impl WasmWorkspace for WorkspaceManager {
                 repo_path: repository_root.to_string_lossy().to_string(),
                 analysis: analysis.clone(),
                 execution_graph: analysis.execution_graph.clone(),
+                runtime_spec: analysis.runtime_spec.clone(),
+                compiled_runtime: analysis.compiled_runtime.clone(),
                 wasm_sandbox: None,
-                resources: workspace.resource_quotas.clone(),
-                network: workspace.network_policy.clone(),
+                resources: ResourceQuotas {
+                    max_memory_mb: analysis.runtime_spec.memory_limit_mb,
+                    max_cpu_millis: analysis.runtime_spec.cpu_limit_units,
+                },
+                network: analysis.runtime_spec.network_policy.clone(),
             };
             logs.push(format!(
                 "planned execution command: {}",
@@ -11770,10 +11839,48 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         execution_graph: ExecutionGraph::default(),
         execution_image: image_match.image.clone(),
         image_match_confidence: image_match.confidence,
+        runtime_spec: ExecutionRuntimeSpec {
+            language: "unknown".to_string(),
+            framework: "unknown".to_string(),
+            package_manager: None,
+            dependencies: vec![],
+            filesystem: RuntimeFilesystemPlan {
+                read_only_layers: vec![],
+                dependency_cache_layer: "dependency-cache".to_string(),
+                build_cache_layer: "build-cache".to_string(),
+                execution_layer: "execution-layer".to_string(),
+                temporary_layer: "temporary-layer".to_string(),
+                copy_on_write: true,
+            },
+            network_policy: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+            memory_limit_mb: UNINITIALIZED_RESOURCE_LIMIT,
+            cpu_limit_units: UNINITIALIZED_RESOURCE_LIMIT,
+            cache_layers: vec![],
+            environment: BTreeMap::new(),
+            ports: vec![],
+            services: vec![],
+            build_steps: vec![],
+            execution_steps: vec![],
+            health_checks: vec![],
+            recovery_steps: vec![],
+            requires_wasm: false,
+        },
+        compiled_runtime: CompiledWasmExecutionEnvironment {
+            environment_id: "runtime-uncompiled".to_string(),
+            spec_fingerprint: "unknown".to_string(),
+            warm_pool_key: "unknown".to_string(),
+            deterministic: true,
+            component_graph: vec![],
+        },
     };
     analysis.execution_graph = BuildPlanner::build_graph(&analysis)
         .with_cache_keys_for(Some(&analysis.fingerprint))
         .with_execution_image(&analysis.execution_image);
+    analysis.runtime_spec = ExecutionRuntimeSpecCompiler::compile(&analysis);
+    analysis.compiled_runtime = WasmRuntimeCompiler::compile(&analysis.runtime_spec);
     {
         let mut warm_pool = WARM_POOL_MANAGER
             .get_or_init(|| Mutex::new(WarmPoolManager::default()))
@@ -12256,6 +12363,252 @@ impl BuildPlanner {
 
         ExecutionGraph { nodes, edges }
     }
+}
+
+impl ExecutionRuntimeSpecCompiler {
+    pub fn compile(analysis: &RepositoryAnalysis) -> ExecutionRuntimeSpec {
+        let dependencies = analysis
+            .dependency_files
+            .iter()
+            .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .collect::<Vec<_>>();
+        let framework_label = format!("{:?}", analysis.framework).to_ascii_lowercase();
+        let language_label = format!("{:?}", analysis.language).to_ascii_lowercase();
+        let mut ports = analysis
+            .topology
+            .as_ref()
+            .map(|topology| {
+                topology
+                    .services
+                    .iter()
+                    .flat_map(|service| service.ports.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                ports_for_framework(analysis.framework)
+                    .into_iter()
+                    .map(|port| port.port)
+                    .collect::<Vec<_>>()
+            });
+        ports.sort_unstable();
+        ports.dedup();
+
+        let services = analysis
+            .topology
+            .as_ref()
+            .map(|topology| {
+                topology
+                    .services
+                    .iter()
+                    .map(|service| RuntimeServicePlan {
+                        id: service.id.clone(),
+                        runtime: runtime_kind_label(service.runtime).to_string(),
+                        framework: Some(framework_label.clone()),
+                        working_directory: service.working_directory.clone(),
+                        start_command: service.start_command.clone(),
+                        ports: service.ports.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![RuntimeServicePlan {
+                    id: "default".to_string(),
+                    runtime: runtime_kind_label(analysis.classification.primary_runtime).to_string(),
+                    framework: Some(framework_label.clone()),
+                    working_directory: ".".to_string(),
+                    start_command: analysis
+                        .execution_graph
+                        .primary_run_command()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    ports: ports.clone(),
+                }]
+            });
+
+        let mut build_steps = Vec::new();
+        let mut execution_steps = Vec::new();
+        let requires_wasm = analysis.execution_graph.nodes.iter().any(|node| {
+            matches!(
+                ExecutionRouter::route(node, &analysis.execution_profile),
+                ExecutionTarget::Wasm(_)
+            )
+        });
+        for node in &analysis.execution_graph.nodes {
+            let Some(command) = node.command.clone() else {
+                continue;
+            };
+            match node.node_type {
+                ExecutionNodeType::InstallDependencies
+                | ExecutionNodeType::Build
+                | ExecutionNodeType::WasmCompile => build_steps.push(command),
+                ExecutionNodeType::DevServer
+                | ExecutionNodeType::Test
+                | ExecutionNodeType::StaticServe
+                | ExecutionNodeType::CustomCommand => execution_steps.push(command),
+            }
+        }
+
+        let mut health_checks = analysis
+            .topology
+            .as_ref()
+            .map(|topology| {
+                topology
+                    .health_policy
+                    .service_checks
+                    .iter()
+                    .flat_map(|(service, checks)| {
+                        checks.iter().map(move |check| match check {
+                            ReadinessCheck::Port(port) => format!("{service}:tcp://{port}"),
+                            ReadinessCheck::Http(path) => format!("{service}:http://{path}"),
+                            ReadinessCheck::Process => format!("{service}:process"),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if health_checks.is_empty() {
+            health_checks.push("/health".to_string());
+        }
+
+        let package_manager = analysis.build_intelligence.package_manager.clone();
+        let network_policy = NetworkPolicy {
+            allow_outbound: package_manager.is_some(),
+            allowed_hosts: allowed_hosts_for_package_manager(package_manager.as_deref()),
+        };
+
+        let mut environment = BTreeMap::new();
+        environment.insert("CI".to_string(), "true".to_string());
+        environment.insert(
+            "RUSTGIT_RUNTIME".to_string(),
+            runtime_kind_label(analysis.classification.primary_runtime).to_string(),
+        );
+        if matches!(analysis.language, Language::JavaScript | Language::TypeScript) {
+            environment.insert("NODE_ENV".to_string(), "production".to_string());
+        }
+        if analysis.language == Language::Python {
+            environment.insert("PYTHONUNBUFFERED".to_string(), "1".to_string());
+        }
+
+        ExecutionRuntimeSpec {
+            language: language_label,
+            framework: framework_label,
+            package_manager,
+            dependencies,
+            filesystem: RuntimeFilesystemPlan {
+                read_only_layers: vec!["repository-snapshot".to_string()],
+                dependency_cache_layer: "dependency-cache".to_string(),
+                build_cache_layer: "build-cache".to_string(),
+                execution_layer: "execution-layer".to_string(),
+                temporary_layer: "temporary-layer".to_string(),
+                copy_on_write: true,
+            },
+            network_policy,
+            memory_limit_mb: RUNTIME_SPEC_DEFAULT_MEMORY_LIMIT_MB,
+            cpu_limit_units: RUNTIME_SPEC_DEFAULT_CPU_LIMIT_UNITS,
+            cache_layers: vec![
+                "repository-snapshot".to_string(),
+                "dependency-cache".to_string(),
+                "build-cache".to_string(),
+                "execution-layer".to_string(),
+                "temporary-layer".to_string(),
+            ],
+            environment,
+            ports,
+            services,
+            build_steps,
+            execution_steps,
+            health_checks,
+            recovery_steps: vec![
+                "retry-with-warm-pool".to_string(),
+                "fallback-provider-escalation".to_string(),
+                "recompile-runtime-spec".to_string(),
+            ],
+            requires_wasm,
+        }
+    }
+}
+
+impl WasmRuntimeCompiler {
+    pub fn compile(spec: &ExecutionRuntimeSpec) -> CompiledWasmExecutionEnvironment {
+        let material = format!(
+            "lang={}|framework={}|pm={}|deps={}|ports={}|build={}|exec={}|cache={}|wasm={}",
+            spec.language,
+            spec.framework,
+            spec.package_manager
+                .as_deref()
+                .unwrap_or(UNKNOWN_SIGNATURE),
+            spec.dependencies.join(","),
+            spec.ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            spec.build_steps.join("||"),
+            spec.execution_steps.join("||"),
+            spec.cache_layers.join("|"),
+            spec.requires_wasm
+        );
+        let spec_fingerprint = hash_key(&material);
+        // hash_key omits leading zeros, so guard the prefix length for shorter hashes.
+        let environment_prefix_len = ENVIRONMENT_ID_PREFIX_LENGTH.min(spec_fingerprint.len());
+        let environment_id = format!("uwef-{}", &spec_fingerprint[..environment_prefix_len]);
+        let warm_pool_key = hash_key(&format!("{}:warm-pool", spec_fingerprint));
+        let mut component_graph = vec![
+            "filesystem".to_string(),
+            "cache".to_string(),
+            "logging".to_string(),
+            "network".to_string(),
+        ];
+        match spec.language.as_str() {
+            "javascript" | "typescript" => {
+                component_graph.push("node-runtime".to_string());
+                component_graph.push("package-manager".to_string());
+            }
+            "python" => {
+                component_graph.push("python-runtime".to_string());
+                component_graph.push("package-manager".to_string());
+            }
+            "rust" => {
+                component_graph.push("rust-runtime".to_string());
+                component_graph.push("cargo".to_string());
+            }
+            _ => {}
+        }
+        if spec.requires_wasm {
+            component_graph.push("wasi".to_string());
+        }
+        component_graph.sort();
+        component_graph.dedup();
+
+        CompiledWasmExecutionEnvironment {
+            environment_id,
+            spec_fingerprint,
+            warm_pool_key,
+            deterministic: true,
+            component_graph,
+        }
+    }
+}
+
+fn allowed_hosts_for_package_manager(package_manager: Option<&str>) -> Vec<String> {
+    let mut hosts = vec!["github.com".to_string()];
+    match package_manager.unwrap_or_default() {
+        "pnpm" | "npm" | "yarn" | "bun" => hosts.push("registry.npmjs.org".to_string()),
+        "cargo" => hosts.push("crates.io".to_string()),
+        "pip" | "pipenv" | "poetry" | "uv" => hosts.push("pypi.org".to_string()),
+        _ => {}
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+fn is_static_web_framework(value: &str) -> bool {
+    let normalized = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized == "staticweb"
 }
 
 pub struct VirtualFileSystem {
@@ -12908,12 +13261,7 @@ impl ExecutionProvider for WasmExecutionProvider {
         if ctx.execution_graph.nodes.is_empty() {
             return false;
         }
-        let has_wasm = ctx.execution_graph.nodes.iter().any(|node| {
-            matches!(
-                ExecutionRouter::route(node, &ctx.analysis.execution_profile),
-                ExecutionTarget::Wasm(_)
-            )
-        });
+        let has_wasm = ctx.runtime_spec.requires_wasm;
         has_wasm
             && ctx.execution_graph.nodes.iter().all(|node| {
                 match ExecutionRouter::route(node, &ctx.analysis.execution_profile) {
@@ -13035,21 +13383,22 @@ impl ExecutionProvider for NodeRuntimeProvider {
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        matches!(
-            ctx.analysis.framework,
-            Framework::Node
-                | Framework::Vite
-                | Framework::React
-                | Framework::Vue
-                | Framework::Svelte
-                | Framework::SvelteKit
-                | Framework::NextJs
-                | Framework::Nuxt
-                | Framework::Astro
-                | Framework::Remix
-                | Framework::Express
-                | Framework::NestJs
-        )
+        matches!(ctx.runtime_spec.language.as_str(), "javascript" | "typescript")
+            || matches!(
+                ctx.analysis.framework,
+                Framework::Node
+                    | Framework::Vite
+                    | Framework::React
+                    | Framework::Vue
+                    | Framework::Svelte
+                    | Framework::SvelteKit
+                    | Framework::NextJs
+                    | Framework::Nuxt
+                    | Framework::Astro
+                    | Framework::Remix
+                    | Framework::Express
+                    | Framework::NestJs
+            )
     }
 
     fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
@@ -13176,14 +13525,15 @@ impl ExecutionProvider for RustRuntimeProvider {
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        matches!(
-            ctx.analysis.framework,
-            Framework::Rust
-                | Framework::Axum
-                | Framework::Actix
-                | Framework::Rocket
-                | Framework::Leptos
-        )
+        ctx.runtime_spec.language == "rust"
+            || matches!(
+                ctx.analysis.framework,
+                Framework::Rust
+                    | Framework::Axum
+                    | Framework::Actix
+                    | Framework::Rocket
+                    | Framework::Leptos
+            )
     }
 
     fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
@@ -13223,7 +13573,8 @@ impl ExecutionProvider for StaticRuntimeProvider {
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        ctx.analysis.framework == Framework::StaticWeb
+        is_static_web_framework(&ctx.runtime_spec.framework)
+            || ctx.analysis.framework == Framework::StaticWeb
     }
 
     fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
@@ -14844,6 +15195,65 @@ mod tests {
             wasm_compatibility: compatibility,
         };
         let image_match = ExecutionMatchEngine::match_repository(&fingerprint);
+        let analysis_seed = RepositoryAnalysis {
+            root: PathBuf::from("/tmp/repo"),
+            framework,
+            language: Language::Unknown,
+            execution_spec: None,
+            dependency_files: vec![],
+            topology: None,
+            fingerprint: fingerprint.clone(),
+            classification: classification.clone(),
+            execution_profile: execution_profile.clone(),
+            build_intelligence: BuildIntelligence {
+                framework,
+                package_manager: None,
+                build_tooling: vec![],
+                entrypoints: vec![],
+                scripts: HashMap::new(),
+            },
+            execution_graph: graph.clone(),
+            execution_image: image_match.image.clone(),
+            image_match_confidence: image_match.confidence,
+            runtime_spec: ExecutionRuntimeSpec {
+                language: "unknown".to_string(),
+                framework: "unknown".to_string(),
+                package_manager: None,
+                dependencies: vec![],
+                filesystem: RuntimeFilesystemPlan {
+                    read_only_layers: vec![],
+                    dependency_cache_layer: "dependency-cache".to_string(),
+                    build_cache_layer: "build-cache".to_string(),
+                    execution_layer: "execution-layer".to_string(),
+                    temporary_layer: "temporary-layer".to_string(),
+                    copy_on_write: true,
+                },
+                network_policy: NetworkPolicy {
+                    allow_outbound: false,
+                    allowed_hosts: vec![],
+                },
+                memory_limit_mb: 0,
+                cpu_limit_units: 0,
+                cache_layers: vec![],
+                environment: BTreeMap::new(),
+                ports: vec![],
+                services: vec![],
+                build_steps: vec![],
+                execution_steps: vec![],
+                health_checks: vec![],
+                recovery_steps: vec![],
+                requires_wasm: false,
+            },
+            compiled_runtime: CompiledWasmExecutionEnvironment {
+                environment_id: "runtime-uncompiled".to_string(),
+                spec_fingerprint: "unknown".to_string(),
+                warm_pool_key: "unknown".to_string(),
+                deterministic: true,
+                component_graph: vec![],
+            },
+        };
+        let runtime_spec = ExecutionRuntimeSpecCompiler::compile(&analysis_seed);
+        let compiled_runtime = WasmRuntimeCompiler::compile(&runtime_spec);
         RepositoryAnalysis {
             root: PathBuf::from("/tmp/repo"),
             framework,
@@ -14864,6 +15274,8 @@ mod tests {
             execution_graph: graph,
             execution_image: image_match.image,
             image_match_confidence: image_match.confidence,
+            runtime_spec,
+            compiled_runtime,
         }
     }
 
@@ -15159,6 +15571,35 @@ dependencies:
         assert!(graph.nodes.iter().any(|node| {
             node.id == "frontend-run" && node.command.as_deref() == Some("pnpm start")
         }));
+    }
+
+    #[test]
+    fn analyze_repository_compiles_uwef_runtime_spec() {
+        let repo = temp_dir("uwef-runtime-spec");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0"},"scripts":{"build":"next build","dev":"next dev"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+            .expect("write pnpm lock");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.runtime_spec.framework, "nextjs");
+        assert_eq!(
+            analysis.runtime_spec.package_manager.as_deref(),
+            Some("pnpm")
+        );
+        assert!(analysis.runtime_spec.filesystem.copy_on_write);
+        assert!(analysis
+            .runtime_spec
+            .cache_layers
+            .contains(&"dependency-cache".to_string()));
+        assert!(analysis.compiled_runtime.environment_id.starts_with("uwef-"));
+        assert!(analysis
+            .compiled_runtime
+            .component_graph
+            .contains(&"node-runtime".to_string()));
     }
 
     #[test]
@@ -16338,10 +16779,13 @@ dependencies:
             edges: vec![],
         }
         .with_cache_keys();
+        let analysis = test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb);
         let ctx = ExecutionContext {
             workspace_id: "ws-router-preferred".to_string(),
             repo_path: "/tmp/repo".to_string(),
-            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            runtime_spec: analysis.runtime_spec.clone(),
+            compiled_runtime: analysis.compiled_runtime.clone(),
+            analysis,
             execution_graph: graph,
             wasm_sandbox: None,
             resources: ResourceQuotas {
@@ -16398,9 +16842,13 @@ dependencies:
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
         };
 
+        let runtime_spec = analysis.runtime_spec.clone();
+        let compiled_runtime = analysis.compiled_runtime.clone();
         let mut ctx = ExecutionContext {
             workspace_id: "ws-router-fallback".to_string(),
             repo_path: "/tmp/repo".to_string(),
+            runtime_spec,
+            compiled_runtime,
             analysis,
             execution_graph: graph,
             wasm_sandbox: None,
@@ -16459,9 +16907,13 @@ dependencies:
             preferred_provider: "NodeRuntimeProvider".to_string(),
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
         };
+        let runtime_spec = analysis.runtime_spec.clone();
+        let compiled_runtime = analysis.compiled_runtime.clone();
         let ctx = ExecutionContext {
             workspace_id: "ws-escalation-trace".to_string(),
             repo_path: "/tmp/repo".to_string(),
+            runtime_spec,
+            compiled_runtime,
             analysis,
             execution_graph: graph,
             wasm_sandbox: None,
@@ -16493,6 +16945,56 @@ dependencies:
                 && step.provider_id.as_deref() == Some("RustRuntimeProvider")
                 && step.result == "selected"
         }));
+    }
+
+    #[test]
+    fn execution_router_uses_generated_runtime_spec_for_provider_matching() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+                runtime: None,
+                cache_binding: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let mut analysis =
+            test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Unknown);
+        analysis.runtime_spec.language = "rust".to_string();
+        analysis.runtime_spec.framework = "unknown".to_string();
+        analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+            preferred_provider: "RustRuntimeProvider".to_string(),
+            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+        };
+        let runtime_spec = analysis.runtime_spec.clone();
+        let compiled_runtime = analysis.compiled_runtime.clone();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-runtime-spec-routing".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            runtime_spec,
+            compiled_runtime,
+            analysis,
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+        let router =
+            ExecutionRouter::new(vec![Box::new(NodeRuntimeProvider), Box::new(RustRuntimeProvider)]);
+        let selection = router.select(&ctx).expect("select provider");
+        assert_eq!(selection.provider_id, "RustRuntimeProvider");
     }
 
     #[test]
@@ -16565,10 +17067,13 @@ dependencies:
             edges: vec![],
         }
         .with_cache_keys();
+        let analysis = test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb);
         let ctx = ExecutionContext {
             workspace_id: "ws-1".to_string(),
             repo_path: "/tmp/repo".to_string(),
-            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            runtime_spec: analysis.runtime_spec.clone(),
+            compiled_runtime: analysis.compiled_runtime.clone(),
+            analysis,
             execution_graph: graph,
             wasm_sandbox: None,
             resources: ResourceQuotas {
@@ -16613,10 +17118,13 @@ dependencies:
             edges: vec![],
         }
         .with_cache_keys();
+        let analysis = test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb);
         let ctx = ExecutionContext {
             workspace_id: "ws-1".to_string(),
             repo_path: repo_root.to_string_lossy().to_string(),
-            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            runtime_spec: analysis.runtime_spec.clone(),
+            compiled_runtime: analysis.compiled_runtime.clone(),
+            analysis,
             execution_graph: graph,
             wasm_sandbox: None,
             resources: ResourceQuotas {
@@ -16673,10 +17181,13 @@ dependencies:
             }],
         }
         .with_cache_keys();
+        let analysis = test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb);
         let ctx = ExecutionContext {
             workspace_id: "ws-1".to_string(),
             repo_path: repo_root.to_string_lossy().to_string(),
-            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            runtime_spec: analysis.runtime_spec.clone(),
+            compiled_runtime: analysis.compiled_runtime.clone(),
+            analysis,
             execution_graph: graph,
             wasm_sandbox: None,
             resources: ResourceQuotas {
@@ -16716,10 +17227,13 @@ dependencies:
             edges: vec![],
         }
         .with_cache_keys();
+        let analysis = test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb);
         let ctx = ExecutionContext {
             workspace_id: "ws-1".to_string(),
             repo_path: repo_root.to_string_lossy().to_string(),
-            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            runtime_spec: analysis.runtime_spec.clone(),
+            compiled_runtime: analysis.compiled_runtime.clone(),
+            analysis,
             execution_graph: graph,
             wasm_sandbox: None,
             resources: ResourceQuotas {
@@ -17428,9 +17942,13 @@ dependencies:
             preferred_provider: "LocalAgentProvider".to_string(),
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
         };
+        let runtime_spec = analysis.runtime_spec.clone();
+        let compiled_runtime = analysis.compiled_runtime.clone();
         let ctx = ExecutionContext {
             workspace_id: "ws-local-agent-failover".to_string(),
             repo_path: "/tmp/repo".to_string(),
+            runtime_spec,
+            compiled_runtime,
             analysis,
             execution_graph: graph,
             wasm_sandbox: None,
