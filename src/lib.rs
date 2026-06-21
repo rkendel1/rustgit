@@ -62,6 +62,9 @@ const RUNTIME_SPEC_DEFAULT_CPU_LIMIT_UNITS: u32 = 2_000;
 const UNINITIALIZED_RESOURCE_LIMIT: u32 = 0;
 const ENVIRONMENT_ID_PREFIX_LENGTH: usize = 12;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
+const DEFAULT_COMPONENT_VERSION: &str = "1.0.0";
+const RUNTIME_CONSTRAINT_MAX_MEMORY_MB: u32 = 16 * 1024;
+const RUNTIME_CONSTRAINT_MAX_CPU_UNITS: u32 = 100_000;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
@@ -3588,6 +3591,229 @@ impl WasiLinker {
         graph.imports.dedup();
         graph.exports.sort();
         graph.exports.dedup();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComponentRegistry {
+    pub store: BTreeMap<String, WasiComponent>,
+    pub versioning: BTreeMap<String, String>,
+    pub signatures: BTreeMap<String, String>,
+}
+
+impl ComponentRegistry {
+    pub fn register(&mut self, component: WasiComponent) {
+        self.versioning
+            .entry(component.id.clone())
+            .or_insert_with(|| DEFAULT_COMPONENT_VERSION.to_string());
+        self.signatures
+            .entry(component.id.clone())
+            .or_insert_with(|| hash_key(&component.module));
+        self.store.insert(component.id.clone(), component);
+    }
+
+    fn register_all(&mut self, components: &[WasiComponent]) {
+        for component in components {
+            self.register(component.clone());
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompiledComponentCache {
+    entries: BTreeMap<String, WasiComponentGraph>,
+}
+
+impl CompiledComponentCache {
+    fn get(&self, key: &str) -> Option<WasiComponentGraph> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, graph: WasiComponentGraph) {
+        self.entries.insert(key, graph);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InterfaceResolver;
+
+impl InterfaceResolver {
+    pub fn resolve(&self, imports: &[String], exports: &[String]) -> Vec<WasiLink> {
+        let mut provider_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut base_provider_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for export in exports {
+            if let Some((component, capability)) = parse_link_entry("export:", export.as_str()) {
+                provider_map
+                    .entry(capability.to_string())
+                    .or_default()
+                    .insert(component.to_string());
+                base_provider_map
+                    .entry(interface_identity(capability))
+                    .or_default()
+                    .insert(component.to_string());
+            }
+        }
+
+        imports
+            .iter()
+            .filter_map(|import| {
+                let (import_component, import_capability) =
+                    parse_link_entry("import:", import.as_str())?;
+                let exact_provider = provider_map
+                    .get(import_capability)
+                    .and_then(|providers| providers.iter().next().cloned());
+                let compatibility_provider = exact_provider.or_else(|| {
+                    base_provider_map
+                        .get(&interface_identity(import_capability))
+                        .and_then(|providers| providers.iter().next().cloned())
+                })?;
+                Some(WasiLink {
+                    from_component: compatibility_provider,
+                    to_component: import_component.to_string(),
+                    capability: import_capability.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CapabilityValidator;
+
+impl CapabilityValidator {
+    pub fn validate(&self, graph: &WasiComponentGraph) -> bool {
+        if !WasiLinker::validate(&graph.capabilities, graph) {
+            return false;
+        }
+        if graph.runtime_constraints.max_memory_mb == 0 || graph.runtime_constraints.max_cpu_units == 0
+        {
+            return false;
+        }
+        if graph.runtime_constraints.max_memory_mb > RUNTIME_CONSTRAINT_MAX_MEMORY_MB
+            || graph.runtime_constraints.max_cpu_units > RUNTIME_CONSTRAINT_MAX_CPU_UNITS
+        {
+            return false;
+        }
+        let component_ids = graph
+            .components
+            .iter()
+            .map(|component| component.id.as_str())
+            .collect::<HashSet<_>>();
+        graph.links.iter().all(|link| {
+            component_ids.contains(link.from_component.as_str())
+                && component_ids.contains(link.to_component.as_str())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionGraphBuilder;
+
+impl ExecutionGraphBuilder {
+    pub fn build(
+        &self,
+        components: Vec<WasiComponent>,
+        links: Vec<WasiLink>,
+        capabilities: CapabilitySet,
+        imports: Vec<String>,
+        exports: Vec<String>,
+        runtime_constraints: RuntimeConstraints,
+    ) -> WasiComponentGraph {
+        let mut execution_plan = ExecutionPlan::default();
+        execution_plan.startup_order = component_startup_order(&components, &links);
+        execution_plan.ordered_nodes = execution_plan.startup_order.clone();
+        WasiComponentGraph {
+            components,
+            links,
+            capabilities,
+            imports,
+            exports,
+            runtime_constraints,
+            execution_plan,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasiComponentLoader {
+    pub registry: ComponentRegistry,
+    pub cache: CompiledComponentCache,
+    pub linker: WasiLinker,
+    pub resolver: InterfaceResolver,
+    pub validator: CapabilityValidator,
+    pub graph_builder: ExecutionGraphBuilder,
+}
+
+impl WasiComponentLoader {
+    fn compute_cache_key(components: &[WasiComponent], imports: &[String], exports: &[String]) -> String {
+        hash_key(&format!(
+            "{}:{}",
+            hash_key(
+                &components
+                    .iter()
+                    .map(|component| format!("{}:{}", component.id, component.module))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
+            hash_key(&format!("{}:{}", imports.join("|"), exports.join("|")))
+        ))
+    }
+
+    pub fn load_graph(
+        &mut self,
+        components: Vec<WasiComponent>,
+        capabilities: CapabilitySet,
+        runtime_constraints: RuntimeConstraints,
+    ) -> WasiComponentGraph {
+        self.registry.register_all(&components);
+        let imports = components
+            .iter()
+            .flat_map(|component| {
+                component
+                    .imports
+                    .iter()
+                    .map(move |import| format!("import:{}:{import}", component.id))
+            })
+            .collect::<Vec<_>>();
+        let exports = components
+            .iter()
+            .flat_map(|component| {
+                component
+                    .exports
+                    .iter()
+                    .map(move |export| format!("export:{}:{export}", component.id))
+            })
+            .collect::<Vec<_>>();
+        let cache_key = Self::compute_cache_key(&components, &imports, &exports);
+        if let Some(cached) = self.cache.get(cache_key.as_str()) {
+            return cached;
+        }
+
+        let links = self.resolver.resolve(&imports, &exports);
+        let mut graph = self.graph_builder.build(
+            components,
+            links,
+            capabilities,
+            imports,
+            exports,
+            runtime_constraints,
+        );
+        WasiLinker::optimize_graph(&mut graph);
+        WasiLinker::enforce_security_model(&mut graph);
+        if !self.validator.validate(&graph) {
+            // Keep loader output deterministic even when validation fails by
+            // returning a graph with explicit startup order and no bindings.
+            graph.links.clear();
+            graph.execution_plan = ExecutionPlan::default();
+            graph.execution_plan.startup_order = graph
+                .components
+                .iter()
+                .map(|component| component.id.clone())
+                .collect::<Vec<_>>();
+            graph.execution_plan.ordered_nodes = graph.execution_plan.startup_order.clone();
+        }
+        self.cache.insert(cache_key, graph.clone());
+        graph
     }
 }
 
@@ -13610,47 +13836,15 @@ impl WasmRuntimeCompiler {
             });
         }
 
-        let imports = components
-            .iter()
-            .flat_map(|component| {
-                component
-                    .imports
-                    .iter()
-                    .map(move |import| format!("import:{}:{import}", component.id))
-            })
-            .collect::<Vec<_>>();
-        let exports = components
-            .iter()
-            .flat_map(|component| {
-                component
-                    .exports
-                    .iter()
-                    .map(move |export| format!("export:{}:{export}", component.id))
-            })
-            .collect::<Vec<_>>();
-        let links = WasiLinker::resolve(&imports, &exports);
-
-        let mut execution_plan = ExecutionPlan::default();
-        execution_plan.startup_order = component_startup_order(&components, &links);
-        execution_plan.ordered_nodes = execution_plan.startup_order.clone();
-
-        let mut wasi_component_graph = WasiComponentGraph {
-            components,
-            links,
-            capabilities,
-            imports,
-            exports,
-            runtime_constraints: RuntimeConstraints {
-                read_only_paths: vec!["/workspace".to_string()],
-                network_allowlist: spec.network_policy.allowed_hosts.clone(),
-                max_memory_mb: spec.memory_limit_mb,
-                max_cpu_units: spec.cpu_limit_units,
-                process_spawn_bounded: true,
-            },
-            execution_plan,
+        let mut loader = WasiComponentLoader::default();
+        let runtime_constraints = RuntimeConstraints {
+            read_only_paths: vec!["/workspace".to_string()],
+            network_allowlist: spec.network_policy.allowed_hosts.clone(),
+            max_memory_mb: spec.memory_limit_mb,
+            max_cpu_units: spec.cpu_limit_units,
+            process_spawn_bounded: true,
         };
-        WasiLinker::optimize_graph(&mut wasi_component_graph);
-        WasiLinker::enforce_security_model(&mut wasi_component_graph);
+        let wasi_component_graph = loader.load_graph(components, capabilities, runtime_constraints);
 
         CompiledWasmExecutionEnvironment {
             environment_id,
@@ -13668,6 +13862,13 @@ fn parse_link_entry<'a>(prefix: &str, value: &'a str) -> Option<(&'a str, &'a st
         .strip_prefix(prefix)
         .and_then(|entry| entry.split_once(':'))
         .filter(|(component, capability)| !component.is_empty() && !capability.is_empty())
+}
+
+fn interface_identity(capability: &str) -> String {
+    capability.split_once('@').map_or_else(
+        || capability.to_string(),
+        |(interface_name, _)| interface_name.to_string(),
+    )
 }
 
 fn package_manager_component_imports(package_manager: &str) -> Vec<String> {
@@ -16835,6 +17036,67 @@ dependencies:
         );
         assert!(WasiLinker::validate(&graph.capabilities, &graph));
         assert!(!graph.links.is_empty());
+    }
+
+    #[test]
+    fn interface_resolver_handles_version_compatible_interfaces() {
+        let resolver = InterfaceResolver;
+        let links = resolver.resolve(
+            &[String::from("import:nextjs:filesystem.read@v2")],
+            &[String::from("export:filesystem:filesystem.read@v1")],
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].from_component, "filesystem");
+        assert_eq!(links[0].to_component, "nextjs");
+        assert_eq!(links[0].capability, "filesystem.read@v2");
+    }
+
+    #[test]
+    fn wasi_component_loader_builds_and_caches_linked_graphs() {
+        let mut loader = WasiComponentLoader::default();
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert("filesystem.read");
+        let components = vec![
+            WasiComponent {
+                id: "filesystem".to_string(),
+                module: "filesystem.wasm".to_string(),
+                imports: vec![],
+                exports: vec!["filesystem.read".to_string()],
+                capabilities: vec!["filesystem.read".to_string()],
+            },
+            WasiComponent {
+                id: "consumer".to_string(),
+                module: "consumer.wasm".to_string(),
+                imports: vec!["filesystem.read".to_string()],
+                exports: vec![],
+                capabilities: vec![],
+            },
+        ];
+        let runtime_constraints = RuntimeConstraints {
+            read_only_paths: vec!["/workspace".to_string()],
+            network_allowlist: vec![],
+            max_memory_mb: 64,
+            max_cpu_units: 1_000,
+            process_spawn_bounded: true,
+        };
+
+        let first = loader.load_graph(
+            components.clone(),
+            capabilities.clone(),
+            runtime_constraints.clone(),
+        );
+        let second = loader.load_graph(components, capabilities, runtime_constraints);
+
+        assert_eq!(first.links.len(), 1);
+        assert_eq!(first.links[0].from_component, "filesystem");
+        assert_eq!(first.links[0].to_component, "consumer");
+        assert_eq!(
+            first.execution_plan.startup_order,
+            vec!["filesystem".to_string(), "consumer".to_string()]
+        );
+        assert_eq!(first, second);
+        assert_eq!(loader.cache.entries.len(), 1);
     }
 
     #[test]
