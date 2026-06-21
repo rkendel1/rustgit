@@ -1,12 +1,15 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import styles from "./page.module.css";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL ??
   (process.env.NODE_ENV === "development"
     ? "http://localhost:8080"
     : "https://api.trythissoftware.com");
+
+const DEFAULT_ASK_QUESTION = "Summarize what this repository does and the best way to run it.";
 
 type RepoContext = {
   owner: string;
@@ -26,6 +29,27 @@ type RunResponse = {
   workspace_id?: string;
   workspace_url?: string;
   status?: string;
+};
+
+type RepositoryIdentity = {
+  health_score?: number;
+  execution_score?: number;
+  healing_score?: number;
+};
+
+type RepositoryIntelligenceResponse = {
+  repository_id?: string;
+  health_score?: number;
+  execution_score?: number;
+  healing_score?: number;
+  runtime?: string;
+  repository_identity?: RepositoryIdentity | null;
+};
+
+type RepositoryAskResponse = {
+  answer?: string;
+  confidence?: number;
+  evidence?: string[];
 };
 
 function createAnonymousId(prefix: string): string {
@@ -89,6 +113,14 @@ function parseRepositoryInput(input: string): RepoContext | null {
   };
 }
 
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Request failed (${response.status}): ${text || "no response body"}`);
+  }
+  return JSON.parse(text) as T;
+}
+
 export default function Home() {
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
@@ -97,9 +129,12 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [analyzeResult, setAnalyzeResult] = useState<AnalyzeResponse | null>(null);
   const [analyzedRepoUrl, setAnalyzedRepoUrl] = useState<string | null>(null);
+  const [intelligence, setIntelligence] = useState<RepositoryIntelligenceResponse | null>(null);
+  const [repoAnswer, setRepoAnswer] = useState<RepositoryAskResponse | null>(null);
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
 
   const parsedRepo = useMemo(() => parseRepositoryInput(repository), [repository]);
+  const canAnalyze = Boolean(parsedRepo) && !analyzing;
   const canRun =
     !running &&
     Boolean(parsedRepo) &&
@@ -108,34 +143,71 @@ export default function Home() {
 
   async function handleAnalyze() {
     if (!parsedRepo) {
-      setError("Enter a GitHub repository as owner/repo or full URL.");
+      setError("Paste a GitHub repository URL or owner/repo.");
       return;
     }
 
     setError(null);
-    setRunResult(null);
     setAnalyzing(true);
+    setAnalyzeResult(null);
+    setAnalyzedRepoUrl(null);
+    setIntelligence(null);
+    setRepoAnswer(null);
+    setRunResult(null);
+
     try {
-      const response = await fetch("/api/proxy/api/v1/repositories/analyze", {
+      const analyzeResponse = await fetch("/api/proxy/api/v1/repositories/analyze", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       });
+      const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
+      setAnalyzeResult(analyzed);
+      setAnalyzedRepoUrl(parsedRepo.repoUrl);
 
-      const responseText = await response.text();
-      if (!response.ok) {
-        throw new Error(
-          `Analyze failed (${response.status}): ${responseText || "no response body"}`,
+      if (!analyzed.fingerprint_id) {
+        return;
+      }
+
+      try {
+        const intelligenceResponse = await fetch(
+          `/api/proxy/api/repositories/${encodeURIComponent(analyzed.fingerprint_id)}/intelligence`,
+          {
+            method: "GET",
+            cache: "no-store",
+          },
+        );
+        const intelligenceBody = await readJsonResponse<RepositoryIntelligenceResponse>(
+          intelligenceResponse,
+        );
+        setIntelligence(intelligenceBody);
+
+        const askResponse = await fetch(
+          `/api/proxy/api/repositories/${encodeURIComponent(analyzed.fingerprint_id)}/ask`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ question: DEFAULT_ASK_QUESTION }),
+          },
+        );
+        const askBody = await readJsonResponse<RepositoryAskResponse>(askResponse);
+        setRepoAnswer(askBody);
+      } catch (caught) {
+        setError(
+          caught instanceof Error
+            ? `Repository analysis completed, but extended intelligence failed: ${caught.message}`
+            : "Repository analysis completed, but extended intelligence failed.",
         );
       }
-      const body = JSON.parse(responseText) as AnalyzeResponse;
-      setAnalyzeResult(body);
-      setAnalyzedRepoUrl(parsedRepo.repoUrl);
     } catch (caught) {
       setAnalyzeResult(null);
       setAnalyzedRepoUrl(null);
+      setIntelligence(null);
+      setRepoAnswer(null);
       setError(caught instanceof Error ? caught.message : "Analyze request failed.");
     } finally {
       setAnalyzing(false);
@@ -144,7 +216,7 @@ export default function Home() {
 
   async function handleRun() {
     if (!parsedRepo) {
-      setError("Enter a GitHub repository first.");
+      setError("Paste a GitHub repository first.");
       return;
     }
 
@@ -168,11 +240,7 @@ export default function Home() {
         }),
       });
 
-      const responseText = await response.text();
-      if (!response.ok) {
-        throw new Error(`Run failed (${response.status}): ${responseText || "no response body"}`);
-      }
-      const body = JSON.parse(responseText) as RunResponse;
+      const body = await readJsonResponse<RunResponse>(response);
       setRunResult(body);
     } catch (caught) {
       setRunResult(null);
@@ -182,54 +250,47 @@ export default function Home() {
     }
   }
 
+  const healthScore = intelligence?.repository_identity?.health_score ?? intelligence?.health_score;
+  const executionScore =
+    intelligence?.repository_identity?.execution_score ?? intelligence?.execution_score;
+  const healingScore = intelligence?.repository_identity?.healing_score ?? intelligence?.healing_score;
+
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        display: "grid",
-        placeItems: "center",
-        padding: "2rem 1rem",
-      }}
-    >
-      <section
-        style={{
-          width: "100%",
-          maxWidth: "42rem",
-          border: "1px solid #dbeafe",
-          borderRadius: "0.75rem",
-          padding: "1.5rem",
-          background: "#ffffff",
-          color: "#0f172a",
-        }}
-      >
-        <h1 style={{ marginBottom: "0.75rem" }}>TryThisSoftware Portal</h1>
-        <p style={{ marginBottom: "0.75rem" }}>
-          Add a repository, analyze it, then run it.
+    <main className={styles.page}>
+      <section className={styles.hero}>
+        <h1>Paste a GitHub repo. Get intelligence. Run it.</h1>
+        <p>
+          Start with a GitHub link, get an instant readout of frameworks/services and a run summary,
+          then launch execution.
+        </p>
+      </section>
+
+      <section className={styles.panel}>
+        <h2>1) Repository input</h2>
+        <label htmlFor="repo" className={styles.label}>
+          GitHub repository URL
+        </label>
+        <input
+          id="repo"
+          value={repository}
+          onChange={(event) => {
+            setRepository(event.target.value);
+            setAnalyzeResult(null);
+            setAnalyzedRepoUrl(null);
+            setIntelligence(null);
+            setRepoAnswer(null);
+            setRunResult(null);
+            setError(null);
+          }}
+          placeholder="https://github.com/owner/repo"
+          className={styles.input}
+        />
+        <p className={styles.hint}>
+          You can also use <code>owner/repo</code>.
         </p>
 
-        <section style={{ display: "grid", gap: "0.75rem" }}>
-          <label htmlFor="repo" style={{ fontWeight: 600 }}>
-            Repository
-          </label>
-          <input
-            id="repo"
-            value={repository}
-            onChange={(event) => {
-              setRepository(event.target.value);
-              setAnalyzeResult(null);
-              setAnalyzedRepoUrl(null);
-              setRunResult(null);
-              setError(null);
-            }}
-            placeholder="owner/repo or https://github.com/owner/repo"
-            style={{
-              border: "1px solid #cbd5e1",
-              borderRadius: "0.5rem",
-              padding: "0.6rem 0.75rem",
-            }}
-          />
-
-          <label htmlFor="branch" style={{ fontWeight: 600 }}>
+        <div className={styles.branchRow}>
+          <label htmlFor="branch" className={styles.label}>
             Branch
           </label>
           <input
@@ -237,116 +298,113 @@ export default function Home() {
             value={branch}
             onChange={(event) => setBranch(event.target.value)}
             placeholder="main"
-            style={{
-              border: "1px solid #cbd5e1",
-              borderRadius: "0.5rem",
-              padding: "0.6rem 0.75rem",
-            }}
+            className={styles.input}
           />
+        </div>
 
-          <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={handleAnalyze}
-              disabled={analyzing}
-              style={{
-                background: "#1d4ed8",
-                color: "#ffffff",
-                border: 0,
-                borderRadius: "0.5rem",
-                padding: "0.6rem 0.9rem",
-                cursor: analyzing ? "wait" : "pointer",
-              }}
-            >
-              {analyzing ? "Analyzing..." : "1) Analyze"}
-            </button>
-            <button
-              type="button"
-              onClick={handleRun}
-              disabled={!canRun}
-              style={{
-                background: "#0f766e",
-                color: "#ffffff",
-                border: 0,
-                borderRadius: "0.5rem",
-                padding: "0.6rem 0.9rem",
-                cursor: canRun ? "pointer" : "not-allowed",
-              }}
-            >
-              {running ? "Running..." : "2) Run"}
-            </button>
+        <div className={styles.actions}>
+          <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.primaryButton}>
+            {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
+          </button>
+          <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
+            {running ? "Starting run..." : "Run repository"}
+          </button>
+        </div>
+      </section>
+
+      {error ? (
+        <section className={styles.errorPanel} role="alert">
+          {error}
+        </section>
+      ) : null}
+
+      {analyzeResult ? (
+        <section className={styles.panel}>
+          <h2>2) Intelligence</h2>
+          <div className={styles.grid}>
+            <div className={styles.tile}>
+              <strong>Repository</strong>
+              <code>{analyzeResult.repo_url ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Fingerprint</strong>
+              <code>{analyzeResult.fingerprint_id ?? "pending"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Frameworks</strong>
+              <span>{(analyzeResult.frameworks ?? []).join(", ") || "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Services</strong>
+              <span>{(analyzeResult.services ?? []).join(", ") || "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Health score</strong>
+              <span>{typeof healthScore === "number" ? healthScore.toFixed(1) : "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Execution score</strong>
+              <span>{typeof executionScore === "number" ? executionScore.toFixed(1) : "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Healing score</strong>
+              <span>{typeof healingScore === "number" ? healingScore.toFixed(1) : "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Runtime</strong>
+              <span>{intelligence?.runtime ?? "n/a"}</span>
+            </div>
+          </div>
+
+          {repoAnswer?.answer ? (
+            <div className={styles.answerBox}>
+              <h3>Repo summary</h3>
+              <p>{repoAnswer.answer}</p>
+              <p className={styles.hint}>
+                Confidence: {typeof repoAnswer.confidence === "number" ? repoAnswer.confidence.toFixed(2) : "n/a"}
+              </p>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+
+      {runResult ? (
+        <section className={styles.panel}>
+          <h2>3) Run status</h2>
+          <div className={styles.grid}>
+            <div className={styles.tile}>
+              <strong>Execution ID</strong>
+              <code>{runResult.execution_id ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Workspace ID</strong>
+              <code>{runResult.workspace_id ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Status</strong>
+              <span>{runResult.status ?? "starting"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Workspace URL</strong>
+              {runResult.workspace_url ? (
+                <a href={runResult.workspace_url} target="_blank" rel="noreferrer">
+                  Open workspace
+                </a>
+              ) : (
+                <span>pending</span>
+              )}
+            </div>
           </div>
         </section>
+      ) : null}
 
-        {error ? (
-          <p style={{ marginTop: "0.9rem", color: "#b91c1c" }} role="alert">
-            {error}
-          </p>
-        ) : null}
-
-        {analyzeResult ? (
-          <section
-            style={{
-              marginTop: "1rem",
-              borderTop: "1px solid #e2e8f0",
-              paddingTop: "1rem",
-            }}
-          >
-            <h2 style={{ marginBottom: "0.5rem" }}>Analysis</h2>
-            <p style={{ marginBottom: "0.35rem" }}>
-              Repository: <code>{analyzeResult.repo_url ?? "n/a"}</code>
-            </p>
-            <p style={{ marginBottom: "0.35rem" }}>
-              Fingerprint: <code>{analyzeResult.fingerprint_id ?? "pending"}</code>
-            </p>
-            <p style={{ marginBottom: "0.35rem" }}>
-              Frameworks: {(analyzeResult.frameworks ?? []).join(", ") || "n/a"}
-            </p>
-            <p>
-              Services: {(analyzeResult.services ?? []).join(", ") || "n/a"}
-            </p>
-          </section>
-        ) : null}
-
-        {runResult ? (
-          <section
-            style={{
-              marginTop: "1rem",
-              borderTop: "1px solid #e2e8f0",
-              paddingTop: "1rem",
-            }}
-          >
-            <h2 style={{ marginBottom: "0.5rem" }}>Execution</h2>
-            <p style={{ marginBottom: "0.35rem" }}>
-              Execution ID: <code>{runResult.execution_id ?? "n/a"}</code>
-            </p>
-            <p style={{ marginBottom: "0.35rem" }}>
-              Workspace ID: <code>{runResult.workspace_id ?? "n/a"}</code>
-            </p>
-            <p style={{ marginBottom: "0.35rem" }}>Status: {runResult.status ?? "starting"}</p>
-            {runResult.workspace_url ? (
-              <p>
-                Workspace URL: <a href={runResult.workspace_url}>{runResult.workspace_url}</a>
-              </p>
-            ) : null}
-          </section>
-        ) : null}
-
-        <section
-          style={{
-            marginTop: "1.25rem",
-            borderTop: "1px solid #e2e8f0",
-            paddingTop: "1rem",
-            color: "#334155",
-          }}
-        >
-          <p style={{ marginBottom: "0.4rem" }}>
-            API base: <code>{API_BASE_URL}</code>
-          </p>
-          <p>
-            Health check: <a href="/api/health">/api/health</a>
-          </p>
-        </section>
+      <section className={styles.footerInfo}>
+        <p>
+          API base: <code>{API_BASE_URL}</code>
+        </p>
+        <p>
+          Health check: <a href="/api/health">/api/health</a>
+        </p>
       </section>
     </main>
   );
