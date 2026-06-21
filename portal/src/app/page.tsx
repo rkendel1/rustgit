@@ -462,41 +462,58 @@ export default function Home() {
 
         <section className={styles.panel}>
           <h2>Repository input</h2>
-          <label htmlFor="github-repo-url" className={styles.label}>
-            GitHub repository URL or owner/repo
-          </label>
-          <input
-            id="github-repo-url"
-            value={repository}
-            onChange={(event) => resetResults(event.target.value)}
-            placeholder="https://github.com/owner/repo"
-            className={styles.input}
-          />
-          <p className={styles.hint}>
-            You can also use <code>owner/repo</code>.
-          </p>
-
-          <div className={styles.branchRow}>
-            <label htmlFor="branch" className={styles.label}>
-              Branch
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              handleAnalyze();
+            }}
+          >
+            <label htmlFor="github-repo-url" className={styles.label}>
+              GitHub repository URL or owner/repo
             </label>
             <input
-              id="branch"
-              value={branch}
-              onChange={(event) => setBranch(event.target.value)}
-              placeholder="main"
+              id="github-repo-url"
+              type="text"
+              autoComplete="off"
+              value={repository}
+              onChange={(event) => resetResults(event.target.value)}
+              onPaste={(event) => {
+                const pasted = event.clipboardData.getData("text");
+                if (pasted) {
+                  event.preventDefault();
+                  resetResults(pasted.trim());
+                }
+              }}
+              placeholder="https://github.com/owner/repo"
               className={styles.input}
             />
-          </div>
+            <p className={styles.hint}>
+              You can also use <code>owner/repo</code>.
+            </p>
 
-          <div className={styles.actions}>
-            <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.primaryButton}>
-              {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
-            </button>
-            <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
-              {running ? "Starting run..." : "Run repository"}
-            </button>
-          </div>
+            <div className={styles.branchRow}>
+              <label htmlFor="branch" className={styles.label}>
+                Branch
+              </label>
+              <input
+                id="branch"
+                type="text"
+                value={branch}
+                onChange={(event) => setBranch(event.target.value)}
+                placeholder="main"
+                className={styles.input}
+              />
+            </div>
+
+            <div className={styles.actions}>
+              <button type="submit" disabled={!canAnalyze} className={styles.primaryButton}>
+                {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
+              </button>
+              <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
+                {running ? "Starting run..." : "Run repository"}
+              </button>
+            </div>
+          </form>
         </section>
 
         {error ? (
