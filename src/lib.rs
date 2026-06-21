@@ -11949,10 +11949,16 @@ impl WorkspaceManager {
         if looks_like_local_path(repo_url) {
             copy_directory(Path::new(repo_url), destination)?;
         } else {
-            let status = Command::new("git")
-                .arg("clone")
-                .arg("--depth")
-                .arg("1")
+            let mut clone_command = Command::new("git");
+            clone_command.arg("clone").arg("--depth").arg("1");
+            if let Some(extra_header) = github_clone_extra_header(repo_url) {
+                clone_command
+                    .arg("-c")
+                    .arg(format!(
+                        "http.https://github.com/.extraheader={extra_header}"
+                    ));
+            }
+            let status = clone_command
                 .arg(repo_url)
                 .arg(destination)
                 .status()
@@ -15714,6 +15720,38 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
 
 fn looks_like_local_path(repo_url: &str) -> bool {
     repo_url.starts_with('/') || repo_url.starts_with("./") || repo_url.starts_with("../")
+}
+
+fn github_clone_extra_header(repo_url: &str) -> Option<String> {
+    github_clone_extra_header_with_token(
+        repo_url,
+        std::env::var("RUSTGIT_GITHUB_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("GITHUB_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("GH_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .as_deref(),
+    )
+}
+
+fn github_clone_extra_header_with_token(repo_url: &str, token: Option<&str>) -> Option<String> {
+    let token = token.map(str::trim).filter(|value| !value.is_empty())?;
+    if !repo_url.starts_with("https://github.com/")
+        && !repo_url.starts_with("https://www.github.com/")
+    {
+        return None;
+    }
+    let mut header = String::from("Authorization: Bearer ");
+    header.push_str(token);
+    Some(header)
 }
 
 fn node_type_name(node_type: ExecutionNodeType) -> &'static str {
@@ -22824,5 +22862,33 @@ services:
         let (recompute_path, recompute_body) = fingerprint_recompute_endpoint(&fingerprint);
         assert_eq!(recompute_path, "/fingerprint/recompute");
         assert!(recompute_body.contains("\"status\":\"recomputed\""));
+    }
+
+    #[test]
+    fn github_clone_extra_header_includes_bearer_token_for_github_https_repos() {
+        let header = github_clone_extra_header_with_token(
+            "https://github.com/rkendel1/new_vue-healed4.git",
+            Some("ghp_test123"),
+        )
+        .expect("expected auth header");
+
+        assert!(header.starts_with("Authorization: Bearer "));
+        assert!(header.ends_with("ghp_test123"));
+    }
+
+    #[test]
+    fn github_clone_extra_header_ignores_non_github_urls() {
+        let header =
+            github_clone_extra_header_with_token("https://gitlab.com/group/repo.git", Some("token"));
+        assert!(header.is_none());
+    }
+
+    #[test]
+    fn github_clone_extra_header_ignores_empty_token() {
+        let header = github_clone_extra_header_with_token(
+            "https://github.com/rkendel1/new_vue-healed4.git",
+            Some("   "),
+        );
+        assert!(header.is_none());
     }
 }

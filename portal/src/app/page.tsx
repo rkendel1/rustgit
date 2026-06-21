@@ -115,10 +115,16 @@ function parseRepositoryInput(input: string): RepoContext | null {
       }
       const owner = segments[0];
       const repo = segments[1];
+      const username = url.username();
+      const password = url.password();
+      const credentials =
+        username || password
+          ? `${username}${password ? `:${password}` : ""}@`
+          : "";
       return {
         owner,
         repo,
-        repoUrl: `https://github.com/${owner}/${repo}.git`,
+        repoUrl: `https://${credentials}github.com/${owner}/${repo}.git`,
       };
     } catch {
       return null;
