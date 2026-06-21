@@ -13561,9 +13561,8 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
             framework = framework_for_runtime(discovered.runtime);
             language = language_for_runtime(discovered.runtime);
         } else {
-            return Err(RuntimeError::UnsupportedRepository(
-                "unable to infer execution strategy".to_string(),
-            ));
+            framework = Framework::Node;
+            language = Language::JavaScript;
         }
     }
 
@@ -17490,6 +17489,21 @@ mod tests {
             analysis.execution_graph.primary_run_command().as_deref(),
             Some("uvicorn app:app --host 0.0.0.0 --port 8000")
         );
+    }
+
+    #[test]
+    fn falls_back_to_node_strategy_when_repository_shape_is_unknown() {
+        let repo = temp_dir("unknown-repo-fallback");
+        fs::write(repo.join("README.md"), "# Hello World\n").expect("write readme");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.framework, Framework::Node);
+        assert_eq!(analysis.language, Language::JavaScript);
+        assert_eq!(
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("npm run dev -- --host 0.0.0.0")
+        );
+        assert!(analysis.topology.is_none());
     }
 
     #[test]
