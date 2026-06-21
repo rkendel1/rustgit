@@ -115,8 +115,8 @@ function parseRepositoryInput(input: string): RepoContext | null {
       }
       const owner = segments[0];
       const repo = segments[1];
-      const username = url.username();
-      const password = url.password();
+      const username = url.username;
+      const password = url.password;
       const credentials =
         username || password
           ? `${username}${password ? `:${password}` : ""}@`

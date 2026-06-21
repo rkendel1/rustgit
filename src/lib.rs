@@ -11951,6 +11951,7 @@ impl WorkspaceManager {
         } else {
             let mut clone_command = Command::new("git");
             clone_command.arg("clone").arg("--depth").arg("1");
+            clone_command.env("GIT_TERMINAL_PROMPT", "0");
             if let Some(extra_header) = github_clone_extra_header(repo_url) {
                 clone_command
                     .arg("-c")
@@ -11958,15 +11959,18 @@ impl WorkspaceManager {
                         "http.https://github.com/.extraheader={extra_header}"
                     ));
             }
-            let status = clone_command
+            let output = clone_command
                 .arg(repo_url)
                 .arg(destination)
-                .status()
+                .output()
                 .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
 
-            if !status.success() {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let reason = github_clone_error_reason(repo_url, &stderr);
                 return Err(RuntimeError::CommandFailed(format!(
-                    "git clone exited with status {status}"
+                    "git clone exited with status {}: {}",
+                    output.status, reason
                 )));
             }
         }
@@ -15729,6 +15733,11 @@ fn github_clone_extra_header(repo_url: &str) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .or_else(|| {
+                std::env::var("GITHUB_PAT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
                 std::env::var("GITHUB_TOKEN")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
@@ -15752,6 +15761,21 @@ fn github_clone_extra_header_with_token(repo_url: &str, token: Option<&str>) -> 
     let mut header = String::from("Authorization: Bearer ");
     header.push_str(token);
     Some(header)
+}
+
+fn github_clone_error_reason(repo_url: &str, stderr: &str) -> String {
+    if repo_url.starts_with("https://github.com/") || repo_url.starts_with("https://www.github.com/")
+    {
+        if stderr.contains("could not read Username for 'https://github.com'") {
+            return "GitHub authentication is required in this environment; set RUSTGIT_GITHUB_TOKEN/GITHUB_PAT/GITHUB_TOKEN/GH_TOKEN or pass a credentialed repo URL such as https://<token>@github.com/owner/repo.git".to_string();
+        }
+    }
+
+    if stderr.is_empty() {
+        "git clone failed with no stderr output".to_string()
+    } else {
+        stderr.to_string()
+    }
 }
 
 fn node_type_name(node_type: ExecutionNodeType) -> &'static str {
@@ -22890,5 +22914,22 @@ services:
             Some("   "),
         );
         assert!(header.is_none());
+    }
+
+    #[test]
+    fn github_clone_error_reason_surfaces_auth_guidance_for_github_username_prompt_failure() {
+        let reason = github_clone_error_reason(
+            "https://github.com/rkendel1/new_vue-healed4.git",
+            "fatal: could not read Username for 'https://github.com': No such device or address",
+        );
+        assert!(reason.contains("GitHub authentication is required"));
+        assert!(reason.contains("RUSTGIT_GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn github_clone_error_reason_preserves_non_auth_stderr() {
+        let stderr = "fatal: repository 'https://github.com/rkendel1/missing.git/' not found";
+        let reason = github_clone_error_reason("https://github.com/rkendel1/missing.git", stderr);
+        assert_eq!(reason, stderr);
     }
 }
