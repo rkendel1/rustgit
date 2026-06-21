@@ -1,4 +1,8 @@
+use std::fs;
+use std::path::{Path as FsPath, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{Path, State},
@@ -8,6 +12,7 @@ use axum::{
     Router,
 };
 use rustgit_wasm_runtime::{
+    analyze::{AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
     healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, RuntimeError,
     WasmWorkspace, Workspace, WorkspaceManager,
@@ -17,6 +22,12 @@ use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
 type SharedManager = Arc<WorkspaceManager>;
+
+#[derive(Clone)]
+struct AppState {
+    manager: SharedManager,
+    analyze_cache: Arc<AnalyzeCache>,
+}
 
 #[derive(Deserialize)]
 struct LaunchRequest {
@@ -52,6 +63,8 @@ struct AnalyzeRequest {
     repo: Option<String>,
     url: Option<String>,
     repo_url: Option<String>,
+    branch: Option<String>,
+    commit: Option<String>,
 }
 
 fn err_response(err: RuntimeError) -> (StatusCode, Json<Value>) {
@@ -98,15 +111,97 @@ fn resolve_repo_url(
     }
 }
 
+fn prepare_repository_for_analysis(repo_url: &str, branch: &str, commit: &str) -> rustgit_wasm_runtime::Result<PathBuf> {
+    if FsPath::new(repo_url).exists() {
+        return Ok(PathBuf::from(repo_url));
+    }
+
+    let workspace = std::env::temp_dir()
+        .join("rustgit-analyze")
+        .join(hash_key(repo_url))
+        .join(hash_key(&format!("{repo_url}:{branch}:{commit}")));
+    if workspace.exists() {
+        fs::remove_dir_all(&workspace)?;
+    }
+    fs::create_dir_all(&workspace)?;
+
+    let mut clone = Command::new("git");
+    clone
+        .arg("-c")
+        .arg("credential.helper=")
+        .arg("-c")
+        .arg("credential.username=")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--branch")
+        .arg(branch)
+        .arg(repo_url)
+        .arg(&workspace);
+    clone.env("GIT_TERMINAL_PROMPT", "0");
+    let output = clone
+        .output()
+        .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(RuntimeError::CommandFailed(format!(
+            "git clone exited with status {}: {}",
+            output.status, stderr
+        )));
+    }
+
+    if !commit.is_empty() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .arg("checkout")
+            .arg(commit)
+            .output()
+            .map_err(|e| RuntimeError::CommandFailed(format!("git checkout failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(RuntimeError::CommandFailed(format!(
+                "git checkout exited with status {}: {}",
+                output.status, stderr
+            )));
+        }
+    }
+
+    Ok(workspace)
+}
+
+fn resolve_repository_commit(root: &FsPath) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!commit.is_empty()).then_some(commit)
+}
+
+fn hash_key(input: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
 async fn launch_workspace(
-    State(manager): State<SharedManager>,
+    State(state): State<AppState>,
     Json(body): Json<LaunchRequest>,
 ) -> Result<(StatusCode, Json<Workspace>), (StatusCode, Json<Value>)> {
     let repo_url = body.repo_url;
+    let manager = state.manager;
     tokio::task::spawn_blocking(move || manager.launch(&repo_url))
         .await
         .expect("task panicked")
@@ -115,11 +210,12 @@ async fn launch_workspace(
 }
 
 async fn launch_execution(
-    State(manager): State<SharedManager>,
+    State(state): State<AppState>,
     Json(body): Json<ExecutionRequest>,
 ) -> Result<(StatusCode, Json<ExecutionResponse>), (StatusCode, Json<Value>)> {
     let repo_url = resolve_repo_url(body.repo_url, None, body.owner, body.repo)?;
     let _branch = body.branch;
+    let manager = state.manager;
     tokio::task::spawn_blocking(move || manager.launch(&repo_url))
         .await
         .expect("task panicked")
@@ -136,27 +232,54 @@ async fn launch_execution(
         .map_err(err_response)
 }
 
-// Lightweight compatibility check — no filesystem I/O. Framework detection happens on launch.
-async fn analyze_repository_compat(
+async fn analyze_repository(
+    State(state): State<AppState>,
     Json(body): Json<AnalyzeRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let started = Instant::now();
     let repo_url = resolve_repo_url(body.repo_url, body.url, body.owner, body.repo)?;
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "repo_url": repo_url,
-            "compatible": true,
-            "supported": true,
-            "frameworks": [],
-            "services": [],
-        })),
-    ))
+    let branch = body
+        .branch
+        .unwrap_or_else(|| "main".to_string())
+        .trim()
+        .to_string();
+    let requested_commit = body.commit.unwrap_or_default().trim().to_string();
+    let repo_root = prepare_repository_for_analysis(&repo_url, &branch, &requested_commit)
+        .map_err(err_response)?;
+    let resolved_commit = resolve_repository_commit(&repo_root).unwrap_or_else(|| {
+        if requested_commit.is_empty() {
+            "unknown".to_string()
+        } else {
+            requested_commit.clone()
+        }
+    });
+    let cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit);
+
+    if let Some(cached) = state.analyze_cache.get(&cache_key) {
+        let mut payload = cached.payload;
+        payload["cached"] = json!(true);
+        payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+        return Ok((StatusCode::OK, Json(payload)));
+    }
+
+    let request = AnalyzeEngineRequest {
+        repo: repo_url.clone(),
+        branch,
+        commit: resolved_commit.clone(),
+    };
+    let result = AnalyzeEngine::analyze(&repo_root, &request).map_err(err_response)?;
+    let mut payload = result.payload;
+    payload["cached"] = json!(false);
+    payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+    state.analyze_cache.put(cache_key, payload.clone());
+    Ok((StatusCode::OK, Json(payload)))
 }
 
 async fn stop_workspace(
-    State(manager): State<SharedManager>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
     tokio::task::spawn_blocking(move || manager.stop(&id))
         .await
         .expect("task panicked")
@@ -165,9 +288,10 @@ async fn stop_workspace(
 }
 
 async fn restart_workspace(
-    State(manager): State<SharedManager>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
     tokio::task::spawn_blocking(move || manager.restart(&id))
         .await
         .expect("task panicked")
@@ -176,9 +300,10 @@ async fn restart_workspace(
 }
 
 async fn workspace_logs(
-    State(manager): State<SharedManager>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
     tokio::task::spawn_blocking(move || manager.logs(&id))
         .await
         .expect("task panicked")
@@ -248,14 +373,15 @@ async fn seed_launch(Path((owner, repo)): Path<(String, String)>) -> (StatusCode
     json_payload_response(payload)
 }
 
-async fn list_workspaces(State(manager): State<SharedManager>) -> Json<Vec<Workspace>> {
-    Json(manager.list_workspaces())
+async fn list_workspaces(State(state): State<AppState>) -> Json<Vec<Workspace>> {
+    Json(state.manager.list_workspaces())
 }
 
 async fn get_workspace(
-    State(manager): State<SharedManager>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Workspace>, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
     tokio::task::spawn_blocking(move || manager.get_workspace(&id))
         .await
         .expect("task panicked")
@@ -263,7 +389,7 @@ async fn get_workspace(
         .map_err(err_response)
 }
 
-fn with_workspace_routes(router: Router<SharedManager>, prefix: &str) -> Router<SharedManager> {
+fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> {
     router
         .route(
             &format!("{prefix}/workspaces"),
@@ -294,24 +420,25 @@ fn cors_layer() -> CorsLayer {
         .max_age(std::time::Duration::from_secs(60 * 60))
 }
 
-fn app(manager: SharedManager) -> Router {
+fn app(state: AppState) -> Router {
     with_workspace_routes(
         with_workspace_routes(
-            with_workspace_routes(Router::<SharedManager>::new(), ""),
+            with_workspace_routes(Router::<AppState>::new(), ""),
             "/api/v1",
         ),
         "/api/proxy/api/v1",
     )
         .route("/health", get(health))
+        .route("/api/analyze", post(analyze_repository))
         .route("/api/v1/executions", post(launch_execution))
         .route("/api/proxy/api/v1/executions", post(launch_execution))
         .route(
             "/api/v1/repositories/analyze",
-            post(analyze_repository_compat),
+            post(analyze_repository),
         )
         .route(
             "/api/proxy/api/v1/repositories/analyze",
-            post(analyze_repository_compat),
+            post(analyze_repository),
         )
         .route("/api/badges/generate", post(generate_badge))
         .route("/api/badge/generate", post(generate_badge))
@@ -319,7 +446,7 @@ fn app(manager: SharedManager) -> Router {
         .route("/badge/healed/:owner/:repo.svg", get(healed_badge))
         .route("/seed/:owner/:repo", get(seed_launch))
         .layer(cors_layer())
-        .with_state(manager)
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -339,8 +466,10 @@ async fn main() {
             .to_string()
     });
     let manager: SharedManager = Arc::new(WorkspaceManager::new(root));
-
-    let app = app(manager);
+    let app = app(AppState {
+        manager,
+        analyze_cache: Arc::new(AnalyzeCache::default()),
+    });
 
     let addr = format!("0.0.0.0:{port}");
     println!("listening on {addr}");
@@ -350,6 +479,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
 
     use axum::{
@@ -360,9 +490,9 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{app, runtime_badge, SharedManager, WorkspaceManager};
+    use super::{app, runtime_badge, AnalyzeCache, AppState, WorkspaceManager};
 
-    fn test_manager() -> SharedManager {
+    fn test_state() -> AppState {
         let root = std::env::temp_dir().join(format!(
             "rustgit-server-tests-{}",
             std::time::SystemTime::now()
@@ -370,7 +500,10 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
-        Arc::new(WorkspaceManager::new(root))
+        AppState {
+            manager: Arc::new(WorkspaceManager::new(root)),
+            analyze_cache: Arc::new(AnalyzeCache::default()),
+        }
     }
 
     #[tokio::test]
@@ -397,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn mirrored_workspace_routes_are_available_under_v1_and_proxy_alias() {
-        let app = app(test_manager());
+        let app = app(test_state());
 
         let checks = [
             ("/api/v1/workspaces/missing", "DELETE"),
@@ -426,9 +559,10 @@ mod tests {
 
     #[tokio::test]
     async fn execution_and_analyze_routes_exist_on_both_prefixes() {
-        let app = app(test_manager());
+        let app = app(test_state());
 
         let checks = [
+            "/api/analyze",
             "/api/v1/executions",
             "/api/v1/repositories/analyze",
             "/api/proxy/api/v1/executions",
@@ -454,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn cors_preflight_is_enabled_for_v1_routes() {
-        let app = app(test_manager());
+        let app = app(test_state());
         let response = app
             .oneshot(
                 Request::builder()
@@ -476,5 +610,76 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("*")
         );
+    }
+
+    #[tokio::test]
+    async fn analyze_route_generates_manifest_and_uses_cache() {
+        let repo = std::env::temp_dir().join(format!(
+            "rustgit-analyze-repo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"15.0.0"},"scripts":{"dev":"next dev","build":"next build","start":"next start"}}"#,
+        )
+        .expect("write package");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").expect("write lockfile");
+
+        let app = app(test_state());
+        let request_body = serde_json::json!({
+            "repo_url": repo.to_string_lossy().to_string(),
+            "branch": "main",
+            "commit": "local"
+        })
+        .to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/analyze")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload["runtime"]["packageManager"].as_str(),
+            Some("pnpm"),
+            "phase2 lockfile runtime detection should select pnpm"
+        );
+        assert_eq!(
+            payload["traceability"]["phase3_manifest_first"].as_bool(),
+            Some(true)
+        );
+        assert!(repo.join(".ddockit/manifest.json").exists());
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/analyze")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let second_body = to_bytes(second.into_body(), 1024 * 1024)
+            .await
+            .expect("second body");
+        let second_payload: serde_json::Value =
+            serde_json::from_slice(&second_body).expect("second json");
+        assert_eq!(second_payload["cached"].as_bool(), Some(true));
     }
 }

@@ -18,6 +18,7 @@ mod execution_learning;
 mod execution_memory;
 mod execution_optimizer;
 mod execution_retriever;
+pub mod analyze;
 pub mod preparation;
 pub mod healing;
 mod postgres_db;
