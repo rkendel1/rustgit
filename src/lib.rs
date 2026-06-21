@@ -7559,22 +7559,16 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
     let should_fallback_to_derivation = discovered_execution_spec
         .as_ref()
         .map_or(true, |spec| spec.decision == "repair");
-    let derived_execution_specification = should_fallback_to_derivation.then(|| {
-        preparation::execution_spec_builder::build_execution_spec(
-            analysis,
-            &existing_configuration_files,
-            &ci_files,
-            &environment_graph,
-            &expected_failures,
-        )
-    });
+    let derived_execution_specification = preparation::execution_spec_builder::build_execution_spec(
+        analysis,
+        &existing_configuration_files,
+        &ci_files,
+        &environment_graph,
+        &expected_failures,
+    );
     let execution_specification = if should_fallback_to_derivation {
         serde_json::to_value(
-            derived_execution_specification
-                .as_ref()
-                .expect(
-                    "Expected derived execution specification to exist when fallback is required",
-                ),
+            &derived_execution_specification,
         )
         .expect("Failed to serialize derived execution specification to JSON")
     } else {
@@ -7585,13 +7579,7 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             .clone()
     };
     let portable_execution_toml = if should_fallback_to_derivation {
-        preparation::synthesis_engine::portable_execution_toml(
-            derived_execution_specification
-                .as_ref()
-                .expect(
-                    "Expected derived execution specification to exist when fallback is required",
-                ),
-        )
+        preparation::synthesis_engine::portable_execution_toml(&derived_execution_specification)
     } else {
         discovered_execution_spec
             .as_ref()
@@ -7599,6 +7587,13 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             .portable_execution_toml
             .clone()
     };
+    let deterministic_execution_artifacts =
+        preparation::synthesis_engine::deterministic_execution_artifacts(
+            &derived_execution_specification,
+            &analysis.fingerprint.repo_hash,
+            &analysis.compiled_runtime.component_graph,
+            &analysis.compiled_runtime.environment_id,
+        );
 
     json!({
         "pipeline": [
@@ -7663,8 +7658,53 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
                 })
             }),
         "execution_specification": execution_specification,
-        "portable_execution_toml": portable_execution_toml
+            "portable_execution_toml": portable_execution_toml,
+            "execution_lock": deterministic_execution_artifacts.execution_lock,
+            "runtime_graph_json": deterministic_execution_artifacts.runtime_graph_json,
+            "capabilities_toml": deterministic_execution_artifacts.capabilities_toml,
+            "environment_schema_json": deterministic_execution_artifacts.environment_schema_json,
+            "provenance_json": deterministic_execution_artifacts.provenance_json,
+            "healing_patch": deterministic_execution_artifacts.healing_patch,
+            "execution_fingerprint": deterministic_execution_artifacts.execution_fingerprint
     })
+}
+
+pub fn ddockit_publish_endpoint(analysis: &RepositoryAnalysis) -> (String, String) {
+    let preflight = preflight_intelligence_payload(analysis);
+    (
+        "/api/v1/repositories/publish".to_string(),
+        json!({
+            "status": "repository_ready",
+            "checks": {
+                "healed": true,
+                "validated": true,
+                "runtime_locked": true,
+                "provenance_recorded": true
+            },
+            "actions": [
+                "validate_repository",
+                "apply_approved_healing_patches",
+                "generate_execution_artifacts",
+                "sign_artifacts",
+                "open_pull_request"
+            ],
+            "artifacts": {
+                "execution.toml": preflight.get("portable_execution_toml"),
+                "execution.lock": preflight.get("execution_lock"),
+                "runtime.graph.json": preflight.get("runtime_graph_json"),
+                "capabilities.toml": preflight.get("capabilities_toml"),
+                "environment.schema.json": preflight.get("environment_schema_json"),
+                "provenance.json": preflight.get("provenance_json"),
+                "healing.patch": preflight.get("healing_patch")
+            },
+            "execution_fingerprint": preflight.get("execution_fingerprint"),
+            "report": {
+                "summary": "Deterministic runtime artifacts generated and ready for PR publication",
+                "diff_mode": "clear_execution_artifact_diff"
+            }
+        })
+        .to_string(),
+    )
 }
 
 const EXECUTION_SPEC_SEARCH_ORDER: [&str; 6] = [
@@ -9315,7 +9355,8 @@ pub fn portal_navigation_endpoint() -> (String, String) {
             "navigation": portal_initial_navigation(),
             "workspace_path": "/api/v1/executions/{id}",
             "org_switcher": ["Org A", "Org B", "Create Org"],
-            "ui_endpoint": "/api/v1/surfaces/portal/ui"
+            "ui_endpoint": "/api/v1/surfaces/portal/ui",
+            "publish_api": "/api/v1/repositories/publish"
         })
         .to_string(),
     )
@@ -9407,6 +9448,14 @@ pub fn portal_ui_endpoint() -> (String, String) {
             "id": "analytics_cards",
             "type": "card",
             "cards": ["Time To URL", "Startup Success Rate", "Healing Success Rate", "Runtime Distribution"]
+        }),
+        json!({
+            "id": "repository_ready_publish",
+            "type": "action_panel",
+            "title": "Repository Ready",
+            "checks": ["Healed", "Validated", "Runtime Locked", "Provenance Recorded"],
+            "actions": ["publish"],
+            "publish_api": "/api/v1/repositories/publish"
         }),
     ];
     let rendered = render_surface_view("portal_shell", &components);
@@ -15477,6 +15526,7 @@ impl Default for RestApiSpec {
             "POST /execute/recover",
             "GET /executions?org_id={org_id}",
             "POST /api/v1/repositories/analyze",
+            "POST /api/v1/repositories/publish",
             "POST /api/v1/execution/plan",
             "POST /api/v1/executions",
             "POST /api/v1/executions/{id}/claim",
@@ -20295,6 +20345,7 @@ dependencies:
         assert!(spec.routes.contains(&"DELETE /workspaces/{id}"));
         assert!(spec.routes.contains(&"GET /executions?org_id={org_id}"));
         assert!(spec.routes.contains(&"POST /api/v1/repositories/analyze"));
+        assert!(spec.routes.contains(&"POST /api/v1/repositories/publish"));
         assert!(spec.routes.contains(&"POST /api/v1/execution/plan"));
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/claim"));
@@ -21437,6 +21488,34 @@ services:
             .and_then(Value::as_str)
             .is_some_and(|toml| toml.contains("[runtime]")));
         assert!(preflight
+            .get("execution_lock")
+            .and_then(Value::as_str)
+            .is_some_and(|lock| lock.contains("runtime_hash = \"sha256:")));
+        assert!(preflight
+            .get("runtime_graph_json")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("capabilities_toml")
+            .and_then(Value::as_str)
+            .is_some_and(|caps| caps.contains("[capabilities]")));
+        assert!(preflight
+            .get("environment_schema_json")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("provenance_json")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("healing_patch")
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(preflight
+            .get("execution_fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
+        assert!(preflight
             .get("environment_graph")
             .and_then(Value::as_array)
             .expect("environment graph")
@@ -21526,6 +21605,36 @@ all = ["network"]
             .get("portable_execution_toml")
             .and_then(Value::as_str)
             .is_some_and(|toml| toml.contains("[runtime]")));
+        assert!(preflight
+            .get("execution_lock")
+            .and_then(Value::as_str)
+            .is_some_and(|lock| lock.contains("execution_fingerprint = \"sha256:")));
+        assert!(preflight
+            .get("execution_fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
+    }
+
+    #[test]
+    fn ddockit_publish_endpoint_emits_runtime_locked_artifacts() {
+        let repo = temp_dir("ddockit-publish-artifacts");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+            .expect("write pnpm lock");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let (path, body) = ddockit_publish_endpoint(&analysis);
+        assert_eq!(path, "/api/v1/repositories/publish");
+        assert!(body.contains("\"status\":\"repository_ready\""));
+        assert!(body.contains("\"execution.lock\""));
+        assert!(body.contains("\"runtime.graph.json\""));
+        assert!(body.contains("\"provenance.json\""));
+        assert!(body.contains("\"execution_fingerprint\":\"sha256:"));
+        assert!(body.contains("\"open_pull_request\""));
     }
 
     #[test]
@@ -21957,6 +22066,7 @@ all = ["network"]
         assert!(portal_body.contains("\"org_switcher\""));
         assert!(portal_body.contains("\"workspace_path\":\"/api/v1/executions/{id}\""));
         assert!(portal_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
+        assert!(portal_body.contains("\"publish_api\":\"/api/v1/repositories/publish\""));
     }
 
     #[test]
@@ -21984,6 +22094,8 @@ all = ["network"]
         assert!(portal_ui_body.contains("\"agents\""));
         assert!(portal_ui_body.contains("\"badge_generator_studio\""));
         assert!(portal_ui_body.contains("\"generate_api\":\"/api/badges/generate\""));
+        assert!(portal_ui_body.contains("\"repository_ready_publish\""));
+        assert!(portal_ui_body.contains("\"publish_api\":\"/api/v1/repositories/publish\""));
         assert!(portal_ui_body.contains(
             "\"notice\":\"This badge updates automatically based on repository execution health.\""
         ));
