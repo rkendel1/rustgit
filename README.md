@@ -126,6 +126,11 @@ Rather than split intelligence across isolated stores, USIL standardizes on a si
 - `.execute()`
 - `.ask()`
 - `.compare()`
+- `.explain()`
+- `.simulate()`
+- `.recover()`
+- `.search()`
+- `.timeline()`
 
 ### Current capability trajectory
 
