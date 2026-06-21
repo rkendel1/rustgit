@@ -8,7 +8,7 @@ const DEFAULT_API_BASE_URL =
   process.env.NODE_ENV === "development"
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
-const UPSTREAM_PROXY_PREFIX = "api/proxy";
+const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
 
 function resolveApiBaseUrl(request: NextRequest): string {
   const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
@@ -83,14 +83,15 @@ async function proxyRequest(
     });
 
   let upstreamResponse = await sendUpstreamRequest(upstreamUrl);
+  const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
-    joinedPath === UPSTREAM_PROXY_PREFIX ||
-    joinedPath.startsWith(`${UPSTREAM_PROXY_PREFIX}/`);
+    joinedSegments[0] === UPSTREAM_PROXY_PREFIX_SEGMENTS[0] &&
+    joinedSegments[1] === UPSTREAM_PROXY_PREFIX_SEGMENTS[1];
   const canRetryWithProxyPrefix = !hasProxyPrefix;
   if (upstreamResponse.status === 404 && canRetryWithProxyPrefix) {
     const proxiedUpstreamUrl = buildUpstreamUrl(
       apiBaseUrl,
-      `${UPSTREAM_PROXY_PREFIX}/${joinedPath}`,
+      `${UPSTREAM_PROXY_PREFIX_SEGMENTS.join("/")}/${joinedPath}`,
     );
     appendSearchParams(request.nextUrl.searchParams, proxiedUpstreamUrl);
     upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
