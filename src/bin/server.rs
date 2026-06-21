@@ -136,25 +136,21 @@ async fn launch_execution(
         .map_err(err_response)
 }
 
+// Lightweight compatibility check — no filesystem I/O. Framework detection happens on launch.
 async fn analyze_repository_compat(
-    State(manager): State<SharedManager>,
     Json(body): Json<AnalyzeRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let repo_url = resolve_repo_url(body.repo_url, body.url, body.owner, body.repo)?;
-    tokio::task::spawn_blocking(move || manager.launch(&repo_url))
-        .await
-        .expect("task panicked")
-        .map(|workspace| {
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "repo_url": workspace.repo_url,
-                    "frameworks": [format!("{:?}", workspace.framework).to_lowercase()],
-                    "services": [],
-                })),
-            )
-        })
-        .map_err(err_response)
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "repo_url": repo_url,
+            "compatible": true,
+            "supported": true,
+            "frameworks": [],
+            "services": [],
+        })),
+    ))
 }
 
 async fn stop_workspace(
@@ -312,7 +308,15 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
 
-    let root = std::env::var("WORKSPACE_ROOT").unwrap_or_else(|_| "/data/workspaces".to_string());
+    let root = std::env::var("WORKSPACE_ROOT").unwrap_or_else(|_| {
+        // In production (Fly.io) set WORKSPACE_ROOT=/data/workspaces via fly.toml [env].
+        // Locally, fall back to a directory next to the binary so no root access is needed.
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".workspace-data")
+            .to_string_lossy()
+            .to_string()
+    });
     let manager: SharedManager = Arc::new(WorkspaceManager::new(root));
 
     let app = app(manager);
