@@ -66,6 +66,7 @@ This badge updates automatically based on repository execution health.
 - **Repository knowledge graph assembly** from execution, failure, healing, temporal recovery, dependency, and architecture data.
 - **Repository ask service** (`POST /api/repositories/{id}/ask`) that builds an answer with confidence and evidence links.
 - **Repository intelligence panel endpoint** (`GET /api/repositories/{id}/intelligence`) used by product surfaces for score/runtime/action summaries.
+- **Preflight Intelligence & Environment Synthesis payloads** embedded in `POST /api/v1/repositories/analyze` and `POST /api/v1/execution/plan` responses.
 - **Execution intelligence loop endpoints** for retrieval, learning, and optimization:
   - `GET /intelligence/{execution}`
   - `GET /intelligence/similar`
@@ -82,6 +83,7 @@ This badge updates automatically based on repository execution health.
 - Uses prior outcomes to surface similar executions and repair patterns.
 - Produces operator-facing summaries (execution score, healing score, runtime, last success, recommended actions).
 - Tracks evidence categories for answers (`file`, `execution`, `failure`, `repair`) so responses can be grounded in observed signals.
+- Discovers environment/dependency/configuration/CI files, synthesizes environment variable strategies, predicts likely failures, and emits pre-healing actions before execution.
 
 ### What we can currently determine
 
