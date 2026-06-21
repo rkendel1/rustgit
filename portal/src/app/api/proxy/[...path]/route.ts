@@ -9,6 +9,8 @@ const DEFAULT_API_BASE_URL =
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
 const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
+// Keep proxy calls bounded so UI operations (like Analyze) fail fast instead of hanging indefinitely.
+const UPSTREAM_REQUEST_TIMEOUT_MS = 15_000;
 
 function resolveApiBaseUrl(request: NextRequest): string {
   const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
@@ -44,6 +46,32 @@ function buildUpstreamUrl(apiBaseUrl: string, path: string): URL {
   return url;
 }
 
+function isTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  if (error instanceof DOMException) {
+    return error.name === "AbortError" || error.name === "TimeoutError";
+  }
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
+function upstreamFailureResponse(error: unknown, path: string): NextResponse {
+  const isTimeout = isTimeoutError(error);
+  if (isTimeout) {
+    console.warn(
+      `Proxy upstream request timed out after ${UPSTREAM_REQUEST_TIMEOUT_MS}ms for path: ${path}`,
+    );
+  }
+  return NextResponse.json(
+    {
+      error: isTimeout ? "Upstream request timed out." : "Upstream request failed.",
+      path,
+    },
+    { status: isTimeout ? 504 : 502 },
+  );
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
@@ -74,15 +102,27 @@ async function proxyRequest(
       ? undefined
       : new Uint8Array(await request.arrayBuffer());
 
-  const sendUpstreamRequest = (url: URL) =>
-    fetch(url, {
-      method: request.method,
-      headers: requestHeaders,
-      body: requestBodyBytes,
-      cache: "no-store",
-    });
-
-  let upstreamResponse = await sendUpstreamRequest(upstreamUrl);
+  const sendUpstreamRequest = async (url: URL): Promise<Response> => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_REQUEST_TIMEOUT_MS);
+    try {
+      return await fetch(url, {
+        method: request.method,
+        headers: requestHeaders,
+        body: requestBodyBytes,
+        cache: "no-store",
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+  let upstreamResponse: Response;
+  try {
+    upstreamResponse = await sendUpstreamRequest(upstreamUrl);
+  } catch (error) {
+    return upstreamFailureResponse(error, joinedPath);
+  }
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
     joinedSegments.length >= 2 &&
@@ -95,7 +135,11 @@ async function proxyRequest(
       `${UPSTREAM_PROXY_PREFIX_SEGMENTS.join("/")}/${joinedPath}`,
     );
     appendSearchParams(request.nextUrl.searchParams, proxiedUpstreamUrl);
-    upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
+    try {
+      upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
+    } catch (error) {
+      return upstreamFailureResponse(error, joinedPath);
+    }
   }
 
   return new NextResponse(upstreamResponse.body, {
