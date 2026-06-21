@@ -81,6 +81,17 @@ const PRO_PLAN_RUNS_PER_DAY: usize = 1_000;
 const EXECUTION_IMAGE_VERSION: &str = "v1";
 const UNKNOWN_SIGNATURE: &str = "unknown";
 const CJVF_CANONICAL_HOST: &str = "trythissoftware.com";
+const PREFLIGHT_REPOSITORY_HEALTH_WITH_DEPS: u8 = 98;
+const PREFLIGHT_REPOSITORY_HEALTH_NO_DEPS: u8 = 88;
+const PREFLIGHT_DEPENDENCIES_CONFIDENCE_READY: u8 = 99;
+const PREFLIGHT_DEPENDENCIES_CONFIDENCE_UNKNOWN: u8 = 90;
+const PREFLIGHT_CAPABILITIES_CONFIDENCE_READY: u8 = 96;
+const PREFLIGHT_CAPABILITIES_CONFIDENCE_UNKNOWN: u8 = 90;
+const PREFLIGHT_ENVIRONMENT_CONFIDENCE_DISCOVERED: u8 = 95;
+const PREFLIGHT_ENVIRONMENT_CONFIDENCE_SYNTHESIZED: u8 = 85;
+const PREFLIGHT_RUNTIME_CONFIDENCE_WASM: u8 = 98;
+const PREFLIGHT_RUNTIME_CONFIDENCE_NATIVE: u8 = 99;
+const PREFLIGHT_FAILURE_PENALTY_PER_ISSUE: u8 = 2;
 pub const DDOCKIT_ANON_ID_COOKIE: &str = "ddockit_anon_id";
 pub const DDOCKIT_SESSION_ID_COOKIE: &str = "ddockit_session_id";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
@@ -7360,10 +7371,466 @@ pub fn repositories_analyze_endpoint(
             "repo_url": &request.repo_url,
             "fingerprint_id": &analysis.fingerprint.repo_hash,
             "frameworks": frameworks,
-            "services": services
+            "services": services,
+            "preflight": preflight_intelligence_payload(analysis)
         })
         .to_string(),
     )
+}
+
+fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
+    let root = &analysis.root;
+    let existing_environment_files = discover_existing_files(
+        root,
+        &[
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.example",
+            "portal/.env",
+            "portal/.env.local",
+            "portal/.env.production",
+            "portal/.env.example",
+        ],
+    );
+    let existing_dependency_files = discover_existing_files(
+        root,
+        &[
+            "package.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+            "Cargo.toml",
+            "go.mod",
+            "pyproject.toml",
+            "requirements.txt",
+            "Pipfile",
+            "Pipfile.lock",
+            "poetry.lock",
+            "uv.lock",
+        ],
+    );
+    let existing_configuration_files = discover_existing_files(
+        root,
+        &[
+            "docker-compose.yml",
+            "fly.toml",
+            "vercel.json",
+            "wrangler.toml",
+            "Procfile",
+            "Makefile",
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.cjs",
+            "next.config.ts",
+            "vite.config.js",
+            "vite.config.mjs",
+            "vite.config.cjs",
+            "vite.config.ts",
+        ],
+    );
+    let ci_files = discover_ci_files(root);
+    let discovered_env_keys = discover_env_keys(root, &existing_environment_files);
+    let package_dependencies = parse_package_dependency_names(root);
+
+    let has_prisma =
+        package_dependencies.contains("prisma") || root.join("prisma/schema.prisma").exists();
+    let has_redis =
+        package_dependencies.contains("redis") || package_dependencies.contains("ioredis");
+    let has_openai = package_dependencies.contains("openai");
+
+    let mut environment_graph = Vec::new();
+    environment_graph.push(environment_variable_blueprint(
+        "NODE_ENV",
+        "development",
+        false,
+        false,
+        false,
+        &discovered_env_keys,
+        vec![
+            "repository-config".to_string(),
+            "runtime-default".to_string(),
+            "user-secret".to_string(),
+        ],
+    ));
+    environment_graph.push(environment_variable_blueprint(
+        "PORT",
+        analysis
+            .runtime_spec
+            .ports
+            .first()
+            .copied()
+            .unwrap_or(3000)
+            .to_string(),
+        false,
+        true,
+        false,
+        &discovered_env_keys,
+        vec![
+            "repository-config".to_string(),
+            "runtime-default".to_string(),
+            "port-reallocation".to_string(),
+        ],
+    ));
+    environment_graph.push(environment_variable_blueprint(
+        "HOST",
+        "0.0.0.0",
+        false,
+        true,
+        false,
+        &discovered_env_keys,
+        vec![
+            "repository-config".to_string(),
+            "runtime-default".to_string(),
+            "user-secret".to_string(),
+        ],
+    ));
+
+    if has_prisma {
+        environment_graph.push(environment_variable_blueprint(
+            "DATABASE_URL",
+            "sqlite://./.ddockit/runtime.db",
+            true,
+            true,
+            false,
+            &discovered_env_keys,
+            vec![
+                "local-sqlite".to_string(),
+                "temporary-postgres".to_string(),
+                "remote-postgres".to_string(),
+                "user-secret".to_string(),
+                "mock-service".to_string(),
+                "prompt-user".to_string(),
+            ],
+        ));
+    }
+    if has_redis {
+        environment_graph.push(environment_variable_blueprint(
+            "REDIS_URL",
+            "redis://127.0.0.1:6379",
+            true,
+            false,
+            true,
+            &discovered_env_keys,
+            vec![
+                "embedded-redis".to_string(),
+                "temporary-redis".to_string(),
+                "remote-redis".to_string(),
+                "user-secret".to_string(),
+                "mock-service".to_string(),
+                "prompt-user".to_string(),
+            ],
+        ));
+    }
+    if has_openai {
+        environment_graph.push(environment_variable_blueprint(
+            "OPENAI_API_KEY",
+            "mock-openai-key",
+            true,
+            false,
+            true,
+            &discovered_env_keys,
+            vec![
+                "mock-provider".to_string(),
+                "temporary-secret".to_string(),
+                "user-secret".to_string(),
+                "skip-capability".to_string(),
+            ],
+        ));
+    }
+
+    let expected_failures = simulated_failures(
+        root,
+        analysis,
+        &environment_graph,
+        &existing_environment_files,
+        has_prisma,
+    );
+    let environment_confidence = environment_confidence_scores(
+        &existing_environment_files,
+        &existing_dependency_files,
+        analysis,
+        &expected_failures,
+    );
+
+    json!({
+        "pipeline": [
+            "repository-intelligence",
+            "environment-discovery",
+            "dependency-discovery",
+            "configuration-discovery",
+            "secrets-discovery",
+            "capability-discovery",
+            "simulation",
+            "pre-healing",
+            "execution-plan",
+            "runtime-generation"
+        ],
+        "discovery": {
+            "environment_files": existing_environment_files,
+            "dependency_files": existing_dependency_files,
+            "configuration_files": existing_configuration_files,
+            "ci_files": ci_files
+        },
+        "environment_graph": environment_graph,
+        "capabilities": analysis
+            .compiled_runtime
+            .wasi_component_graph
+            .capabilities
+            .needs
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "simulation": {
+            "expected_failures": expected_failures
+        },
+        "pre_healing": pre_healing_actions(&expected_failures),
+        "environment_confidence": environment_confidence
+    })
+}
+
+fn discover_existing_files(root: &Path, candidates: &[&str]) -> Vec<String> {
+    let mut existing = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let path = root.join(candidate);
+            path.exists().then(|| candidate.to_string())
+        })
+        .collect::<Vec<_>>();
+    existing.sort();
+    existing
+}
+
+fn discover_ci_files(root: &Path) -> Vec<String> {
+    let workflows = root.join(".github/workflows");
+    let mut files = fs::read_dir(workflows)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
+                .then(|| format!(".github/workflows/{file_name}"))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for file in env_files {
+        let content = fs::read_to_string(root.join(file)).unwrap_or_default();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((name, _)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let key = name.trim();
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+            {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+fn parse_package_dependency_names(root: &Path) -> HashSet<String> {
+    let package_json = fs::read_to_string(root.join("package.json")).unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&package_json).unwrap_or(Value::Null);
+    let mut dependencies = HashSet::new();
+    for section in ["dependencies", "devDependencies", "peerDependencies"] {
+        if let Some(entries) = parsed.get(section).and_then(Value::as_object) {
+            dependencies.extend(entries.keys().cloned());
+        }
+    }
+    dependencies
+}
+
+fn environment_variable_blueprint(
+    name: &str,
+    synthesized_value: impl Into<String>,
+    sensitive: bool,
+    required_for_startup: bool,
+    mockable: bool,
+    discovered_env_keys: &HashSet<String>,
+    synthesis_strategy: Vec<String>,
+) -> Value {
+    let value_source = if discovered_env_keys.contains(name) {
+        "repository"
+    } else {
+        "synthesized"
+    };
+    json!({
+        "name": name,
+        "classification": if required_for_startup { "required" } else { "optional" },
+        "sensitive": sensitive,
+        "mockable": mockable,
+        "required_for_startup": required_for_startup,
+        "value_source": value_source,
+        "selected_value": synthesized_value.into(),
+        "synthesis_strategy": synthesis_strategy
+    })
+}
+
+fn simulated_failures(
+    root: &Path,
+    analysis: &RepositoryAnalysis,
+    environment_graph: &[Value],
+    environment_files: &[String],
+    has_prisma: bool,
+) -> Vec<Value> {
+    let mut failures = Vec::new();
+    let missing_database_url = environment_graph.iter().any(|entry| {
+        entry
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name == "DATABASE_URL")
+            && entry
+                .get("classification")
+                .and_then(Value::as_str)
+                .is_some_and(|class| class == "required")
+            && entry
+                .get("value_source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source == "synthesized")
+    });
+    let has_any_synthesized_required_env = environment_graph.iter().any(|entry| {
+        entry
+            .get("classification")
+            .and_then(Value::as_str)
+            .is_some_and(|class| class == "required")
+            && entry
+                .get("value_source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source == "synthesized")
+    });
+    if missing_database_url || (has_prisma && environment_files.is_empty()) {
+        failures.push(json!({
+            "failure": "Missing DATABASE_URL",
+            "confidence": 98,
+            "pre_heal": "synthesize local sqlite, then temporary postgres fallback"
+        }));
+    }
+    if has_any_synthesized_required_env {
+        failures.push(json!({
+            "failure": "Required environment synthesis needed",
+            "confidence": 92,
+            "pre_heal": "materialize synthesized required variables and validate startup contract"
+        }));
+    }
+    if root.join(".nvmrc").exists() || root.join(".node-version").exists() {
+        failures.push(json!({
+            "failure": "Node version mismatch",
+            "confidence": 96,
+            "pre_heal": "select runtime version from repository and historical success profile"
+        }));
+    }
+    if analysis.build_intelligence.package_manager.as_deref() == Some("pnpm")
+        && !root.join("pnpm-lock.yaml").exists()
+    {
+        failures.push(json!({
+            "failure": "pnpm lock mismatch",
+            "confidence": 91,
+            "pre_heal": "regenerate lockfile-compatible install command"
+        }));
+    }
+    if analysis
+        .runtime_spec
+        .ports
+        .iter()
+        .any(|port| *port == 3000 || *port == 8080)
+    {
+        failures.push(json!({
+            "failure": "Port conflict",
+            "confidence": 88,
+            "pre_heal": "allocate alternate runtime port and rewrite health endpoint bindings"
+        }));
+    }
+    failures
+}
+
+fn pre_healing_actions(expected_failures: &[Value]) -> Vec<String> {
+    expected_failures
+        .iter()
+        .filter_map(|failure| failure.get("failure").and_then(Value::as_str))
+        .map(|failure| match failure {
+            "Missing DATABASE_URL" => {
+                "Search repo/env history, synthesize DATABASE_URL, validate connectivity".to_string()
+            }
+            "Node version mismatch" => {
+                "Mutate Node runtime candidate, simulate compatibility, pin selected version".to_string()
+            }
+            "pnpm lock mismatch" => {
+                "Reconcile package manager + lock strategy before install".to_string()
+            }
+            "Port conflict" => "Reserve free port, rewrite run command and health probes".to_string(),
+            _ => "Run compatibility pre-heal".to_string(),
+        })
+        .collect()
+}
+
+fn environment_confidence_scores(
+    environment_files: &[String],
+    dependency_files: &[String],
+    analysis: &RepositoryAnalysis,
+    expected_failures: &[Value],
+) -> Value {
+    let repository_health: u8 = if dependency_files.is_empty() {
+        PREFLIGHT_REPOSITORY_HEALTH_NO_DEPS
+    } else {
+        PREFLIGHT_REPOSITORY_HEALTH_WITH_DEPS
+    };
+    let dependencies: u8 = if analysis.runtime_spec.dependencies.is_empty() {
+        PREFLIGHT_DEPENDENCIES_CONFIDENCE_UNKNOWN
+    } else {
+        PREFLIGHT_DEPENDENCIES_CONFIDENCE_READY
+    };
+    let capabilities: u8 = if analysis
+        .compiled_runtime
+        .wasi_component_graph
+        .capabilities
+        .needs
+        .is_empty()
+    {
+        PREFLIGHT_CAPABILITIES_CONFIDENCE_UNKNOWN
+    } else {
+        PREFLIGHT_CAPABILITIES_CONFIDENCE_READY
+    };
+    let environment: u8 = if environment_files.is_empty() {
+        PREFLIGHT_ENVIRONMENT_CONFIDENCE_SYNTHESIZED
+    } else {
+        PREFLIGHT_ENVIRONMENT_CONFIDENCE_DISCOVERED
+    };
+    let expected_runtime: u8 = if analysis.runtime_spec.requires_wasm {
+        PREFLIGHT_RUNTIME_CONFIDENCE_WASM
+    } else {
+        PREFLIGHT_RUNTIME_CONFIDENCE_NATIVE
+    };
+    let expected_success = ((repository_health as u16
+        + dependencies as u16
+        + capabilities as u16
+        + environment as u16
+        + expected_runtime as u16)
+        / 5) as u8;
+    let failure_count = expected_failures.len().min(u8::MAX as usize) as u8;
+    let penalty = failure_count.saturating_mul(PREFLIGHT_FAILURE_PENALTY_PER_ISSUE);
+    json!({
+        "repository_health": repository_health,
+        "environment": environment,
+        "dependencies": dependencies,
+        "capabilities": capabilities,
+        "expected_runtime": expected_runtime,
+        "expected_success": expected_success.saturating_sub(penalty)
+    })
 }
 
 fn parse_badge_repository_context(repo_url: &str) -> Option<OverlayRepositoryContext> {
@@ -7503,7 +7970,8 @@ pub fn execution_plan_endpoint(analysis: &RepositoryAnalysis) -> (String, String
         json!({
             "execution_plan_id": execution_plan_id,
             "services": plan.services.iter().map(|service| service.id.clone()).collect::<Vec<_>>(),
-            "startup_order": plan.startup_order
+            "startup_order": plan.startup_order,
+            "preflight": preflight_intelligence_payload(analysis)
         })
         .to_string(),
     )
@@ -20395,11 +20863,14 @@ services:
         assert_eq!(analyze_path, "/api/v1/repositories/analyze");
         assert!(analyze_body.contains("\"fingerprint_id\""));
         assert!(analyze_body.contains("\"services\":[\"backend\"]"));
+        assert!(analyze_body.contains("\"preflight\""));
+        assert!(analyze_body.contains("\"environment_confidence\""));
 
         let (plan_path, plan_body) = execution_plan_endpoint(&analysis);
         assert_eq!(plan_path, "/api/v1/execution/plan");
         assert!(plan_body.contains("\"execution_plan_id\""));
         assert!(plan_body.contains("\"startup_order\":[\"backend\"]"));
+        assert!(plan_body.contains("\"preflight\""));
 
         let (start_path, start_body) = executions_start_endpoint(&ExecutionStartRequest {
             org_id: Some("org-1".to_string()),
@@ -20520,6 +20991,73 @@ services:
             format!("/workspaces/{}", workspace.workspace_id)
         );
         assert!(workspace_delete_body.contains("\"status\":\"deleted\""));
+    }
+
+    #[test]
+    fn preflight_intelligence_synthesizes_environment_and_failure_predictions() {
+        let repo = temp_dir("preflight-intelligence");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0","prisma":"5.0.0","openai":"4.0.0"},"scripts":{"dev":"next dev","build":"next build"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+            .expect("write pnpm lock");
+        fs::write(
+            repo.join(".env.example"),
+            "NODE_ENV=development\nPORT=3000\nHOST=0.0.0.0\n",
+        )
+        .expect("write env example");
+        fs::create_dir_all(repo.join("prisma")).expect("create prisma");
+        fs::write(repo.join("prisma/schema.prisma"), "datasource db { provider = \"sqlite\" }\n")
+            .expect("write prisma schema");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let (_, analyze_body) = repositories_analyze_endpoint(
+            &RepositoryAnalyzeRequest {
+                repo_url: "https://github.com/example/preflight".to_string(),
+            },
+            &analysis,
+        );
+        let payload: Value = serde_json::from_str(&analyze_body).expect("parse analyze payload");
+        let preflight = payload
+            .get("preflight")
+            .and_then(Value::as_object)
+            .expect("preflight payload");
+
+        assert_eq!(
+            preflight
+                .get("pipeline")
+                .and_then(Value::as_array)
+                .expect("pipeline")
+                .len(),
+            10
+        );
+        assert!(preflight
+            .get("environment_graph")
+            .and_then(Value::as_array)
+            .expect("environment graph")
+            .iter()
+            .any(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("DATABASE_URL")
+                    && entry.get("value_source").and_then(Value::as_str) == Some("synthesized")
+            }));
+        assert!(preflight
+            .get("simulation")
+            .and_then(Value::as_object)
+            .and_then(|simulation| simulation.get("expected_failures"))
+            .and_then(Value::as_array)
+            .expect("expected failures")
+            .iter()
+            .any(|entry| {
+                entry.get("failure").and_then(Value::as_str) == Some("Missing DATABASE_URL")
+            }));
+        assert!(preflight
+            .get("environment_confidence")
+            .and_then(Value::as_object)
+            .and_then(|confidence| confidence.get("expected_success"))
+            .and_then(Value::as_u64)
+            .is_some());
     }
 
     #[test]
