@@ -194,13 +194,18 @@ export default function Home() {
     setRunResult(null);
 
     try {
-      const analyzeResponse = await fetch("/api/proxy/api/v1/repositories/analyze", {
+      const analyzeRequest = {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
-      });
+      };
+      const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
+      const analyzeResponse =
+        analyzeV1Response.status === 404
+          ? await fetch("/api/proxy/api/repositories/analyze", analyzeRequest)
+          : analyzeV1Response;
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
