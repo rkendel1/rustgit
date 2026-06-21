@@ -20,6 +20,18 @@ const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
 const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
 const ANALYZE_WORKSPACES_FALLBACK_PATH = "/api/proxy/workspaces";
 
+type AnalyzeEndpointResponseKind = "analyze" | "workspace";
+type AnalyzeEndpointConfig = {
+  path: string;
+  responseKind: AnalyzeEndpointResponseKind;
+};
+
+const ANALYZE_ENDPOINTS: AnalyzeEndpointConfig[] = [
+  { path: ANALYZE_V1_PATH, responseKind: "analyze" },
+  { path: ANALYZE_LEGACY_PATH, responseKind: "analyze" },
+  { path: ANALYZE_WORKSPACES_FALLBACK_PATH, responseKind: "workspace" },
+];
+
 type RepoContext = {
   owner: string;
   repo: string;
@@ -141,10 +153,10 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
 
 async function readAnalyzeResponse(
   response: Response,
-  path: string,
+  responseKind: AnalyzeEndpointResponseKind,
   fallbackRepoUrl: string,
 ): Promise<AnalyzeResponse> {
-  if (path === ANALYZE_WORKSPACES_FALLBACK_PATH) {
+  if (responseKind === "workspace") {
     return {
       repo_url: (await readJsonResponse<WorkspaceLaunchResponse>(response)).repo_url ?? fallbackRepoUrl,
     };
@@ -225,22 +237,19 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      const analyzePaths = [ANALYZE_V1_PATH, ANALYZE_LEGACY_PATH, ANALYZE_WORKSPACES_FALLBACK_PATH];
       let analyzeResponse: Response | null = null;
-      let analyzePath: string | null = null;
+      let analyzeResponseKind: AnalyzeEndpointResponseKind = "analyze";
       let lastFailure = "All endpoints failed";
 
-      for (const path of analyzePaths) {
+      for (const endpoint of ANALYZE_ENDPOINTS) {
         try {
-          const response = await fetch(path, analyzeRequest);
+          const response = await fetch(endpoint.path, analyzeRequest);
           if (response.ok) {
             analyzeResponse = response;
-            analyzePath = path;
+            analyzeResponseKind = endpoint.responseKind;
             break;
           }
-          // We consume the error response body here only for user-visible diagnostics.
-          const text = (await response.text()).slice(0, 500);
-          lastFailure = `${path} -> ${response.status}: ${text || "no response body"}`;
+          lastFailure = `${endpoint.path} -> ${response.status}`;
         } catch (error) {
           lastFailure = error instanceof Error ? error.message : String(error);
         }
@@ -252,7 +261,7 @@ export default function Home() {
 
       const analyzed = await readAnalyzeResponse(
         analyzeResponse,
-        analyzePath ?? ANALYZE_V1_PATH,
+        analyzeResponseKind,
         parsedRepo.repoUrl,
       );
       setAnalyzeResult(analyzed);
