@@ -8,6 +8,7 @@ const DEFAULT_API_BASE_URL =
   process.env.NODE_ENV === "development"
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
+const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
 
 function resolveApiBaseUrl(request: NextRequest): string {
   const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
@@ -29,20 +30,33 @@ function resolveApiBaseUrl(request: NextRequest): string {
   }
 }
 
+function appendSearchParams(source: URLSearchParams, target: URL): void {
+  source.forEach((value, key) => {
+    target.searchParams.append(key, value);
+  });
+}
+
+function buildUpstreamUrl(apiBaseUrl: string, path: string): URL {
+  const url = new URL(apiBaseUrl);
+  const basePath = url.pathname.replace(/\/+$/, "");
+  const normalizedPath = path.replace(/^\/+/, "");
+  url.pathname = `${basePath}/${normalizedPath}`.replace(/\/{2,}/g, "/");
+  return url;
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
 ): Promise<NextResponse> {
   const resolvedParams = await params;
-  const joinedPath = resolvedParams.path.join("/");
+  const joinedPath = resolvedParams.path
+    .join("/")
+    .replace(/\/{2,}/g, "/")
+    .replace(/^\/+|\/+$/g, "");
   const apiBaseUrl = resolveApiBaseUrl(request);
-  const upstreamUrl = new URL(
-    `${apiBaseUrl}/${joinedPath}`,
-  );
+  const upstreamUrl = buildUpstreamUrl(apiBaseUrl, joinedPath);
 
-  request.nextUrl.searchParams.forEach((value, key) => {
-    upstreamUrl.searchParams.append(key, value);
-  });
+  appendSearchParams(request.nextUrl.searchParams, upstreamUrl);
 
   const requestHeaders = new Headers();
   const contentType = request.headers.get("content-type");
@@ -55,15 +69,34 @@ async function proxyRequest(
     requestHeaders.set("authorization", authorization);
   }
 
-  const upstreamResponse = await fetch(upstreamUrl, {
-    method: request.method,
-    headers: requestHeaders,
-    body:
-      request.method === "GET" || request.method === "HEAD"
-        ? undefined
-        : await request.text(),
-    cache: "no-store",
-  });
+  const requestBodyBytes =
+    request.method === "GET" || request.method === "HEAD"
+      ? undefined
+      : new Uint8Array(await request.arrayBuffer());
+
+  const sendUpstreamRequest = (url: URL) =>
+    fetch(url, {
+      method: request.method,
+      headers: requestHeaders,
+      body: requestBodyBytes,
+      cache: "no-store",
+    });
+
+  let upstreamResponse = await sendUpstreamRequest(upstreamUrl);
+  const joinedSegments = joinedPath.split("/");
+  const hasProxyPrefix =
+    joinedSegments.length >= 2 &&
+    joinedSegments[0] === UPSTREAM_PROXY_PREFIX_SEGMENTS[0] &&
+    joinedSegments[1] === UPSTREAM_PROXY_PREFIX_SEGMENTS[1];
+  const canRetryWithProxyPrefix = !hasProxyPrefix;
+  if (upstreamResponse.status === 404 && canRetryWithProxyPrefix) {
+    const proxiedUpstreamUrl = buildUpstreamUrl(
+      apiBaseUrl,
+      `${UPSTREAM_PROXY_PREFIX_SEGMENTS.join("/")}/${joinedPath}`,
+    );
+    appendSearchParams(request.nextUrl.searchParams, proxiedUpstreamUrl);
+    upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
+  }
 
   return new NextResponse(upstreamResponse.body, {
     status: upstreamResponse.status,
