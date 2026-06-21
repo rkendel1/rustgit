@@ -85,6 +85,7 @@ async function proxyRequest(
   let upstreamResponse = await sendUpstreamRequest(upstreamUrl);
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
+    joinedSegments.length >= 2 &&
     joinedSegments[0] === UPSTREAM_PROXY_PREFIX_SEGMENTS[0] &&
     joinedSegments[1] === UPSTREAM_PROXY_PREFIX_SEGMENTS[1];
   const canRetryWithProxyPrefix = !hasProxyPrefix;
