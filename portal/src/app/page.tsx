@@ -208,8 +208,18 @@ export default function Home() {
           analyzeV1Response.status === 404
             ? await fetch("/api/proxy/api/repositories/analyze", analyzeRequest)
             : analyzeV1Response;
-      } catch {
-        analyzeResponse = await fetch("/api/proxy/api/repositories/analyze", analyzeRequest);
+      } catch (primaryError) {
+        try {
+          analyzeResponse = await fetch("/api/proxy/api/repositories/analyze", analyzeRequest);
+        } catch (fallbackError) {
+          const primaryMessage =
+            primaryError instanceof Error ? primaryError.message : "unknown primary failure";
+          const fallbackMessage =
+            fallbackError instanceof Error ? fallbackError.message : "unknown fallback failure";
+          throw new Error(
+            `Analyze request failed for both endpoints: ${primaryMessage}; fallback: ${fallbackMessage}`,
+          );
+        }
       }
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
