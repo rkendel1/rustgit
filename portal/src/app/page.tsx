@@ -17,28 +17,7 @@ const NO_REPOSITORY_SELECTED = "No repository selected";
 const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
 const PORTAL_DEVICE_FINGERPRINT = "portal-home";
-const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
-const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
-const ANALYZE_EXECUTIONS_FALLBACK_PATH = "/api/proxy/api/v1/executions";
-const ANALYZE_WORKSPACES_FALLBACK_PATH_V1 = "/api/proxy/api/v1/workspaces";
-const ANALYZE_WORKSPACES_FALLBACK_PATH_API = "/api/proxy/api/workspaces";
-const ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT = "/api/proxy/workspaces";
-const ANALYZE_RETRYABLE_STATUS_CODES = new Set([404, 405, 502, 503, 504]);
-
-type AnalyzeEndpointResponseKind = "analyze" | "workspace";
-type AnalyzeEndpointConfig = {
-  path: string;
-  responseKind: AnalyzeEndpointResponseKind;
-};
-
-const ANALYZE_ENDPOINTS: AnalyzeEndpointConfig[] = [
-  { path: ANALYZE_V1_PATH, responseKind: "analyze" },
-  { path: ANALYZE_LEGACY_PATH, responseKind: "analyze" },
-  { path: ANALYZE_EXECUTIONS_FALLBACK_PATH, responseKind: "workspace" },
-  { path: ANALYZE_WORKSPACES_FALLBACK_PATH_V1, responseKind: "workspace" },
-  { path: ANALYZE_WORKSPACES_FALLBACK_PATH_API, responseKind: "workspace" },
-  { path: ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT, responseKind: "workspace" },
-];
+const ANALYZE_PATH = "/api/proxy/api/analyze";
 
 type RepoContext = {
   owner: string;
@@ -47,14 +26,11 @@ type RepoContext = {
 };
 
 type AnalyzeResponse = {
+  repo?: string;
   repo_url?: string;
   fingerprint_id?: string;
   frameworks?: string[];
   services?: string[];
-};
-
-type WorkspaceLaunchResponse = {
-  repo_url?: string;
 };
 
 type RunResponse = {
@@ -165,23 +141,6 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
-async function readAnalyzeResponse(
-  response: Response,
-  responseKind: AnalyzeEndpointResponseKind,
-  fallbackRepoUrl: string,
-): Promise<AnalyzeResponse> {
-  if (responseKind === "workspace") {
-    try {
-      return {
-        repo_url: (await readJsonResponse<WorkspaceLaunchResponse>(response)).repo_url ?? fallbackRepoUrl,
-      };
-    } catch {
-      return { repo_url: fallbackRepoUrl };
-    }
-  }
-  return readJsonResponse<AnalyzeResponse>(response);
-}
-
 export default function Home() {
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
@@ -271,39 +230,8 @@ export default function Home() {
           commit: null,
         }),
       };
-      let analyzeResponse: Response | null = null;
-      let analyzeResponseKind: AnalyzeEndpointResponseKind = "analyze";
-      let lastFailure = "";
-
-      for (const endpoint of ANALYZE_ENDPOINTS) {
-        try {
-          const response = await fetch(endpoint.path, analyzeRequest);
-          if (response.ok) {
-            analyzeResponse = response;
-            analyzeResponseKind = endpoint.responseKind;
-            break;
-          }
-          lastFailure = `${endpoint.path} -> ${response.status} ${response.statusText}`;
-          if (!ANALYZE_RETRYABLE_STATUS_CODES.has(response.status)) {
-            break;
-          }
-        } catch (error) {
-          lastFailure = error instanceof Error ? error.message : String(error);
-          break;
-        }
-      }
-
-      if (!analyzeResponse) {
-        throw new Error(
-          `Analyze request failed across all endpoints${lastFailure ? `: ${lastFailure}` : "."}`,
-        );
-      }
-
-      const analyzed = await readAnalyzeResponse(
-        analyzeResponse,
-        analyzeResponseKind,
-        parsedRepo.repoUrl,
-      );
+      const analyzeResponse = await fetch(ANALYZE_PATH, analyzeRequest);
+      const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
 
