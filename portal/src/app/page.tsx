@@ -28,13 +28,17 @@ type RunResponse = {
   status?: string;
 };
 
-function hashToken(value: string): string {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash << 5) - hash + value.charCodeAt(index);
-    hash |= 0;
+function createAnonymousId(prefix: string): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
   }
-  return Math.abs(hash).toString(36);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    return `${prefix}-${hex}`;
+  }
+  return `${prefix}-${Date.now()}`;
 }
 
 function parseRepositoryInput(input: string): RepoContext | null {
@@ -96,6 +100,11 @@ export default function Home() {
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
 
   const parsedRepo = useMemo(() => parseRepositoryInput(repository), [repository]);
+  const canRun =
+    !running &&
+    Boolean(parsedRepo) &&
+    Boolean(analyzeResult) &&
+    analyzedRepoUrl === parsedRepo?.repoUrl;
 
   async function handleAnalyze() {
     if (!parsedRepo) {
@@ -110,15 +119,18 @@ export default function Home() {
       const response = await fetch("/api/proxy/api/v1/repositories/analyze", {
         method: "POST",
         headers: {
-          "content-type": "application/json",
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       });
 
-      const body = (await response.json()) as AnalyzeResponse;
+      const responseText = await response.text();
       if (!response.ok) {
-        throw new Error(`Analyze failed (${response.status})`);
+        throw new Error(
+          `Analyze failed (${response.status}): ${responseText || "no response body"}`,
+        );
       }
+      const body = JSON.parse(responseText) as AnalyzeResponse;
       setAnalyzeResult(body);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
     } catch (caught) {
@@ -139,18 +151,16 @@ export default function Home() {
     setError(null);
     setRunning(true);
     try {
-      const anonUserSuffix = hashToken(parsedRepo.repoUrl).slice(0, 10);
-      const anonSessionSuffix = hashToken(`${parsedRepo.repoUrl}:${branch}`).slice(0, 10);
       const response = await fetch("/api/proxy/api/v1/executions", {
         method: "POST",
         headers: {
-          "content-type": "application/json",
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
           org_id: null,
           user_id: null,
-          anon_user_id: `anon-portal-${anonUserSuffix}`,
-          anon_session_id: `portal-${anonSessionSuffix}`,
+          anon_user_id: createAnonymousId("anon-portal"),
+          anon_session_id: createAnonymousId("portal-session"),
           device_fingerprint: "portal-home",
           repo_url: parsedRepo.repoUrl,
           branch: branch.trim() || "main",
@@ -158,10 +168,11 @@ export default function Home() {
         }),
       });
 
-      const body = (await response.json()) as RunResponse;
+      const responseText = await response.text();
       if (!response.ok) {
-        throw new Error(`Run failed (${response.status})`);
+        throw new Error(`Run failed (${response.status}): ${responseText || "no response body"}`);
       }
+      const body = JSON.parse(responseText) as RunResponse;
       setRunResult(body);
     } catch (caught) {
       setRunResult(null);
@@ -207,6 +218,8 @@ export default function Home() {
               setRepository(event.target.value);
               setAnalyzeResult(null);
               setAnalyzedRepoUrl(null);
+              setRunResult(null);
+              setError(null);
             }}
             placeholder="owner/repo or https://github.com/owner/repo"
             style={{
@@ -250,19 +263,14 @@ export default function Home() {
             <button
               type="button"
               onClick={handleRun}
-              disabled={
-                running ||
-                !parsedRepo ||
-                !analyzeResult ||
-                analyzedRepoUrl !== parsedRepo.repoUrl
-              }
+              disabled={!canRun}
               style={{
                 background: "#0f766e",
                 color: "#ffffff",
                 border: 0,
                 borderRadius: "0.5rem",
                 padding: "0.6rem 0.9rem",
-                cursor: running ? "wait" : "pointer",
+                cursor: canRun ? "pointer" : "not-allowed",
               }}
             >
               {running ? "Running..." : "2) Run"}
@@ -286,7 +294,7 @@ export default function Home() {
           >
             <h2 style={{ marginBottom: "0.5rem" }}>Analysis</h2>
             <p style={{ marginBottom: "0.35rem" }}>
-              Repository: <code>{analyzeResult.repo_url ?? parsedRepo?.repoUrl}</code>
+              Repository: <code>{analyzeResult.repo_url ?? "n/a"}</code>
             </p>
             <p style={{ marginBottom: "0.35rem" }}>
               Fingerprint: <code>{analyzeResult.fingerprint_id ?? "pending"}</code>
