@@ -36,14 +36,25 @@ function appendSearchParams(source: URLSearchParams, target: URL): void {
   });
 }
 
+function buildUpstreamUrl(apiBaseUrl: string, path: string): URL {
+  const url = new URL(apiBaseUrl);
+  const basePath = url.pathname.replace(/\/+$/, "");
+  const normalizedPath = path.replace(/^\/+/, "");
+  url.pathname = `${basePath}/${normalizedPath}`.replace(/\/{2,}/g, "/");
+  return url;
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
 ): Promise<NextResponse> {
   const resolvedParams = await params;
-  const joinedPath = resolvedParams.path.join("/").replace(/^\/+/, "");
+  const joinedPath = resolvedParams.path
+    .join("/")
+    .replace(/\/{2,}/g, "/")
+    .replace(/^\/+|\/+$/g, "");
   const apiBaseUrl = resolveApiBaseUrl(request);
-  const upstreamUrl = new URL(`${apiBaseUrl}/${joinedPath}`);
+  const upstreamUrl = buildUpstreamUrl(apiBaseUrl, joinedPath);
 
   appendSearchParams(request.nextUrl.searchParams, upstreamUrl);
 
@@ -77,7 +88,10 @@ async function proxyRequest(
     joinedPath.startsWith(`${UPSTREAM_PROXY_PREFIX}/`);
   const canRetryWithProxyPrefix = !hasProxyPrefix;
   if (upstreamResponse.status === 404 && canRetryWithProxyPrefix) {
-    const proxiedUpstreamUrl = new URL(`${apiBaseUrl}/${UPSTREAM_PROXY_PREFIX}/${joinedPath}`);
+    const proxiedUpstreamUrl = buildUpstreamUrl(
+      apiBaseUrl,
+      `${UPSTREAM_PROXY_PREFIX}/${joinedPath}`,
+    );
     appendSearchParams(request.nextUrl.searchParams, proxiedUpstreamUrl);
     upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
   }
