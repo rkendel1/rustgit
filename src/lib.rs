@@ -3074,6 +3074,134 @@ pub struct RuntimeServicePlan {
     pub ports: Vec<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapabilitySet {
+    pub needs: BTreeSet<String>,
+}
+
+impl CapabilitySet {
+    pub fn insert(&mut self, capability: impl Into<String>) {
+        self.needs.insert(capability.into());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConstraints {
+    pub read_only_paths: Vec<String>,
+    pub network_allowlist: Vec<String>,
+    pub max_memory_mb: u32,
+    pub max_cpu_units: u32,
+    pub process_spawn_bounded: bool,
+}
+
+impl Default for RuntimeConstraints {
+    fn default() -> Self {
+        Self {
+            read_only_paths: vec!["/workspace".to_string()],
+            network_allowlist: vec![],
+            max_memory_mb: RUNTIME_SPEC_DEFAULT_MEMORY_LIMIT_MB,
+            max_cpu_units: RUNTIME_SPEC_DEFAULT_CPU_LIMIT_UNITS,
+            process_spawn_bounded: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasiComponent {
+    pub id: String,
+    pub module: String,
+    pub imports: Vec<String>,
+    pub exports: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasiLink {
+    pub from_component: String,
+    pub to_component: String,
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasiComponentGraph {
+    pub components: Vec<WasiComponent>,
+    pub links: Vec<WasiLink>,
+    pub capabilities: CapabilitySet,
+    pub imports: Vec<String>,
+    pub exports: Vec<String>,
+    pub runtime_constraints: RuntimeConstraints,
+    pub execution_plan: ExecutionPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WasiLinker;
+
+impl WasiLinker {
+    pub fn resolve(imports: &[String], exports: &[String]) -> Vec<WasiLink> {
+        imports
+            .iter()
+            .filter_map(|import| {
+                let (import_component, import_capability) = import
+                    .trim_start_matches("import:")
+                    .split_once(':')
+                    .unwrap_or_default();
+                exports
+                    .iter()
+                    .find(|export| {
+                        export
+                            .trim_start_matches("export:")
+                            .split_once(':')
+                            .map(|(_, capability)| capability == import_capability)
+                            .unwrap_or(false)
+                    })
+                    .map(|export| WasiLink {
+                        from_component: export
+                            .trim_start_matches("export:")
+                            .split_once(':')
+                            .map(|(component, _)| component.to_string())
+                            .unwrap_or_default(),
+                        to_component: import_component.to_string(),
+                        capability: import_capability.to_string(),
+                    })
+            })
+            .collect()
+    }
+
+    pub fn validate(capabilities: &CapabilitySet, graph: &WasiComponentGraph) -> bool {
+        capabilities.needs.iter().all(|need| {
+            graph
+                .components
+                .iter()
+                .any(|component| component.capabilities.iter().any(|capability| capability == need))
+        })
+    }
+
+    pub fn enforce_security_model(graph: &mut WasiComponentGraph) {
+        graph.runtime_constraints.read_only_paths.sort();
+        graph.runtime_constraints.read_only_paths.dedup();
+        graph.runtime_constraints.network_allowlist.sort();
+        graph.runtime_constraints.network_allowlist.dedup();
+        graph.runtime_constraints.process_spawn_bounded = true;
+    }
+
+    pub fn optimize_graph(graph: &mut WasiComponentGraph) {
+        graph.components.sort_by(|a, b| a.id.cmp(&b.id));
+        graph.components.dedup_by(|a, b| a.id == b.id);
+        graph.links.sort_by(|a, b| {
+            (&a.from_component, &a.to_component, &a.capability).cmp(&(
+                &b.from_component,
+                &b.to_component,
+                &b.capability,
+            ))
+        });
+        graph.links.dedup();
+        graph.imports.sort();
+        graph.imports.dedup();
+        graph.exports.sort();
+        graph.exports.dedup();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionRuntimeSpec {
     pub language: String,
@@ -3102,6 +3230,7 @@ pub struct CompiledWasmExecutionEnvironment {
     pub warm_pool_key: String,
     pub deterministic: bool,
     pub component_graph: Vec<String>,
+    pub wasi_component_graph: WasiComponentGraph,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -11874,6 +12003,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
             warm_pool_key: "unknown".to_string(),
             deterministic: true,
             component_graph: vec![],
+            wasi_component_graph: WasiComponentGraph::default(),
         },
     };
     analysis.execution_graph = BuildPlanner::build_graph(&analysis)
@@ -12579,12 +12709,152 @@ impl WasmRuntimeCompiler {
         component_graph.sort();
         component_graph.dedup();
 
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert("filesystem.read");
+        capabilities.insert("filesystem.write");
+        if spec.network_policy.allow_outbound {
+            capabilities.insert("network.http");
+        }
+        if !spec.execution_steps.is_empty() {
+            capabilities.insert("process.spawn");
+        }
+        if spec.requires_wasm {
+            capabilities.insert("wasi.runtime");
+        }
+        if !spec.framework.is_empty() && spec.framework != UNKNOWN_SIGNATURE {
+            capabilities.insert(format!("{}.framework", spec.framework));
+        }
+        if let Some(package_manager) = spec.package_manager.as_deref() {
+            capabilities.insert(format!("{package_manager}.package_manager"));
+        }
+        if !spec.language.is_empty() && spec.language != UNKNOWN_SIGNATURE {
+            capabilities.insert(format!("{}.runtime", spec.language));
+        }
+
+        let mut components = vec![
+            WasiComponent {
+                id: "filesystem".to_string(),
+                module: "filesystem.wasm".to_string(),
+                imports: vec![],
+                exports: vec!["filesystem.read".to_string(), "filesystem.write".to_string()],
+                capabilities: vec!["filesystem.read".to_string(), "filesystem.write".to_string()],
+            },
+            WasiComponent {
+                id: "network".to_string(),
+                module: "network.wasm".to_string(),
+                imports: vec!["filesystem.write".to_string()],
+                exports: vec!["network.http".to_string()],
+                capabilities: vec!["network.http".to_string()],
+            },
+            WasiComponent {
+                id: "process".to_string(),
+                module: "process.wasm".to_string(),
+                imports: vec!["filesystem.read".to_string()],
+                exports: vec!["process.spawn".to_string()],
+                capabilities: vec!["process.spawn".to_string()],
+            },
+        ];
+
+        match spec.language.as_str() {
+            "javascript" | "typescript" => {
+                components.push(WasiComponent {
+                    id: "nodejs".to_string(),
+                    module: "nodejs.wasm".to_string(),
+                    imports: vec!["process.spawn".to_string()],
+                    exports: vec!["javascript.runtime".to_string()],
+                    capabilities: vec!["javascript.runtime".to_string()],
+                });
+            }
+            "python" => {
+                components.push(WasiComponent {
+                    id: "python".to_string(),
+                    module: "python.wasm".to_string(),
+                    imports: vec!["process.spawn".to_string()],
+                    exports: vec!["python.runtime".to_string()],
+                    capabilities: vec!["python.runtime".to_string()],
+                });
+            }
+            "rust" => {
+                components.push(WasiComponent {
+                    id: "rust".to_string(),
+                    module: "rust.wasm".to_string(),
+                    imports: vec!["process.spawn".to_string()],
+                    exports: vec!["rust.runtime".to_string()],
+                    capabilities: vec!["rust.runtime".to_string()],
+                });
+            }
+            _ => {}
+        }
+
+        if let Some(package_manager) = spec.package_manager.as_deref() {
+            components.push(WasiComponent {
+                id: package_manager.to_string(),
+                module: format!("{package_manager}.wasm"),
+                imports: vec!["network.http".to_string(), "filesystem.read".to_string()],
+                exports: vec![format!("{package_manager}.package_manager")],
+                capabilities: vec![format!("{package_manager}.package_manager")],
+            });
+        }
+
+        if spec.requires_wasm {
+            components.push(WasiComponent {
+                id: "wasi".to_string(),
+                module: "wasi.wasm".to_string(),
+                imports: vec!["filesystem.read".to_string()],
+                exports: vec!["wasi.runtime".to_string()],
+                capabilities: vec!["wasi.runtime".to_string()],
+            });
+        }
+
+        let imports = components
+            .iter()
+            .flat_map(|component| {
+                component
+                    .imports
+                    .iter()
+                    .map(move |import| format!("import:{}:{import}", component.id))
+            })
+            .collect::<Vec<_>>();
+        let exports = components
+            .iter()
+            .flat_map(|component| {
+                component
+                    .exports
+                    .iter()
+                    .map(move |export| format!("export:{}:{export}", component.id))
+            })
+            .collect::<Vec<_>>();
+        let links = WasiLinker::resolve(&imports, &exports);
+
+        let mut execution_plan = ExecutionPlan::default();
+        execution_plan.startup_order = components.iter().map(|component| component.id.clone()).collect();
+        execution_plan.ordered_nodes = execution_plan.startup_order.clone();
+
+        let mut wasi_component_graph = WasiComponentGraph {
+            components,
+            links,
+            capabilities,
+            imports,
+            exports,
+            runtime_constraints: RuntimeConstraints {
+                read_only_paths: vec!["/workspace".to_string()],
+                network_allowlist: spec.network_policy.allowed_hosts.clone(),
+                max_memory_mb: spec.memory_limit_mb,
+                max_cpu_units: spec.cpu_limit_units,
+                process_spawn_bounded: true,
+            },
+            execution_plan,
+        };
+        WasiLinker::optimize_graph(&mut wasi_component_graph);
+        WasiLinker::enforce_security_model(&mut wasi_component_graph);
+
         CompiledWasmExecutionEnvironment {
             environment_id,
             spec_fingerprint,
             warm_pool_key,
             deterministic: true,
             component_graph,
+            wasi_component_graph,
         }
     }
 }
@@ -15250,6 +15520,7 @@ mod tests {
                 warm_pool_key: "unknown".to_string(),
                 deterministic: true,
                 component_graph: vec![],
+                wasi_component_graph: WasiComponentGraph::default(),
             },
         };
         let runtime_spec = ExecutionRuntimeSpecCompiler::compile(&analysis_seed);
@@ -15600,6 +15871,80 @@ dependencies:
             .compiled_runtime
             .component_graph
             .contains(&"node-runtime".to_string()));
+        assert!(analysis
+            .compiled_runtime
+            .wasi_component_graph
+            .components
+            .iter()
+            .any(|component| component.module == "nodejs.wasm"));
+        assert!(analysis
+            .compiled_runtime
+            .wasi_component_graph
+            .capabilities
+            .needs
+            .contains("pnpm.package_manager"));
+        assert!(WasiLinker::validate(
+            &analysis.compiled_runtime.wasi_component_graph.capabilities,
+            &analysis.compiled_runtime.wasi_component_graph
+        ));
+        assert!(!analysis
+            .compiled_runtime
+            .wasi_component_graph
+            .links
+            .is_empty());
+    }
+
+    #[test]
+    fn wasi_linker_resolves_imports_and_enforces_constraints() {
+        let spec = ExecutionRuntimeSpec {
+            language: "rust".to_string(),
+            framework: "unknown".to_string(),
+            package_manager: Some("cargo".to_string()),
+            dependencies: vec!["Cargo.toml".to_string()],
+            filesystem: RuntimeFilesystemPlan {
+                read_only_layers: vec!["repository-snapshot".to_string()],
+                dependency_cache_layer: "dependency-cache".to_string(),
+                build_cache_layer: "build-cache".to_string(),
+                execution_layer: "execution-layer".to_string(),
+                temporary_layer: "temporary-layer".to_string(),
+                copy_on_write: true,
+            },
+            network_policy: NetworkPolicy {
+                allow_outbound: true,
+                allowed_hosts: vec!["crates.io".to_string(), "crates.io".to_string()],
+            },
+            memory_limit_mb: 512,
+            cpu_limit_units: 1_000,
+            cache_layers: vec![],
+            environment: BTreeMap::new(),
+            ports: vec![],
+            services: vec![],
+            build_steps: vec!["cargo build".to_string()],
+            execution_steps: vec!["cargo test".to_string()],
+            health_checks: vec!["/health".to_string()],
+            recovery_steps: vec!["retry-with-warm-pool".to_string()],
+            requires_wasm: true,
+        };
+
+        let compiled = WasmRuntimeCompiler::compile(&spec);
+        let graph = compiled.wasi_component_graph;
+        assert!(graph.components.iter().any(|component| component.id == "rust"));
+        assert!(graph.components.iter().any(|component| component.id == "cargo"));
+        assert!(graph
+            .runtime_constraints
+            .network_allowlist
+            .contains(&"crates.io".to_string()));
+        assert_eq!(
+            graph
+                .runtime_constraints
+                .network_allowlist
+                .iter()
+                .filter(|host| host.as_str() == "crates.io")
+                .count(),
+            1
+        );
+        assert!(WasiLinker::validate(&graph.capabilities, &graph));
+        assert!(!graph.links.is_empty());
     }
 
     #[test]
