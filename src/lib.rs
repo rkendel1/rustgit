@@ -12,6 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
 mod architecture_docs;
+mod execution_context;
+mod execution_embeddings;
+mod execution_learning;
+mod execution_memory;
+mod execution_optimizer;
+mod execution_retriever;
 mod postgres_db;
 mod repository_context_builder;
 mod repository_embeddings;
@@ -22,6 +28,12 @@ pub use architecture_docs::{
     analyze_architecture_from_source, extract_execution_flow_from_source, generate_grounded_docs,
     ArchitectureSnapshot, CallGraph, ExecutionFlowGraph, GeneratedDocs,
 };
+pub use execution_context::ExecutionContextBuilder;
+pub use execution_embeddings::{fingerprint_embedding, ExecutionEmbedding};
+pub use execution_learning::ExecutionLearningEngine;
+pub use execution_memory::{ExecutionContextSnapshot, ExecutionMemory, ExecutionPattern};
+pub use execution_optimizer::{ExecutionOptimizer, OptimizedExecutionPlan};
+pub use execution_retriever::ExecutionRetriever;
 pub use postgres_db::{
     deserialize_string_array, infer_repository_from_commits, ExecutionIntelligencePersistenceError,
     ExecutionIntelligencePostgresStore, ExecutionIntelligenceReadStore, PersistenceResult,
@@ -7771,6 +7783,40 @@ pub struct EidbRepositoryAnswerRecord {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbExecutionEmbeddingRecord {
+    pub id: String,
+    pub repository_id: String,
+    pub commit_sha: String,
+    pub fingerprint_hash: String,
+    pub embedding: Vec<f32>,
+    pub language: String,
+    pub framework: String,
+    pub runtime: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbExecutionPatternRecord {
+    pub id: String,
+    pub fingerprint: String,
+    pub failure_type: String,
+    pub repair: String,
+    pub success_rate: f64,
+    pub execution_count: u64,
+    pub average_duration: f64,
+    pub average_cost: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbExecutionContextRecord {
+    pub execution_id: String,
+    pub similar_execution_ids: Vec<String>,
+    pub retrieved_patterns: Vec<String>,
+    pub generated_plan: String,
+    pub chosen_plan: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IdentityMergeEngine;
 
@@ -7816,6 +7862,9 @@ pub struct ExecutionIntelligenceDatabase {
     pub repository_context_snapshots: Vec<EidbRepositoryContextSnapshotRecord>,
     pub repository_questions: Vec<EidbRepositoryQuestionRecord>,
     pub repository_answers: Vec<EidbRepositoryAnswerRecord>,
+    pub execution_embeddings: Vec<EidbExecutionEmbeddingRecord>,
+    pub execution_patterns: Vec<EidbExecutionPatternRecord>,
+    pub execution_contexts: Vec<EidbExecutionContextRecord>,
 }
 
 impl ExecutionIntelligenceDatabase {
@@ -7828,6 +7877,7 @@ impl ExecutionIntelligenceDatabase {
             include_str!("../migrations/0005_anonymous_execution_identity.sql"),
             include_str!("../migrations/0006_repository_identity_and_healing_repairs.sql"),
             include_str!("../migrations/0007_repository_intelligence_rag.sql"),
+            include_str!("../migrations/0008_execution_intelligence_feedback_loop.sql"),
         ]
     }
 
@@ -7865,6 +7915,18 @@ impl ExecutionIntelligenceDatabase {
 
     pub fn record_repository_answer(&mut self, answer: EidbRepositoryAnswerRecord) {
         self.repository_answers.push(answer);
+    }
+
+    pub fn record_execution_embedding(&mut self, embedding: EidbExecutionEmbeddingRecord) {
+        self.execution_embeddings.push(embedding);
+    }
+
+    pub fn record_execution_pattern(&mut self, pattern: EidbExecutionPatternRecord) {
+        self.execution_patterns.push(pattern);
+    }
+
+    pub fn record_execution_context(&mut self, context: EidbExecutionContextRecord) {
+        self.execution_contexts.push(context);
     }
 
     pub fn last_good_commit_for_repository(&self, repository_id: &str) -> Option<&str> {
@@ -8144,6 +8206,362 @@ pub fn repository_ask_endpoint_with_store(
         })
         .to_string(),
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntelligenceRetrieveRequest {
+    pub execution_id: String,
+    pub repository_id: String,
+    pub fingerprint_hash: String,
+    pub generated_plan: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntelligenceLearnRequest {
+    pub execution_id: String,
+    pub repository_id: String,
+    pub commit_sha: String,
+    pub fingerprint_hash: String,
+    pub generated_plan: String,
+    pub chosen_plan: String,
+    pub status: String,
+    pub duration_seconds: Option<u64>,
+    pub cost_units: Option<f64>,
+    pub repair: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntelligenceOptimizeRequest {
+    pub execution_id: String,
+    pub fingerprint_hash: String,
+    pub generated_plan: String,
+    pub failure_type: Option<String>,
+}
+
+pub fn intelligence_execution_endpoint(
+    execution_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let execution = database
+        .executions
+        .iter()
+        .find(|entry| entry.execution_id == execution_id);
+    let context = database
+        .execution_contexts
+        .iter()
+        .find(|entry| entry.execution_id == execution_id);
+    (
+        format!("/intelligence/{execution_id}"),
+        json!({
+            "execution_id": execution_id,
+            "execution": execution,
+            "context": context,
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_similar_endpoint(
+    fingerprint_hash: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let retriever = ExecutionRetriever {
+        memories: database
+            .execution_contexts
+            .iter()
+            .filter_map(|context| {
+                database
+                    .executions
+                    .iter()
+                    .find(|execution| execution.execution_id == context.execution_id)
+                    .map(|execution| ExecutionMemory {
+                        execution_id: execution.execution_id.clone(),
+                        repository_id: execution.repository_id.clone(),
+                        commit_sha: execution.commit_hash.clone(),
+                        fingerprint_hash: fingerprint_hash.to_string(),
+                        generated_plan: context.generated_plan.clone(),
+                        chosen_plan: context.chosen_plan.clone(),
+                        success: eidb_execution_status_is_success(&execution.status),
+                        failure_type: (!eidb_execution_status_is_success(&execution.status))
+                            .then(|| ExecutionLearningEngine::classify_failure(&execution.status)),
+                        repair: None,
+                        duration_seconds: execution
+                            .completed_at
+                            .map(|completed| completed.saturating_sub(execution.started_at)),
+                        cost_units: None,
+                    })
+            })
+            .collect(),
+        patterns: vec![],
+    };
+    (
+        "/intelligence/similar".to_string(),
+        json!({
+            "fingerprint_hash": fingerprint_hash,
+            "similar_executions": retriever.similar_executions(fingerprint_hash, 10),
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_patterns_endpoint(
+    fingerprint_hash: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let patterns = database
+        .execution_patterns
+        .iter()
+        .filter(|entry| entry.fingerprint == fingerprint_hash)
+        .cloned()
+        .collect::<Vec<_>>();
+    (
+        "/intelligence/patterns".to_string(),
+        json!({
+            "fingerprint_hash": fingerprint_hash,
+            "patterns": patterns,
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_repairs_endpoint(
+    fingerprint_hash: &str,
+    failure_type: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let retriever = ExecutionRetriever {
+        memories: vec![],
+        patterns: database
+            .execution_patterns
+            .iter()
+            .map(|entry| ExecutionPattern {
+                fingerprint: entry.fingerprint.clone(),
+                failure_type: entry.failure_type.clone(),
+                repair: entry.repair.clone(),
+                success_rate: entry.success_rate,
+                execution_count: entry.execution_count,
+                average_duration: entry.average_duration,
+                average_cost: entry.average_cost,
+            })
+            .collect(),
+    };
+    (
+        "/intelligence/repairs".to_string(),
+        json!({
+            "fingerprint_hash": fingerprint_hash,
+            "failure_type": failure_type,
+            "repairs": retriever.patterns_for_failure(fingerprint_hash, failure_type, 10),
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_context_endpoint(
+    execution_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let context = database
+        .execution_contexts
+        .iter()
+        .find(|entry| entry.execution_id == execution_id);
+    (
+        "/intelligence/context".to_string(),
+        json!({
+            "execution_id": execution_id,
+            "context": context,
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_retrieve_endpoint(
+    request: &IntelligenceRetrieveRequest,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let retriever = ExecutionRetriever {
+        memories: database
+            .execution_contexts
+            .iter()
+            .filter_map(|context| {
+                database
+                    .executions
+                    .iter()
+                    .find(|execution| execution.execution_id == context.execution_id)
+                    .map(|execution| ExecutionMemory {
+                        execution_id: execution.execution_id.clone(),
+                        repository_id: execution.repository_id.clone(),
+                        commit_sha: execution.commit_hash.clone(),
+                        fingerprint_hash: request.fingerprint_hash.clone(),
+                        generated_plan: context.generated_plan.clone(),
+                        chosen_plan: context.chosen_plan.clone(),
+                        success: eidb_execution_status_is_success(&execution.status),
+                        failure_type: (!eidb_execution_status_is_success(&execution.status))
+                            .then(|| ExecutionLearningEngine::classify_failure(&execution.status)),
+                        repair: None,
+                        duration_seconds: execution
+                            .completed_at
+                            .map(|completed| completed.saturating_sub(execution.started_at)),
+                        cost_units: None,
+                    })
+            })
+            .collect(),
+        patterns: vec![],
+    };
+    let similar = retriever.similar_executions(request.fingerprint_hash.as_str(), request.limit.unwrap_or(10));
+    (
+        "/intelligence/retrieve".to_string(),
+        json!({
+            "execution_id": request.execution_id,
+            "repository_id": request.repository_id,
+            "similar_executions": similar,
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_learn_endpoint(
+    request: &IntelligenceLearnRequest,
+    database: &mut ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let embedding = fingerprint_embedding(request.fingerprint_hash.as_str());
+    database.record_execution_embedding(EidbExecutionEmbeddingRecord {
+        id: format!("embedding-{}", request.execution_id),
+        repository_id: request.repository_id.clone(),
+        commit_sha: request.commit_sha.clone(),
+        fingerprint_hash: request.fingerprint_hash.clone(),
+        embedding,
+        language: "unknown".to_string(),
+        framework: "unknown".to_string(),
+        runtime: "unknown".to_string(),
+        created_at: now_epoch_seconds(),
+    });
+
+    let failure_type = ExecutionLearningEngine::classify_failure(&request.status);
+    let success = eidb_execution_status_is_success(&request.status);
+    let repair = request.repair.clone().unwrap_or_else(|| "none".to_string());
+
+    let mut patterns = database
+        .execution_patterns
+        .iter()
+        .map(|entry| ExecutionPattern {
+            fingerprint: entry.fingerprint.clone(),
+            failure_type: entry.failure_type.clone(),
+            repair: entry.repair.clone(),
+            success_rate: entry.success_rate,
+            execution_count: entry.execution_count,
+            average_duration: entry.average_duration,
+            average_cost: entry.average_cost,
+        })
+        .collect::<Vec<_>>();
+    ExecutionLearningEngine::learn_pattern(
+        &mut patterns,
+        request.fingerprint_hash.as_str(),
+        failure_type.as_str(),
+        repair.as_str(),
+        success,
+        request.duration_seconds.unwrap_or_default() as f64,
+        request.cost_units.unwrap_or_default(),
+    );
+    database.execution_patterns = patterns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, entry)| EidbExecutionPatternRecord {
+            id: format!("pattern-{idx}"),
+            fingerprint: entry.fingerprint,
+            failure_type: entry.failure_type,
+            repair: entry.repair,
+            success_rate: entry.success_rate,
+            execution_count: entry.execution_count,
+            average_duration: entry.average_duration,
+            average_cost: entry.average_cost,
+        })
+        .collect();
+
+    (
+        "/intelligence/learn".to_string(),
+        json!({
+            "execution_id": request.execution_id,
+            "learned_failure_type": failure_type,
+            "patterns": database.execution_patterns,
+        })
+        .to_string(),
+    )
+}
+
+pub fn intelligence_optimize_endpoint(
+    request: &IntelligenceOptimizeRequest,
+    database: &mut ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    let retriever = ExecutionRetriever {
+        memories: database
+            .execution_contexts
+            .iter()
+            .filter_map(|context| {
+                database
+                    .executions
+                    .iter()
+                    .find(|execution| execution.execution_id == context.execution_id)
+                    .map(|execution| ExecutionMemory {
+                        execution_id: execution.execution_id.clone(),
+                        repository_id: execution.repository_id.clone(),
+                        commit_sha: execution.commit_hash.clone(),
+                        fingerprint_hash: request.fingerprint_hash.clone(),
+                        generated_plan: context.generated_plan.clone(),
+                        chosen_plan: context.chosen_plan.clone(),
+                        success: eidb_execution_status_is_success(&execution.status),
+                        failure_type: (!eidb_execution_status_is_success(&execution.status))
+                            .then(|| ExecutionLearningEngine::classify_failure(&execution.status)),
+                        repair: None,
+                        duration_seconds: execution
+                            .completed_at
+                            .map(|completed| completed.saturating_sub(execution.started_at)),
+                        cost_units: None,
+                    })
+            })
+            .collect(),
+        patterns: database
+            .execution_patterns
+            .iter()
+            .map(|entry| ExecutionPattern {
+                fingerprint: entry.fingerprint.clone(),
+                failure_type: entry.failure_type.clone(),
+                repair: entry.repair.clone(),
+                success_rate: entry.success_rate,
+                execution_count: entry.execution_count,
+                average_duration: entry.average_duration,
+                average_cost: entry.average_cost,
+            })
+            .collect(),
+    };
+    let similar = retriever.similar_executions(request.fingerprint_hash.as_str(), 10);
+    let patterns = request
+        .failure_type
+        .as_ref()
+        .map(|failure_type| retriever.patterns_for_failure(request.fingerprint_hash.as_str(), failure_type, 10))
+        .unwrap_or_default();
+    let (context, optimized) = ExecutionContextBuilder::default().build(
+        request.execution_id.as_str(),
+        request.generated_plan.as_str(),
+        &similar,
+        &patterns,
+    );
+    database.record_execution_context(EidbExecutionContextRecord {
+        execution_id: context.execution_id.clone(),
+        similar_execution_ids: context.similar_execution_ids.clone(),
+        retrieved_patterns: context.retrieved_patterns.clone(),
+        generated_plan: context.generated_plan.clone(),
+        chosen_plan: context.chosen_plan.clone(),
+    });
+    (
+        "/intelligence/optimize".to_string(),
+        json!({
+            "execution_id": request.execution_id,
+            "context": context,
+            "optimized_plan": optimized,
+        })
+        .to_string(),
+    )
 }
 
 pub fn billing_usage_endpoint(
@@ -11712,6 +12130,14 @@ impl Default for RestApiSpec {
             "GET /repositories/{id}/last-good",
             "GET /api/repositories/{id}/intelligence",
             "POST /api/repositories/{id}/ask",
+            "GET /intelligence/{execution}",
+            "GET /intelligence/similar",
+            "GET /intelligence/patterns",
+            "GET /intelligence/repairs",
+            "GET /intelligence/context",
+            "POST /intelligence/retrieve",
+            "POST /intelligence/learn",
+            "POST /intelligence/optimize",
             "GET /billing/usage?org_id={org_id}",
             "GET /billing/summary",
             "POST /billing/invoice",
@@ -15825,6 +16251,14 @@ dependencies:
             .routes
             .contains(&"GET /api/repositories/{id}/intelligence"));
         assert!(spec.routes.contains(&"POST /api/repositories/{id}/ask"));
+        assert!(spec.routes.contains(&"GET /intelligence/{execution}"));
+        assert!(spec.routes.contains(&"GET /intelligence/similar"));
+        assert!(spec.routes.contains(&"GET /intelligence/patterns"));
+        assert!(spec.routes.contains(&"GET /intelligence/repairs"));
+        assert!(spec.routes.contains(&"GET /intelligence/context"));
+        assert!(spec.routes.contains(&"POST /intelligence/retrieve"));
+        assert!(spec.routes.contains(&"POST /intelligence/learn"));
+        assert!(spec.routes.contains(&"POST /intelligence/optimize"));
         assert!(spec.routes.contains(&"GET /billing/usage?org_id={org_id}"));
         assert!(spec.routes.contains(&"GET /billing/summary"));
         assert!(spec.routes.contains(&"POST /billing/invoice"));
@@ -17781,6 +18215,9 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_questions"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_answers"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_embeddings"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS execution_embeddings"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS execution_patterns"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS execution_contexts"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS audit_logs"));
     }
 
@@ -17974,6 +18411,72 @@ services:
         assert!(body.contains("\"evidence\""));
         assert!(body.contains("\"related_failures\""));
         assert!(body.contains("\"related_healings\""));
+    }
+
+    #[test]
+    fn intelligence_feedback_loop_endpoints_emit_retrieval_learning_and_context_payloads() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-1".to_string(),
+            org_id: None,
+            user_id: None,
+            anon_user_id: Some("anon".to_string()),
+            workspace_id: "ws-1".to_string(),
+            repository_id: "repo-1".to_string(),
+            commit_hash: "aaaaaaa".to_string(),
+            started_at: 10,
+            completed_at: Some(20),
+            status: "success".to_string(),
+            execution_tier: "WASM".to_string(),
+        });
+        database.record_execution_context(EidbExecutionContextRecord {
+            execution_id: "exec-1".to_string(),
+            similar_execution_ids: vec![],
+            retrieved_patterns: vec![],
+            generated_plan: "npm install".to_string(),
+            chosen_plan: "pnpm install".to_string(),
+        });
+
+        let (similar_path, similar_body) = intelligence_similar_endpoint("fp-1", &database);
+        assert_eq!(similar_path, "/intelligence/similar");
+        assert!(similar_body.contains("\"similar_executions\""));
+
+        let (learn_path, learn_body) = intelligence_learn_endpoint(
+            &IntelligenceLearnRequest {
+                execution_id: "exec-1".to_string(),
+                repository_id: "repo-1".to_string(),
+                commit_sha: "aaaaaaa".to_string(),
+                fingerprint_hash: "fp-1".to_string(),
+                generated_plan: "npm install".to_string(),
+                chosen_plan: "pnpm install".to_string(),
+                status: "pnpm lockfile mismatch".to_string(),
+                duration_seconds: Some(12),
+                cost_units: Some(1.5),
+                repair: Some("switch-pnpm".to_string()),
+            },
+            &mut database,
+        );
+        assert_eq!(learn_path, "/intelligence/learn");
+        assert!(learn_body.contains("WrongPackageManager"));
+        assert_eq!(database.execution_embeddings.len(), 1);
+        assert_eq!(database.execution_patterns.len(), 1);
+
+        let (optimize_path, optimize_body) = intelligence_optimize_endpoint(
+            &IntelligenceOptimizeRequest {
+                execution_id: "exec-2".to_string(),
+                fingerprint_hash: "fp-1".to_string(),
+                generated_plan: "npm install && npm run build".to_string(),
+                failure_type: Some("WrongPackageManager".to_string()),
+            },
+            &mut database,
+        );
+        assert_eq!(optimize_path, "/intelligence/optimize");
+        assert!(optimize_body.contains("\"optimized_plan\""));
+        assert_eq!(database.execution_contexts.len(), 2);
+
+        let (context_path, context_body) = intelligence_context_endpoint("exec-2", &database);
+        assert_eq!(context_path, "/intelligence/context");
+        assert!(context_body.contains("\"execution_id\":\"exec-2\""));
     }
 
     #[test]
