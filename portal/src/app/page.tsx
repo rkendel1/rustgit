@@ -18,6 +18,7 @@ const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
 const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
 const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
+const ANALYZE_EXECUTIONS_FALLBACK_PATH = "/api/proxy/api/v1/executions";
 const ANALYZE_WORKSPACES_FALLBACK_PATH_V1 = "/api/proxy/api/v1/workspaces";
 const ANALYZE_WORKSPACES_FALLBACK_PATH_API = "/api/proxy/api/workspaces";
 const ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT = "/api/proxy/workspaces";
@@ -31,6 +32,7 @@ type AnalyzeEndpointConfig = {
 const ANALYZE_ENDPOINTS: AnalyzeEndpointConfig[] = [
   { path: ANALYZE_V1_PATH, responseKind: "analyze" },
   { path: ANALYZE_LEGACY_PATH, responseKind: "analyze" },
+  { path: ANALYZE_EXECUTIONS_FALLBACK_PATH, responseKind: "workspace" },
   { path: ANALYZE_WORKSPACES_FALLBACK_PATH_V1, responseKind: "workspace" },
   { path: ANALYZE_WORKSPACES_FALLBACK_PATH_API, responseKind: "workspace" },
   { path: ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT, responseKind: "workspace" },
@@ -249,7 +251,16 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
+        body: JSON.stringify({
+          org_id: null,
+          user_id: null,
+          anon_user_id: createAnonymousId("anon-portal"),
+          anon_session_id: createAnonymousId("portal-session"),
+          device_fingerprint: "portal-home",
+          repo_url: parsedRepo.repoUrl,
+          branch: branch.trim() || "main",
+          commit: null,
+        }),
       };
       let analyzeResponse: Response | null = null;
       let analyzeResponseKind: AnalyzeEndpointResponseKind = "analyze";
