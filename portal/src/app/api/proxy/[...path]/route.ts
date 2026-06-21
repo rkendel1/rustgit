@@ -9,6 +9,7 @@ const DEFAULT_API_BASE_URL =
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
 const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
+// Keep proxy calls bounded so UI operations (like Analyze) fail fast instead of hanging indefinitely.
 const UPSTREAM_REQUEST_TIMEOUT_MS = 15_000;
 
 function resolveApiBaseUrl(request: NextRequest): string {
@@ -45,6 +46,32 @@ function buildUpstreamUrl(apiBaseUrl: string, path: string): URL {
   return url;
 }
 
+function isTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  if (error instanceof DOMException) {
+    return error.name === "AbortError" || error.name === "TimeoutError";
+  }
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
+function upstreamFailureResponse(error: unknown, path: string): NextResponse {
+  const isTimeout = isTimeoutError(error);
+  if (isTimeout) {
+    console.warn(
+      `Proxy upstream request timed out after ${UPSTREAM_REQUEST_TIMEOUT_MS}ms for path: ${path}`,
+    );
+  }
+  return NextResponse.json(
+    {
+      error: isTimeout ? "Upstream request timed out." : "Upstream request failed.",
+      path,
+    },
+    { status: isTimeout ? 504 : 502 },
+  );
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
@@ -77,7 +104,7 @@ async function proxyRequest(
 
   const sendUpstreamRequest = async (url: URL): Promise<Response> => {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), UPSTREAM_REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_REQUEST_TIMEOUT_MS);
     try {
       return await fetch(url, {
         method: request.method,
@@ -87,21 +114,14 @@ async function proxyRequest(
         signal: controller.signal,
       });
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timeoutId);
     }
   };
-
   let upstreamResponse: Response;
   try {
     upstreamResponse = await sendUpstreamRequest(upstreamUrl);
   } catch (error) {
-    const isTimeout = error instanceof Error && error.name === "AbortError";
-    return NextResponse.json(
-      {
-        error: isTimeout ? "Upstream request timed out." : "Upstream request failed.",
-      },
-      { status: isTimeout ? 504 : 502 },
-    );
+    return upstreamFailureResponse(error, joinedPath);
   }
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
@@ -118,13 +138,7 @@ async function proxyRequest(
     try {
       upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
     } catch (error) {
-      const isTimeout = error instanceof Error && error.name === "AbortError";
-      return NextResponse.json(
-        {
-          error: isTimeout ? "Upstream request timed out." : "Upstream request failed.",
-        },
-        { status: isTimeout ? 504 : 502 },
-      );
+      return upstreamFailureResponse(error, joinedPath);
     }
   }
 
