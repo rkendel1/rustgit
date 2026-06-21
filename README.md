@@ -155,6 +155,8 @@ Portal screenshots:
 ![TryThisSoftware portal (current usable layout)](docs/screenshots/portal-home-usable.png)
 ![TryThisSoftware portal (repository prefilled)](docs/screenshots/portal-home-usable-filled.png)
 ![TryThisSoftware portal (local home)](docs/screenshots/portal-home.png)
+![TryThisSoftware portal redesign (desktop)](docs/screenshots/portal-home-redesign-desktop.png)
+![TryThisSoftware portal redesign (mobile)](docs/screenshots/portal-home-redesign-mobile.png)
 
 Dual-surface intelligence screenshots (simulated from current data model + prompting behavior):
 

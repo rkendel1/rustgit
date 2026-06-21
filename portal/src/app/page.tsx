@@ -12,6 +12,10 @@ const API_BASE_URL =
 const DEFAULT_ASK_QUESTION = "Summarize what this repository does and the best way to run it.";
 const SCORE_DECIMAL_PLACES = 1;
 const CONFIDENCE_DECIMAL_PLACES = 2;
+const PORTAL_NAME = "RustGit Portal";
+const NO_REPOSITORY_SELECTED = "No repository selected";
+const DEFAULT_AVATAR_LETTER = "R";
+const EMPTY_STATE_HEADING = "It's empty here";
 
 type RepoContext = {
   owner: string;
@@ -330,20 +334,23 @@ export default function Home() {
     intelligence?.repository_identity?.healing_score,
     intelligence?.healing_score,
   );
-  const repositoryName = parsedRepo ? `${parsedRepo.owner}/${parsedRepo.repo}` : "No repository selected";
+  const repositoryName = parsedRepo
+    ? `${parsedRepo.owner}/${parsedRepo.repo}`
+    : NO_REPOSITORY_SELECTED;
+  const avatarLetter = parsedRepo?.owner?.charAt(0).toUpperCase() || DEFAULT_AVATAR_LETTER;
 
   return (
     <main className={styles.page}>
       <aside className={styles.sidebar}>
         <div className={styles.profileCard}>
-          <div className={styles.avatar}>{parsedRepo?.owner?.slice(0, 1).toUpperCase() ?? "R"}</div>
+          <div className={styles.avatar}>{avatarLetter}</div>
           <div>
-            <strong>RustGit Portal</strong>
+            <strong>{PORTAL_NAME}</strong>
             <p>{repositoryName}</p>
           </div>
         </div>
 
-        <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.newMailButton}>
+        <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.analyzeButton}>
           {analyzing ? "Analyzing..." : "Analyze Repository"}
         </button>
 
@@ -476,8 +483,8 @@ export default function Home() {
           </section>
         ) : (
           <section className={styles.emptyPanel}>
-            <h2>It&apos;s empty here</h2>
-            <p>Analyze a repository to view framework, services, and score details.</p>
+            <h2>{EMPTY_STATE_HEADING}</h2>
+            <p>Analyze a repository to view frameworks, services, and score details.</p>
           </section>
         )}
       </section>
@@ -523,7 +530,7 @@ export default function Home() {
           </section>
         ) : (
           <section className={styles.emptyPanel}>
-            <h2>It&apos;s empty here</h2>
+            <h2>{EMPTY_STATE_HEADING}</h2>
             <p>Run a repository to populate execution status and workspace links.</p>
           </section>
         )}
