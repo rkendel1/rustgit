@@ -36,9 +36,7 @@ async function proxyRequest(
   const resolvedParams = await params;
   const joinedPath = resolvedParams.path.join("/");
   const apiBaseUrl = resolveApiBaseUrl(request);
-  const upstreamUrl = new URL(
-    `${apiBaseUrl}/${joinedPath}`,
-  );
+  const upstreamUrl = new URL(`${apiBaseUrl}/${joinedPath}`);
 
   request.nextUrl.searchParams.forEach((value, key) => {
     upstreamUrl.searchParams.append(key, value);
@@ -55,15 +53,26 @@ async function proxyRequest(
     requestHeaders.set("authorization", authorization);
   }
 
-  const upstreamResponse = await fetch(upstreamUrl, {
+  const requestBody =
+    request.method === "GET" || request.method === "HEAD"
+      ? undefined
+      : await request.text();
+
+  const requestInit: RequestInit = {
     method: request.method,
     headers: requestHeaders,
-    body:
-      request.method === "GET" || request.method === "HEAD"
-        ? undefined
-        : await request.text(),
+    body: requestBody,
     cache: "no-store",
-  });
+  };
+
+  let upstreamResponse = await fetch(upstreamUrl, requestInit);
+  if (upstreamResponse.status === 404 && !joinedPath.startsWith("api/proxy/")) {
+    const proxiedUpstreamUrl = new URL(`${apiBaseUrl}/api/proxy/${joinedPath}`);
+    request.nextUrl.searchParams.forEach((value, key) => {
+      proxiedUpstreamUrl.searchParams.append(key, value);
+    });
+    upstreamResponse = await fetch(proxiedUpstreamUrl, requestInit);
+  }
 
   return new NextResponse(upstreamResponse.body, {
     status: upstreamResponse.status,
