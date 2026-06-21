@@ -7669,6 +7669,44 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
     })
 }
 
+pub fn ddockit_publish_endpoint(analysis: &RepositoryAnalysis) -> (String, String) {
+    let preflight = preflight_intelligence_payload(analysis);
+    (
+        "/api/v1/repositories/publish".to_string(),
+        json!({
+            "status": "repository_ready",
+            "checks": {
+                "healed": true,
+                "validated": true,
+                "runtime_locked": true,
+                "provenance_recorded": true
+            },
+            "actions": [
+                "validate_repository",
+                "apply_approved_healing_patches",
+                "generate_execution_artifacts",
+                "sign_artifacts",
+                "open_pull_request"
+            ],
+            "artifacts": {
+                "execution.toml": preflight.get("portable_execution_toml"),
+                "execution.lock": preflight.get("execution_lock"),
+                "runtime.graph.json": preflight.get("runtime_graph_json"),
+                "capabilities.toml": preflight.get("capabilities_toml"),
+                "environment.schema.json": preflight.get("environment_schema_json"),
+                "provenance.json": preflight.get("provenance_json"),
+                "healing.patch": preflight.get("healing_patch")
+            },
+            "execution_fingerprint": preflight.get("execution_fingerprint"),
+            "report": {
+                "summary": "Deterministic runtime artifacts generated and ready for PR publication",
+                "diff_mode": "clear_execution_artifact_diff"
+            }
+        })
+        .to_string(),
+    )
+}
+
 const EXECUTION_SPEC_SEARCH_ORDER: [&str; 6] = [
     "execution.toml",
     "execution.json",
@@ -9317,7 +9355,8 @@ pub fn portal_navigation_endpoint() -> (String, String) {
             "navigation": portal_initial_navigation(),
             "workspace_path": "/api/v1/executions/{id}",
             "org_switcher": ["Org A", "Org B", "Create Org"],
-            "ui_endpoint": "/api/v1/surfaces/portal/ui"
+            "ui_endpoint": "/api/v1/surfaces/portal/ui",
+            "publish_api": "/api/v1/repositories/publish"
         })
         .to_string(),
     )
@@ -9409,6 +9448,14 @@ pub fn portal_ui_endpoint() -> (String, String) {
             "id": "analytics_cards",
             "type": "card",
             "cards": ["Time To URL", "Startup Success Rate", "Healing Success Rate", "Runtime Distribution"]
+        }),
+        json!({
+            "id": "repository_ready_publish",
+            "type": "action_panel",
+            "title": "Repository Ready",
+            "checks": ["Healed", "Validated", "Runtime Locked", "Provenance Recorded"],
+            "actions": ["publish"],
+            "publish_api": "/api/v1/repositories/publish"
         }),
     ];
     let rendered = render_surface_view("portal_shell", &components);
@@ -15463,6 +15510,7 @@ impl Default for RestApiSpec {
             "POST /execute/recover",
             "GET /executions?org_id={org_id}",
             "POST /api/v1/repositories/analyze",
+            "POST /api/v1/repositories/publish",
             "POST /api/v1/execution/plan",
             "POST /api/v1/executions",
             "POST /api/v1/executions/{id}/claim",
@@ -20212,6 +20260,7 @@ dependencies:
         assert!(spec.routes.contains(&"DELETE /workspaces/{id}"));
         assert!(spec.routes.contains(&"GET /executions?org_id={org_id}"));
         assert!(spec.routes.contains(&"POST /api/v1/repositories/analyze"));
+        assert!(spec.routes.contains(&"POST /api/v1/repositories/publish"));
         assert!(spec.routes.contains(&"POST /api/v1/execution/plan"));
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/claim"));
@@ -21482,6 +21531,28 @@ all = ["network"]
     }
 
     #[test]
+    fn ddockit_publish_endpoint_emits_runtime_locked_artifacts() {
+        let repo = temp_dir("ddockit-publish-artifacts");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+            .expect("write pnpm lock");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let (path, body) = ddockit_publish_endpoint(&analysis);
+        assert_eq!(path, "/api/v1/repositories/publish");
+        assert!(body.contains("\"status\":\"repository_ready\""));
+        assert!(body.contains("\"execution.lock\""));
+        assert!(body.contains("\"runtime.graph.json\""));
+        assert!(body.contains("\"provenance.json\""));
+        assert!(body.contains("\"execution_fingerprint\":\"sha256:"));
+        assert!(body.contains("\"open_pull_request\""));
+    }
+
+    #[test]
     fn badge_seed_endpoints_emit_runtime_state_and_seed_pipeline_payloads() {
         let (badge_path, badge_body) = badge_svg_endpoint(
             "octocat",
@@ -21910,6 +21981,7 @@ all = ["network"]
         assert!(portal_body.contains("\"org_switcher\""));
         assert!(portal_body.contains("\"workspace_path\":\"/api/v1/executions/{id}\""));
         assert!(portal_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
+        assert!(portal_body.contains("\"publish_api\":\"/api/v1/repositories/publish\""));
     }
 
     #[test]
@@ -21937,6 +22009,8 @@ all = ["network"]
         assert!(portal_ui_body.contains("\"agents\""));
         assert!(portal_ui_body.contains("\"badge_generator_studio\""));
         assert!(portal_ui_body.contains("\"generate_api\":\"/api/badges/generate\""));
+        assert!(portal_ui_body.contains("\"repository_ready_publish\""));
+        assert!(portal_ui_body.contains("\"publish_api\":\"/api/v1/repositories/publish\""));
         assert!(portal_ui_body.contains(
             "\"notice\":\"This badge updates automatically based on repository execution health.\""
         ));
