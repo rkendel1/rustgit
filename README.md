@@ -154,6 +154,8 @@ Fly.io app configs are checked in under `deploy/fly/`:
 - `workspaces.fly.toml` (`trythissoftware-workspaces`)
 - `postgres.fly.toml` (`trythissoftware-db`) — self-managed Postgres, runs on Fly's private network
 
+The repository root `fly.toml` is intentionally configured for the frontend (`rustgit` app) and uses `portal/Dockerfile` so a plain `fly deploy` from repo root serves `trythissoftware.com`.
+
 Required runtime environment variables:
 
 - API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`
