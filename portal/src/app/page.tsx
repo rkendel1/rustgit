@@ -157,9 +157,13 @@ async function readAnalyzeResponse(
   fallbackRepoUrl: string,
 ): Promise<AnalyzeResponse> {
   if (responseKind === "workspace") {
-    return {
-      repo_url: (await readJsonResponse<WorkspaceLaunchResponse>(response)).repo_url ?? fallbackRepoUrl,
-    };
+    try {
+      return {
+        repo_url: (await readJsonResponse<WorkspaceLaunchResponse>(response)).repo_url ?? fallbackRepoUrl,
+      };
+    } catch {
+      return { repo_url: fallbackRepoUrl };
+    }
   }
   return readJsonResponse<AnalyzeResponse>(response);
 }
@@ -239,7 +243,7 @@ export default function Home() {
       };
       let analyzeResponse: Response | null = null;
       let analyzeResponseKind: AnalyzeEndpointResponseKind = "analyze";
-      let lastFailure = "No endpoints attempted";
+      let lastFailure = "";
 
       for (const endpoint of ANALYZE_ENDPOINTS) {
         try {
@@ -256,7 +260,9 @@ export default function Home() {
       }
 
       if (!analyzeResponse) {
-        throw new Error(`Analyze request failed across all endpoints: ${lastFailure}`);
+        throw new Error(
+          `Analyze request failed across all endpoints${lastFailure ? `: ${lastFailure}` : "."}`,
+        );
       }
 
       const analyzed = await readAnalyzeResponse(
