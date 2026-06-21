@@ -89,12 +89,12 @@ impl HealingOrchestrator {
             };
         }
 
-        let attempt_limit = budget.max_attempts.min(candidates.len()).max(1);
+        let attempt_limit = budget.max_attempts.min(candidates.len());
         for candidate in candidates.iter().take(attempt_limit) {
             timeline.record(HealingStage::CandidateGenerated, candidate.id.clone());
             let mut applied = true;
-            for action in candidate.steps.iter().copied() {
-                if !runtime.apply_repair(action) {
+            for repair_action in candidate.steps.iter().copied() {
+                if !runtime.apply_repair(repair_action) {
                     applied = false;
                     break;
                 }

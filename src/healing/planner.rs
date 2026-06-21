@@ -80,7 +80,7 @@ impl HealingPlanner {
     }
 
     pub fn rank_candidates(&self, mut candidates: Vec<HealingPlan>) -> Vec<HealingPlan> {
-        candidates.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+        candidates.sort_by(|first, second| second.confidence.total_cmp(&first.confidence));
         candidates
     }
 }

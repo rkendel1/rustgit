@@ -17,9 +17,9 @@ pub fn plan_confidence(actions: &[RepairAction], fallback: f32) -> f32 {
     if actions.is_empty() {
         return fallback;
     }
-    let total = actions
+    actions
         .iter()
         .map(|action| action_confidence(*action))
-        .sum::<f32>();
-    (total / actions.len() as f32).min(0.99)
+        .product::<f32>()
+        .min(0.99)
 }
