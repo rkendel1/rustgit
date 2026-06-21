@@ -30,6 +30,10 @@ type AnalyzeResponse = {
   services?: string[];
 };
 
+type WorkspaceLaunchResponse = {
+  repo_url?: string;
+};
+
 type RunResponse = {
   execution_id?: string;
   workspace_id?: string;
@@ -95,7 +99,7 @@ function parseRepositoryInput(input: string): RepoContext | null {
       return {
         owner,
         repo,
-        repoUrl: `https://github.com/${owner}/${repo}`,
+        repoUrl: `https://github.com/${owner}/${repo}.git`,
       };
     } catch {
       return null;
@@ -115,7 +119,7 @@ function parseRepositoryInput(input: string): RepoContext | null {
   return {
     owner,
     repo,
-    repoUrl: `https://github.com/${owner}/${repo}`,
+    repoUrl: `https://github.com/${owner}/${repo}.git`,
   };
 }
 
@@ -198,7 +202,6 @@ export default function Home() {
     setRunResult(null);
 
     try {
-      const analyzeFallbackPath = "/api/proxy/api/repositories/analyze";
       const analyzeRequest = {
         method: "POST",
         headers: {
@@ -206,27 +209,42 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      const analyzeResponse = await (async () => {
+      const analyzePaths = [
+        "/api/proxy/api/v1/repositories/analyze",
+        "/api/proxy/api/repositories/analyze",
+        "/api/proxy/workspaces",
+      ];
+      let analyzeResponse: Response | null = null;
+      let analyzePath: string | null = null;
+      let lastFailure = "no response body";
+
+      for (const path of analyzePaths) {
         try {
-          const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
-          return analyzeV1Response.ok
-            ? analyzeV1Response
-            : await fetch(analyzeFallbackPath, analyzeRequest);
-        } catch (primaryError) {
-          try {
-            return await fetch(analyzeFallbackPath, analyzeRequest);
-          } catch (fallbackError) {
-            const primaryMessage =
-              primaryError instanceof Error ? primaryError.message : String(primaryError);
-            const fallbackMessage =
-              fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-            throw new Error(
-              `Analyze request failed for both endpoints: ${primaryMessage}; fallback: ${fallbackMessage}`,
-            );
+          const response = await fetch(path, analyzeRequest);
+          if (response.ok) {
+            analyzeResponse = response;
+            analyzePath = path;
+            break;
           }
+          const text = await response.text();
+          lastFailure = `${path} -> ${response.status}: ${text || "no response body"}`;
+        } catch (error) {
+          lastFailure = error instanceof Error ? error.message : String(error);
         }
-      })();
-      const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
+      }
+
+      if (!analyzeResponse) {
+        throw new Error(`Analyze request failed across all endpoints: ${lastFailure}`);
+      }
+
+      const analyzed =
+        analyzePath === "/api/proxy/workspaces"
+          ? {
+              repo_url:
+                (await readJsonResponse<WorkspaceLaunchResponse>(analyzeResponse)).repo_url ??
+                parsedRepo.repoUrl,
+            }
+          : await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
 
