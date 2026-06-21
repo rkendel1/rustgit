@@ -7558,7 +7558,7 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
         discover_execution_specification(root, analysis, &existing_dependency_files, &environment_graph);
     let should_fallback_to_derivation = discovered_execution_spec
         .as_ref()
-        .is_none_or(|spec| spec.decision == "repair");
+        .map_or(true, |spec| spec.decision == "repair");
     let derived_execution_specification = should_fallback_to_derivation.then(|| {
         preparation::execution_spec_builder::build_execution_spec(
             analysis,
@@ -7568,27 +7568,37 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             &expected_failures,
         )
     });
-    let execution_specification = discovered_execution_spec
-        .as_ref()
-        .and_then(|spec| (!should_fallback_to_derivation).then(|| spec.execution_specification.clone()))
-        .unwrap_or_else(|| {
-            serde_json::to_value(
-                derived_execution_specification
-                    .as_ref()
-                    .expect("derived execution specification"),
-            )
-            .expect("serialize derived execution specification")
-        });
-    let portable_execution_toml = discovered_execution_spec
-        .as_ref()
-        .and_then(|spec| (!should_fallback_to_derivation).then(|| spec.portable_execution_toml.clone()))
-        .unwrap_or_else(|| {
-            preparation::synthesis_engine::portable_execution_toml(
-                derived_execution_specification
-                    .as_ref()
-                    .expect("derived execution specification"),
-            )
-        });
+    let execution_specification = if should_fallback_to_derivation {
+        serde_json::to_value(
+            derived_execution_specification
+                .as_ref()
+                .expect(
+                    "Expected derived execution specification to exist when fallback is required",
+                ),
+        )
+        .expect("Failed to serialize derived execution specification to JSON")
+    } else {
+        discovered_execution_spec
+            .as_ref()
+            .expect("Expected discovered execution specification when fallback is disabled")
+            .execution_specification
+            .clone()
+    };
+    let portable_execution_toml = if should_fallback_to_derivation {
+        preparation::synthesis_engine::portable_execution_toml(
+            derived_execution_specification
+                .as_ref()
+                .expect(
+                    "Expected derived execution specification to exist when fallback is required",
+                ),
+        )
+    } else {
+        discovered_execution_spec
+            .as_ref()
+            .expect("Expected discovered execution specification when fallback is disabled")
+            .portable_execution_toml
+            .clone()
+    };
 
     json!({
         "pipeline": [
@@ -7761,6 +7771,7 @@ fn discover_dot_execution_spec_candidate(root: &Path) -> Option<ExecutionSpecDis
                     (extension == "toml" || extension == "json").then_some(path)
                 })
                 .collect::<Vec<_>>();
+            // Deterministically prefer the same candidate across runs when multiple spec files exist.
             candidates.sort();
             let first = candidates.first()?;
             let relative = first
@@ -7853,7 +7864,7 @@ fn validate_discovered_spec(
         .needs
         .is_empty()
         || hint.contains("capabilities");
-    let dependency_valid = !dependency_files.is_empty() || hint.contains("dependencies");
+    let dependency_valid = dependency_files.is_empty() || hint.contains("dependencies");
     let environment_valid = environment_graph.is_empty()
         || hint.contains("environment")
         || hint.contains("[environment]");
@@ -7868,19 +7879,10 @@ fn validate_discovered_spec(
 }
 
 fn trust_score_for_discovered_spec(candidate: &ExecutionSpecDiscoveryCandidate) -> (u8, &'static str) {
-    let hint = candidate.validation_hint.to_ascii_lowercase();
-    if hint.contains("ddockit_signature = \"verified\"")
-        || hint.contains("\"ddockit_signature\":\"verified\"")
-    {
-        return (100, "verified_ddockit_signed");
-    }
-    if hint.contains("maintainer_signature") {
-        return (95, "repository_maintainer_signed");
-    }
     if candidate.source == "well_known_execution_toml" || candidate.source == "oci_wasi_metadata" {
         return (90, "published_release_artifact");
     }
-    if candidate.path == "ddockit.toml" || hint.contains("generated_by = \"ddockit\"") {
+    if candidate.path == "ddockit.toml" {
         return (85, "generated_by_ddockit");
     }
     (70, "user_modified")
@@ -21389,6 +21391,8 @@ services:
             r#"version = "1"
 [runtime]
 language = "typescript"
+[dependencies]
+all = ["next"]
 [environment]
 NODE_ENV = "development"
 [capabilities]
