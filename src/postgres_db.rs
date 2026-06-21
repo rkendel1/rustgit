@@ -101,6 +101,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "repository_intelligence_rag",
         sql: include_str!("../migrations/0007_repository_intelligence_rag.sql"),
     },
+    Migration {
+        version: "0008",
+        name: "execution_intelligence_feedback_loop",
+        sql: include_str!("../migrations/0008_execution_intelligence_feedback_loop.sql"),
+    },
 ];
 
 pub trait ExecutionIntelligenceReadStore {
