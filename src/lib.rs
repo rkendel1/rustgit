@@ -12327,6 +12327,19 @@ impl WorkspaceManager {
 
         Ok(())
     }
+
+    pub fn list_workspaces(&self) -> Vec<Workspace> {
+        let workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+        workspaces.values().map(|r| r.workspace.clone()).collect()
+    }
+
+    pub fn get_workspace(&self, id: &str) -> Result<Workspace> {
+        let workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+        workspaces
+            .get(id)
+            .map(|r| r.workspace.clone())
+            .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))
+    }
 }
 
 impl WasmWorkspace for WorkspaceManager {

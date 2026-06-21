@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use rustgit_wasm_runtime::{
@@ -248,10 +248,31 @@ async fn seed_launch(Path((owner, repo)): Path<(String, String)>) -> (StatusCode
     json_payload_response(payload)
 }
 
+async fn list_workspaces(State(manager): State<SharedManager>) -> Json<Vec<Workspace>> {
+    Json(manager.list_workspaces())
+}
+
+async fn get_workspace(
+    State(manager): State<SharedManager>,
+    Path(id): Path<String>,
+) -> Result<Json<Workspace>, (StatusCode, Json<Value>)> {
+    tokio::task::spawn_blocking(move || manager.get_workspace(&id))
+        .await
+        .expect("task panicked")
+        .map(Json)
+        .map_err(err_response)
+}
+
 fn with_workspace_routes(router: Router<SharedManager>, prefix: &str) -> Router<SharedManager> {
     router
-        .route(&format!("{prefix}/workspaces"), post(launch_workspace))
-        .route(&format!("{prefix}/workspaces/:id"), delete(stop_workspace))
+        .route(
+            &format!("{prefix}/workspaces"),
+            get(list_workspaces).post(launch_workspace),
+        )
+        .route(
+            &format!("{prefix}/workspaces/:id"),
+            get(get_workspace).delete(stop_workspace),
+        )
         .route(
             &format!("{prefix}/workspaces/:id/restart"),
             post(restart_workspace),
