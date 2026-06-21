@@ -239,7 +239,7 @@ export default function Home() {
       };
       let analyzeResponse: Response | null = null;
       let analyzeResponseKind: AnalyzeEndpointResponseKind = "analyze";
-      let lastFailure = "All endpoints failed";
+      let lastFailure = "No endpoints attempted";
 
       for (const endpoint of ANALYZE_ENDPOINTS) {
         try {
@@ -249,7 +249,7 @@ export default function Home() {
             analyzeResponseKind = endpoint.responseKind;
             break;
           }
-          lastFailure = `${endpoint.path} -> ${response.status}`;
+          lastFailure = `${endpoint.path} -> ${response.status} ${response.statusText}`;
         } catch (error) {
           lastFailure = error instanceof Error ? error.message : String(error);
         }
