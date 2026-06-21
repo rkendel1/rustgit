@@ -1,10 +1,33 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ??
-  (process.env.NODE_ENV === "development"
+const PRODUCTION_BASE_DOMAIN =
+  process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "").replace(/\/.*$/, "") ??
+  "trythissoftware.com";
+
+const DEFAULT_API_BASE_URL =
+  process.env.NODE_ENV === "development"
     ? "http://localhost:8080"
-    : "https://api.trythissoftware.com");
+    : `https://api.${PRODUCTION_BASE_DOMAIN}`;
+
+function resolveApiBaseUrl(request: NextRequest): string {
+  const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (!configuredApiUrl) {
+    return DEFAULT_API_BASE_URL;
+  }
+
+  try {
+    const configured = new URL(configuredApiUrl);
+    if (
+      process.env.NODE_ENV !== "development" &&
+      configured.hostname === request.nextUrl.hostname
+    ) {
+      return DEFAULT_API_BASE_URL;
+    }
+    return configured.toString().replace(/\/$/, "");
+  } catch {
+    return DEFAULT_API_BASE_URL;
+  }
+}
 
 async function proxyRequest(
   request: NextRequest,
@@ -12,8 +35,9 @@ async function proxyRequest(
 ): Promise<NextResponse> {
   const resolvedParams = await params;
   const joinedPath = resolvedParams.path.join("/");
+  const apiBaseUrl = resolveApiBaseUrl(request);
   const upstreamUrl = new URL(
-    `${API_BASE_URL.replace(/\/$/, "")}/${joinedPath}`,
+    `${apiBaseUrl}/${joinedPath}`,
   );
 
   request.nextUrl.searchParams.forEach((value, key) => {
