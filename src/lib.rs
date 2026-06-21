@@ -4858,7 +4858,7 @@ impl MeshExecutionRouter {
                 placement
                     .fallback_nodes
                     .iter()
-                    .take(replicas.max(1))
+                    .take(replicas)
                     .cloned()
                     .collect()
             })
@@ -5014,8 +5014,9 @@ impl ExecutionMesh {
             .iter()
             .find(|node_id| node_id.as_str() != failed_node_id)
             .cloned()?;
-        self.router.migrate(component_id, placements, &target);
-        Some(target)
+        self.router
+            .migrate(component_id, placements, &target)
+            .then_some(target)
     }
 }
 
