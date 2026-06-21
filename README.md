@@ -115,6 +115,8 @@ Tagline: **Every repository becomes a queryable, executable, continuously learni
 
 Rather than split intelligence across isolated stores, USIL standardizes on a single software object interface:
 
+Accessors use `get*` and lifecycle/intelligence operations use action verbs.
+
 - `.getExecution()`
 - `.getArchitecture()`
 - `.getRuntime()`
