@@ -194,6 +194,7 @@ export default function Home() {
     setRunResult(null);
 
     try {
+      const analyzeFallbackPath = "/api/proxy/api/repositories/analyze";
       const analyzeRequest = {
         method: "POST",
         headers: {
@@ -201,25 +202,27 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      let analyzeResponse: Response;
+      let analyzeResponse: Response | null = null;
       try {
         const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
         analyzeResponse =
           analyzeV1Response.status === 404
-            ? await fetch("/api/proxy/api/repositories/analyze", analyzeRequest)
+            ? await fetch(analyzeFallbackPath, analyzeRequest)
             : analyzeV1Response;
       } catch (primaryError) {
         try {
-          analyzeResponse = await fetch("/api/proxy/api/repositories/analyze", analyzeRequest);
+          analyzeResponse = await fetch(analyzeFallbackPath, analyzeRequest);
         } catch (fallbackError) {
-          const primaryMessage =
-            primaryError instanceof Error ? primaryError.message : "unknown primary failure";
+          const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
           const fallbackMessage =
-            fallbackError instanceof Error ? fallbackError.message : "unknown fallback failure";
+            fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
           throw new Error(
             `Analyze request failed for both endpoints: ${primaryMessage}; fallback: ${fallbackMessage}`,
           );
         }
+      }
+      if (!analyzeResponse) {
+        throw new Error("Analyze request failed before receiving a response.");
       }
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
