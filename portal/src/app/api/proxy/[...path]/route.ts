@@ -34,7 +34,7 @@ async function proxyRequest(
   params: Promise<{ path: string[] }>,
 ): Promise<NextResponse> {
   const resolvedParams = await params;
-  const joinedPath = resolvedParams.path.join("/");
+  const joinedPath = resolvedParams.path.join("/").replace(/^\/+/, "");
   const apiBaseUrl = resolveApiBaseUrl(request);
   const upstreamUrl = new URL(`${apiBaseUrl}/${joinedPath}`);
 
@@ -53,16 +53,16 @@ async function proxyRequest(
     requestHeaders.set("authorization", authorization);
   }
 
-  const requestBody =
+  const requestBodyBytes =
     request.method === "GET" || request.method === "HEAD"
       ? undefined
-      : await request.arrayBuffer();
+      : new Uint8Array(await request.arrayBuffer());
 
   const sendUpstreamRequest = (url: URL) =>
     fetch(url, {
       method: request.method,
       headers: requestHeaders,
-      body: requestBody ? requestBody.slice(0) : undefined,
+      body: requestBodyBytes ? new Uint8Array(requestBodyBytes) : undefined,
       cache: "no-store",
     });
 
