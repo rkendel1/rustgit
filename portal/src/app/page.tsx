@@ -16,6 +16,21 @@ const PORTAL_NAME = "RustGit Portal";
 const NO_REPOSITORY_SELECTED = "No repository selected";
 const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
+const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
+const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
+const ANALYZE_WORKSPACES_FALLBACK_PATH = "/api/proxy/workspaces";
+
+type AnalyzeEndpointResponseKind = "analyze" | "workspace";
+type AnalyzeEndpointConfig = {
+  path: string;
+  responseKind: AnalyzeEndpointResponseKind;
+};
+
+const ANALYZE_ENDPOINTS: AnalyzeEndpointConfig[] = [
+  { path: ANALYZE_V1_PATH, responseKind: "analyze" },
+  { path: ANALYZE_LEGACY_PATH, responseKind: "analyze" },
+  { path: ANALYZE_WORKSPACES_FALLBACK_PATH, responseKind: "workspace" },
+];
 
 type RepoContext = {
   owner: string;
@@ -28,6 +43,10 @@ type AnalyzeResponse = {
   fingerprint_id?: string;
   frameworks?: string[];
   services?: string[];
+};
+
+type WorkspaceLaunchResponse = {
+  repo_url?: string;
 };
 
 type RunResponse = {
@@ -95,7 +114,7 @@ function parseRepositoryInput(input: string): RepoContext | null {
       return {
         owner,
         repo,
-        repoUrl: `https://github.com/${owner}/${repo}`,
+        repoUrl: `https://github.com/${owner}/${repo}.git`,
       };
     } catch {
       return null;
@@ -115,7 +134,7 @@ function parseRepositoryInput(input: string): RepoContext | null {
   return {
     owner,
     repo,
-    repoUrl: `https://github.com/${owner}/${repo}`,
+    repoUrl: `https://github.com/${owner}/${repo}.git`,
   };
 }
 
@@ -130,6 +149,23 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
     const message = error instanceof Error ? error.message : "unknown parse error";
     throw new Error(`Invalid JSON response: ${message}`);
   }
+}
+
+async function readAnalyzeResponse(
+  response: Response,
+  responseKind: AnalyzeEndpointResponseKind,
+  fallbackRepoUrl: string,
+): Promise<AnalyzeResponse> {
+  if (responseKind === "workspace") {
+    try {
+      return {
+        repo_url: (await readJsonResponse<WorkspaceLaunchResponse>(response)).repo_url ?? fallbackRepoUrl,
+      };
+    } catch {
+      return { repo_url: fallbackRepoUrl };
+    }
+  }
+  return readJsonResponse<AnalyzeResponse>(response);
 }
 
 export default function Home() {
@@ -198,7 +234,6 @@ export default function Home() {
     setRunResult(null);
 
     try {
-      const analyzeFallbackPath = "/api/proxy/api/repositories/analyze";
       const analyzeRequest = {
         method: "POST",
         headers: {
@@ -206,27 +241,35 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      const analyzeResponse = await (async () => {
+      let analyzeResponse: Response | null = null;
+      let analyzeResponseKind: AnalyzeEndpointResponseKind = "analyze";
+      let lastFailure = "";
+
+      for (const endpoint of ANALYZE_ENDPOINTS) {
         try {
-          const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
-          return analyzeV1Response.ok
-            ? analyzeV1Response
-            : await fetch(analyzeFallbackPath, analyzeRequest);
-        } catch (primaryError) {
-          try {
-            return await fetch(analyzeFallbackPath, analyzeRequest);
-          } catch (fallbackError) {
-            const primaryMessage =
-              primaryError instanceof Error ? primaryError.message : String(primaryError);
-            const fallbackMessage =
-              fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-            throw new Error(
-              `Analyze request failed for both endpoints: ${primaryMessage}; fallback: ${fallbackMessage}`,
-            );
+          const response = await fetch(endpoint.path, analyzeRequest);
+          if (response.ok) {
+            analyzeResponse = response;
+            analyzeResponseKind = endpoint.responseKind;
+            break;
           }
+          lastFailure = `${endpoint.path} -> ${response.status} ${response.statusText}`;
+        } catch (error) {
+          lastFailure = error instanceof Error ? error.message : String(error);
         }
-      })();
-      const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
+      }
+
+      if (!analyzeResponse) {
+        throw new Error(
+          `Analyze request failed across all endpoints${lastFailure ? `: ${lastFailure}` : "."}`,
+        );
+      }
+
+      const analyzed = await readAnalyzeResponse(
+        analyzeResponse,
+        analyzeResponseKind,
+        parsedRepo.repoUrl,
+      );
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
 
