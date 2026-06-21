@@ -17417,6 +17417,11 @@ mod tests {
         let analysis = analyze_repository(&repo).expect("analyze repo");
         assert_eq!(analysis.framework, Framework::React);
         assert_eq!(analysis.language, Language::JavaScript);
+        assert!(analysis
+            .execution_graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "install"));
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
             Some("npm run dev -- --host 0.0.0.0")
