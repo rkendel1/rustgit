@@ -9,6 +9,13 @@ const DEFAULT_API_BASE_URL =
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
 const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
+const ALLOWED_WEB_ORIGINS = new Set([
+  "https://trythissoftware.com",
+  "https://www.trythissoftware.com",
+  "https://rustgit.fly.dev",
+]);
+const CORS_ALLOW_METHODS = "GET, POST, DELETE, OPTIONS";
+const CORS_ALLOW_HEADERS = "Content-Type, Authorization";
 
 // Default timeout for most proxy calls.
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -67,7 +74,39 @@ function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
 }
 
-function upstreamFailureResponse(error: unknown, path: string): NextResponse {
+function resolveAllowedOrigin(request: NextRequest): string | null {
+  const origin = request.headers.get("origin");
+  if (!origin) {
+    return null;
+  }
+
+  if (
+    process.env.NODE_ENV === "development" &&
+    (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:"))
+  ) {
+    return origin;
+  }
+
+  if (ALLOWED_WEB_ORIGINS.has(origin)) {
+    return origin;
+  }
+
+  if (
+    origin.startsWith("chrome-extension://") ||
+    origin.startsWith("moz-extension://") ||
+    origin.startsWith("safari-web-extension://")
+  ) {
+    return origin;
+  }
+
+  return null;
+}
+
+function upstreamFailureResponse(
+  error: unknown,
+  path: string,
+  allowedOrigin: string | null,
+): NextResponse {
   const isTimeout = isTimeoutError(error);
   if (isTimeout) {
     const timeoutMs = timeoutForPath(path);
@@ -75,13 +114,46 @@ function upstreamFailureResponse(error: unknown, path: string): NextResponse {
       `Proxy upstream request timed out after ${timeoutMs}ms for path: ${path}`,
     );
   }
-  return NextResponse.json(
+  return withCorsHeaders(
+    NextResponse.json(
     {
       error: isTimeout ? "Upstream request timed out." : "Upstream request failed.",
       path,
     },
     { status: isTimeout ? 504 : 502 },
+    ),
+    allowedOrigin,
   );
+}
+
+function withCorsHeaders(response: NextResponse, allowedOrigin: string | null): NextResponse {
+  if (!allowedOrigin) {
+    return response;
+  }
+  response.headers.set("Access-Control-Allow-Origin", allowedOrigin);
+  response.headers.set("Access-Control-Allow-Methods", CORS_ALLOW_METHODS);
+  response.headers.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS);
+  response.headers.set("Access-Control-Max-Age", "3600");
+  response.headers.set("Vary", "Origin");
+  return response;
+}
+
+function forbiddenOriginResponse(origin: string): NextResponse {
+  return NextResponse.json(
+    { error: "Origin is not allowed.", origin },
+    { status: 403 },
+  );
+}
+
+function resolveOriginDecision(request: NextRequest): {
+  allowedOrigin: string | null;
+  requestOrigin: string | null;
+  isAllowed: boolean;
+} {
+  const requestOrigin = request.headers.get("origin");
+  const allowedOrigin = resolveAllowedOrigin(request);
+  const isAllowed = !requestOrigin || Boolean(allowedOrigin);
+  return { allowedOrigin, requestOrigin, isAllowed };
 }
 
 async function proxyRequest(
@@ -89,6 +161,11 @@ async function proxyRequest(
   params: Promise<{ path: string[] }>,
 ): Promise<NextResponse> {
   const resolvedParams = await params;
+  const originDecision = resolveOriginDecision(request);
+  if (!originDecision.isAllowed && originDecision.requestOrigin) {
+    return forbiddenOriginResponse(originDecision.requestOrigin);
+  }
+
   const joinedPath = resolvedParams.path
     .join("/")
     .replace(/\/{2,}/g, "/")
@@ -134,7 +211,7 @@ async function proxyRequest(
   try {
     upstreamResponse = await sendUpstreamRequest(upstreamUrl);
   } catch (error) {
-    return upstreamFailureResponse(error, joinedPath);
+    return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
   }
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
@@ -151,17 +228,20 @@ async function proxyRequest(
     try {
       upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
     } catch (error) {
-      return upstreamFailureResponse(error, joinedPath);
+      return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
     }
   }
 
-  return new NextResponse(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    headers: {
-      "content-type":
-        upstreamResponse.headers.get("content-type") ?? "application/json",
-    },
-  });
+  return withCorsHeaders(
+    new NextResponse(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: {
+        "content-type":
+          upstreamResponse.headers.get("content-type") ?? "application/json",
+      },
+    }),
+    originDecision.allowedOrigin,
+  );
 }
 
 export async function GET(
@@ -183,4 +263,15 @@ export async function DELETE(
   context: { params: Promise<{ path: string[] }> },
 ) {
   return proxyRequest(request, context.params);
+}
+
+export async function OPTIONS(request: NextRequest) {
+  const originDecision = resolveOriginDecision(request);
+  if (!originDecision.allowedOrigin) {
+    if (!originDecision.requestOrigin) {
+      return new NextResponse(null, { status: 204 });
+    }
+    return forbiddenOriginResponse(originDecision.requestOrigin);
+  }
+  return withCorsHeaders(new NextResponse(null, { status: 204 }), originDecision.allowedOrigin);
 }
