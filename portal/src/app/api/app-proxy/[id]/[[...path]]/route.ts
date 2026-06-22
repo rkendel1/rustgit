@@ -5,16 +5,59 @@ const BACKEND_BASE =
     ? "http://localhost:8080"
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 
-async function getWorkspacePort(id: string): Promise<number | null> {
+const READY_LOG_PATTERN = /ready|listening|localhost|compiled|started|vite v/i;
+
+type WorkspaceState = "Running" | "Failed" | string;
+
+type WorkspaceInfo = {
+  state?: WorkspaceState;
+  framework?: string;
+  ports?: Array<{ port?: number }>;
+};
+
+function startupTimeoutMs(framework?: string): number {
+  const normalized = framework?.toLowerCase();
+  if (!normalized) return 45_000;
+  if (["vite", "react", "svelte", "node"].includes(normalized)) return 30_000;
+  if (["nextjs", "next.js", "nuxt", "python"].includes(normalized)) return 45_000;
+  if (["angular", "django"].includes(normalized)) return 60_000;
+  if (["fastapi", "fast_api", "fast api"].includes(normalized)) return 30_000;
+  return 45_000;
+}
+
+function retryDelayMs(attempt: number): number {
+  if (attempt < 2) return 500;
+  if (attempt < 4) return 1_000;
+  return 2_000;
+}
+
+function progressPercent(elapsedMs: number, maxWaitMs: number): number {
+  if (maxWaitMs <= 0) return 0;
+  return Math.min(99, Math.floor((elapsedMs / maxWaitMs) * 100));
+}
+
+async function getWorkspace(id: string): Promise<WorkspaceInfo | null> {
   try {
     const res = await fetch(`${BACKEND_BASE}/workspaces/${id}`, {
       cache: "no-store",
     });
     if (!res.ok) return null;
-    const ws = await res.json();
-    return (ws.ports?.[0]?.port as number) ?? null;
+    return (await res.json()) as WorkspaceInfo;
   } catch {
     return null;
+  }
+}
+
+async function getWorkspaceLogs(id: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${BACKEND_BASE}/workspaces/${id}/logs`, {
+      cache: "no-store",
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { logs?: string[] };
+    return Array.isArray(data.logs) ? data.logs : [];
+  } catch {
+    return [];
   }
 }
 
@@ -23,18 +66,23 @@ async function handle(
   params: Promise<{ id: string; path?: string[] }>,
 ): Promise<NextResponse> {
   const { id, path } = await params;
-  const port = await getWorkspacePort(id);
+  const startedAt = Date.now();
+  let attempt = 0;
+  let workspace = await getWorkspace(id);
+  let lastLogs: string[] = [];
+  let lastProbe = "not started";
 
-  if (!port) {
+  if (!workspace) {
     return NextResponse.json(
-      { error: "Workspace not found or not yet running" },
+      { error: "Workspace not found" },
       { status: 404 },
     );
   }
+  const maxWaitMs = startupTimeoutMs(workspace.framework);
 
   const subPath = path ? path.join("/") : "";
-  const search = request.nextUrl.search;
-  const upstreamUrl = `http://127.0.0.1:${port}/${subPath}${search}`;
+  const makeUpstreamUrl = (port: number): string =>
+    `http://127.0.0.1:${port}/${subPath}${request.nextUrl.search}`;
 
   const forwardHeaders = new Headers();
   request.headers.forEach((value, key) => {
@@ -42,78 +90,128 @@ async function handle(
       forwardHeaders.set(key, value);
     }
   });
-  forwardHeaders.set("host", `127.0.0.1:${port}`);
 
   const bodyBytes =
     request.method !== "GET" && request.method !== "HEAD"
       ? new Uint8Array(await request.arrayBuffer())
       : undefined;
 
-  // Retry up to 8 times (≈8 s total) to handle slow startup (Django, uvicorn compile, etc.)
-  let upstreamRes: Response | null = null;
-  const MAX_RETRIES = 8;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      upstreamRes = await fetch(upstreamUrl, {
-        method: request.method,
-        headers: forwardHeaders,
-        body: bodyBytes,
-      });
-      break;
-    } catch {
-      if (attempt < MAX_RETRIES - 1) {
-        await new Promise((r) => setTimeout(r, 1000));
+  while (Date.now() - startedAt < maxWaitMs) {
+    const port = workspace.ports?.[0]?.port ?? null;
+    if (!port) {
+      lastProbe = "port unavailable";
+    } else {
+      forwardHeaders.set("host", `127.0.0.1:${port}`);
+      try {
+        const upstreamRes = await fetch(makeUpstreamUrl(port), {
+          method: request.method,
+          headers: forwardHeaders,
+          body: bodyBytes,
+        });
+
+        const contentType = upstreamRes.headers.get("content-type") ?? "";
+        const proxyBase = `/api/app-proxy/${id}/`;
+
+        if (contentType.includes("text/html")) {
+          let html = await upstreamRes.text();
+          const rewriteAbsoluteToProxy = (value: string): string =>
+            value
+              .replace(
+                /=\s*(["'])\/(?!\/)([^"']*)\1/g,
+                (_match, quote: string, path: string) =>
+                  `=${quote}${proxyBase}${path}${quote}`,
+              )
+              .replace(
+                /=\s*\/(?!\/)([^\s"'=<>`]+)/g,
+                (_match, path: string) => `=${proxyBase}${path}`,
+              );
+
+          html = rewriteAbsoluteToProxy(html);
+          // Make relative URLs resolve through our proxy
+          const baseTag = `<base href="${proxyBase}">`;
+          if (html.includes("<head>")) {
+            html = html.replace("<head>", `<head>${baseTag}`);
+          } else {
+            html = baseTag + html;
+          }
+          return new NextResponse(html, {
+            status: upstreamRes.status,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
+
+        const responseHeaders = new Headers();
+        responseHeaders.set("content-type", contentType || "application/octet-stream");
+        const cacheControl = upstreamRes.headers.get("cache-control");
+        if (cacheControl) responseHeaders.set("cache-control", cacheControl);
+
+        return new NextResponse(upstreamRes.body, {
+          status: upstreamRes.status,
+          headers: responseHeaders,
+        });
+      } catch (error) {
+        lastProbe = error instanceof Error ? error.message : "connection failed";
       }
     }
-  }
 
-  if (!upstreamRes) {
-    return NextResponse.json(
-      { error: `App on port ${port} did not respond after ${MAX_RETRIES}s — it may still be starting or may have crashed. Check workspace logs.` },
-      { status: 502 },
-    );
-  }
-
-  const contentType = upstreamRes.headers.get("content-type") ?? "";
-  const proxyBase = `/api/app-proxy/${id}/`;
-
-  if (contentType.includes("text/html")) {
-    let html = await upstreamRes.text();
-    const rewriteAbsoluteToProxy = (value: string): string =>
-      value
-        .replace(
-          /=\s*(["'])\/(?!\/)([^"']*)\1/g,
-          (_match, quote: string, path: string) =>
-            `=${quote}${proxyBase}${path}${quote}`,
-        )
-        .replace(
-          /=\s*\/(?!\/)([^\s"'=<>`]+)/g,
-          (_match, path: string) => `=${proxyBase}${path}`,
-        );
-
-    html = rewriteAbsoluteToProxy(html);
-    // Make relative URLs resolve through our proxy
-    const baseTag = `<base href="${proxyBase}">`;
-    if (html.includes("<head>")) {
-      html = html.replace("<head>", `<head>${baseTag}`);
-    } else {
-      html = baseTag + html;
+    if (workspace.state === "Failed") {
+      const elapsed = Date.now() - startedAt;
+      const logs = await getWorkspaceLogs(id);
+      return NextResponse.json(
+        {
+          error: "Workspace failed to become ready.",
+          status: "failed",
+          framework: workspace.framework ?? "unknown",
+          workspaceState: workspace.state,
+          port: workspace.ports?.[0]?.port ?? null,
+          lastProbe,
+          startupElapsedSeconds: Math.floor(elapsed / 1000),
+          startupMaxSeconds: Math.floor(maxWaitMs / 1000),
+          logs: logs.slice(-5),
+        },
+        { status: 502 },
+      );
     }
-    return new NextResponse(html, {
-      status: upstreamRes.status,
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
+
+    if (attempt % 2 === 0 || lastLogs.length === 0) {
+      const logs = await getWorkspaceLogs(id);
+      if (logs.length > 0) {
+        lastLogs = logs.slice(-5);
+        if (lastProbe === "port unavailable" && READY_LOG_PATTERN.test(lastLogs.join("\n"))) {
+          lastProbe = "startup logs indicate server is initializing";
+        }
+      }
+    }
+
+    const delay = retryDelayMs(attempt);
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= maxWaitMs) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, Math.min(delay, maxWaitMs - elapsed)));
+    attempt += 1;
+    const refreshed = await getWorkspace(id);
+    if (!refreshed) {
+      break;
+    }
+    workspace = refreshed;
   }
 
-  const responseHeaders = new Headers();
-  responseHeaders.set("content-type", contentType || "application/octet-stream");
-  const cacheControl = upstreamRes.headers.get("cache-control");
-  if (cacheControl) responseHeaders.set("cache-control", cacheControl);
-
-  return new NextResponse(upstreamRes.body, {
-    status: upstreamRes.status,
-    headers: responseHeaders,
-  });
+  const elapsed = Date.now() - startedAt;
+  return NextResponse.json(
+    {
+      status: "starting",
+      framework: workspace.framework ?? "unknown",
+      workspaceState: workspace.state ?? "unknown",
+      port: workspace.ports?.[0]?.port ?? null,
+      progress: progressPercent(elapsed, maxWaitMs),
+      lastProbe,
+      startupElapsedSeconds: Math.floor(elapsed / 1000),
+      startupMaxSeconds: Math.floor(maxWaitMs / 1000),
+      logs: lastLogs,
+    },
+    { status: 202 },
+  );
 }
 
 export async function GET(
