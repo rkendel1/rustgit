@@ -9,6 +9,7 @@ const API_BASE_URL =
     ? "http://localhost:8080"
     : "https://api.trythissoftware.com");
 
+const DEFAULT_ASK_QUESTION = "Summarize what this repository does and the best way to run it.";
 const SCORE_DECIMAL_PLACES = 1;
 const CONFIDENCE_DECIMAL_PLACES = 2;
 const PORTAL_NAME = "RustGit Portal";
@@ -461,6 +462,8 @@ export default function Home() {
           repo_url: repo.repoUrl,
           branch: branch.trim() || "main",
           commit: null,
+          include_repository_summary: true,
+          ask_question: DEFAULT_ASK_QUESTION,
         }),
       };
       const analyzeResponse = await fetch(ANALYZE_PATH, analyzeRequest);

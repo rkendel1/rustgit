@@ -150,6 +150,8 @@ struct AnalyzeRequest {
     repo_url: Option<String>,
     branch: Option<String>,
     commit: Option<String>,
+    include_repository_summary: Option<bool>,
+    ask_question: Option<String>,
 }
 
 fn err_response(err: RuntimeError) -> (StatusCode, Json<Value>) {
@@ -357,6 +359,8 @@ async fn analyze_repository(
     Json(body): Json<AnalyzeRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let started = Instant::now();
+    let include_repository_summary = body.include_repository_summary.unwrap_or(false);
+    let ask_question = body.ask_question.as_deref();
     let repo_url = resolve_repo_url(body.repo_url, body.url, body.owner, body.repo)?;
     let branch = body
         .branch
@@ -375,7 +379,9 @@ async fn analyze_repository(
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-        enrich_analyze_payload(&mut payload);
+        if include_repository_summary {
+            enrich_analyze_payload(&mut payload, ask_question);
+        }
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
                 idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
@@ -399,7 +405,9 @@ async fn analyze_repository(
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-        enrich_analyze_payload(&mut payload);
+        if include_repository_summary {
+            enrich_analyze_payload(&mut payload, ask_question);
+        }
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
                 idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
@@ -417,7 +425,9 @@ async fn analyze_repository(
     let mut payload = result.payload;
     payload["cached"] = json!(false);
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-    enrich_analyze_payload(&mut payload);
+    if include_repository_summary {
+        enrich_analyze_payload(&mut payload, ask_question);
+    }
     state
         .analyze_cache
         .put(resolved_cache_key.clone(), payload.clone());
@@ -569,13 +579,11 @@ fn repository_ask_from_payload(payload: &Value, question: Option<&str>) -> Value
     })
 }
 
-fn enrich_analyze_payload(payload: &mut Value) {
+fn enrich_analyze_payload(payload: &mut Value, question: Option<&str>) {
     if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
         payload["repository_intelligence"] =
             repository_intelligence_from_payload(fingerprint_id, payload);
-        payload["repository_ask"] = repository_ask_from_payload(payload, Some(
-            "Summarize what this repository does and the best way to run it.",
-        ));
+        payload["repository_ask"] = repository_ask_from_payload(payload, question);
     }
 }
 
@@ -1312,6 +1320,14 @@ mod tests {
             payload["traceability"]["phase3_manifest_first"].as_bool(),
             Some(true)
         );
+        assert!(
+            payload.get("repository_intelligence").is_none(),
+            "analyze should only include repository summary projections when explicitly requested"
+        );
+        assert!(
+            payload.get("repository_ask").is_none(),
+            "analyze should only include repository summary projections when explicitly requested"
+        );
         assert!(repo.join(".ddockit/manifest.json").exists());
 
         let second = app
@@ -1331,6 +1347,8 @@ mod tests {
         let second_payload: serde_json::Value =
             serde_json::from_slice(&second_body).expect("second json");
         assert_eq!(second_payload["cached"].as_bool(), Some(true));
+        assert!(second_payload.get("repository_intelligence").is_none());
+        assert!(second_payload.get("repository_ask").is_none());
     }
 
     #[tokio::test]
@@ -1364,7 +1382,9 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "repo_url": repo_url,
-                            "branch": "main"
+                            "branch": "main",
+                            "include_repository_summary": true,
+                            "ask_question": "Summarize what this repository does and the best way to run it."
                         })
                         .to_string(),
                     ))

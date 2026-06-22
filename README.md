@@ -66,7 +66,7 @@ This badge updates automatically based on repository execution health.
 - **Repository knowledge graph assembly** from execution, failure, healing, temporal recovery, dependency, and architecture data.
 - **Repository ask service** (`POST /api/repositories/{id}/ask`) that builds an answer with confidence and evidence links.
 - **Repository intelligence panel endpoint** (`GET /api/repositories/{id}/intelligence`) used by product surfaces for score/runtime/action summaries.
-- **Consolidated analyze response** (`POST /api/analyze`) now includes `repository_intelligence` and `repository_ask` projections so UIs can avoid extra follow-up calls.
+- **Optional consolidated analyze response** (`POST /api/analyze`) can include `repository_intelligence` and `repository_ask` when `include_repository_summary=true` so UIs can do one efficient call without extra endpoint fan-out.
 - **Preflight Intelligence & Environment Synthesis payloads** embedded in `POST /api/v1/repositories/analyze` and `POST /api/v1/execution/plan` responses.
 - **Execution intelligence loop endpoints** for retrieval, learning, and optimization:
   - `GET /intelligence/{execution}`
