@@ -296,6 +296,20 @@
   gap: 0.35rem;
 }
 
+.previewFrame {
+  margin-top: 0.5rem;
+  border: 1px solid #dbeafe;
+  border-radius: 0.65rem;
+  overflow: hidden;
+  background: #f8fbff;
+}
+
+.previewImage {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
 /* Workspace live view inside Execution Details */
 .workspaceHeader {
   display: flex;
