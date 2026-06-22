@@ -160,10 +160,12 @@ async function handle(
       responseHeaders.set("location", rewritten);
     } catch (error) {
       // If Location is malformed, leave it as-is rather than failing the proxy response.
-      console.warn("App proxy Location rewrite failed", error);
+      console.warn("App proxy Location rewrite failed", { location, error });
     }
   }
   // Strip hop-by-hop headers that don't make sense to replay across origins.
+  // content-length is recalculated by the runtime if needed; keeping upstream's
+  // value risks mismatches once this proxy rewrites headers/body framing.
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
   return new NextResponse(upstreamRes.body, {
