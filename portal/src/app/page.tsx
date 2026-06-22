@@ -325,6 +325,7 @@ export default function Home() {
   const [workspacePreviewError, setWorkspacePreviewError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
   const [envConfig, setEnvConfig] = useState<Record<string, string>>({});
+  const [envExampleHints, setEnvExampleHints] = useState<Record<string, string>>({});
   const [freeingSpace, setFreeingSpace] = useState(false);
   const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
@@ -370,6 +371,7 @@ export default function Home() {
     setWorkspacePreviewVersion(0);
     setWorkspacePreviewError(null);
     setEnvConfig({});
+    setEnvExampleHints({});
     setError(null);
   }
 
@@ -470,6 +472,21 @@ export default function Home() {
         if (cancelled) return;
         const files = payload.files ?? [];
         setWorkspaceFiles(files);
+        const envExamplePath = files.find(
+          (f) => f === ".env.example" || f === ".env.sample" || f === ".env.template",
+        );
+        if (envExamplePath) {
+          try {
+            const envRes = await fetch(
+              `/api/proxy/workspaces/${wsId}/files/${encodeWorkspacePath(envExamplePath)}`,
+              { cache: "no-store" },
+            );
+            if (envRes.ok) {
+              const envPayload = await readJsonResponse<WorkspaceFileResponse>(envRes);
+              if (!cancelled) setEnvExampleHints(parseKeyValueLines(envPayload.content ?? ""));
+            }
+          } catch { /* hints are best-effort */ }
+        }
         if (files.length === 0) {
           setSelectedWorkspaceFile(null);
           setSelectedWorkspaceFileContent("");
@@ -764,9 +781,8 @@ export default function Home() {
   const executionIntelligence = analyzeResult?.execution_intelligence;
   const launchPlan = analyzeResult?.launch_plan;
   const launchBranches = analyzeResult?.launch_overrides?.branches ?? [];
-  const requiredEnvVars = (executionIntelligence?.environmentVariables ?? [])
-    .filter((entry) => entry?.name)
-    .map((entry) => entry.name as string);
+  const envVarEntries = (executionIntelligence?.environmentVariables ?? [])
+    .filter((entry): entry is { name: string; required?: boolean } => Boolean(entry?.name));
   const healActions = [
     executionIntelligence?.workspace?.requiresSecrets ? "Fix missing .env" : null,
     !executionIntelligence?.docker?.dockerfile ? "Generate Dockerfile" : null,
@@ -975,15 +991,18 @@ export default function Home() {
               <strong>Memory</strong>
               <span>{workspace?.resource_quotas?.max_memory_mb ?? "—"} MB</span>
             </div>
-            {(() => {
-              const url = runResult?.workspace_url ?? workspace?.ports?.[0]?.route ?? null;
-              return url ? (
-                <div className={styles.tile} style={{ gridColumn: "1 / -1" }}>
-                  <strong>App URL</strong>
-                  <a href={url} target="_blank" rel="noreferrer">{url}</a>
+            {workspace?.ports && workspace.ports.length > 0 ? (
+              workspace.ports.map((p) => (
+                <div key={p.port} className={styles.tile} style={{ gridColumn: "1 / -1" }}>
+                  <strong>App URL{workspace.ports.length > 1 ? ` :${p.port}` : ""}</strong>
+                  {p.route ? (
+                    <a href={p.route} target="_blank" rel="noreferrer">{p.route}</a>
+                  ) : (
+                    <span>port {p.port} ({p.protocol})</span>
+                  )}
                 </div>
-              ) : null;
-            })()}
+              ))
+            ) : null}
           </div>
         </section>
 
@@ -1016,7 +1035,7 @@ export default function Home() {
             </div>
             <div className={styles.tile}>
               <strong>Environment</strong>
-              <span>{launchPlan?.environmentCount ?? requiredEnvVars.length} variables</span>
+              <span>{launchPlan?.environmentCount ?? envVarEntries.length} variables</span>
             </div>
             <div className={styles.tile}>
               <strong>Auto Heals</strong>
@@ -1183,18 +1202,23 @@ export default function Home() {
         <section className={styles.panel}>
           <h2>Environment Variables</h2>
           <p className={styles.hint}>Values are sent with every Run and Retry run for this repository.</p>
-          {requiredEnvVars.length === 0 ? (
-            <p className={styles.hint}>No required environment variables detected yet. Analyze a repository first.</p>
+          {envVarEntries.length === 0 ? (
+            <p className={styles.hint}>No environment variables detected yet. Analyze a repository first.</p>
           ) : (
             <div className={styles.envConfigGrid}>
-              {requiredEnvVars.map((name) => (
+              {envVarEntries.map(({ name, required }) => (
                 <div key={name}>
-                  <label htmlFor={`env-${name}`} className={styles.envVarName}>{name}</label>
+                  <div className={styles.envVarHeader}>
+                    <label htmlFor={`env-${name}`} className={styles.envVarName}>{name}</label>
+                    <span className={required !== false ? styles.envVarRequired : styles.envVarOptional}>
+                      {required !== false ? "required" : "optional"}
+                    </span>
+                  </div>
                   <input
                     id={`env-${name}`}
                     type="text"
                     className={styles.input}
-                    placeholder="value"
+                    placeholder={envExampleHints[name] ?? ""}
                     value={envConfig[name] ?? ""}
                     onChange={(e) => setEnvConfig((prev) => ({ ...prev, [name]: e.target.value }))}
                   />

@@ -206,13 +206,36 @@
   margin-top: 0.5rem;
 }
 
+.envVarHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
 .envVarName {
-  display: block;
   font-family: monospace;
   font-size: 0.82rem;
   font-weight: 600;
   color: #475569;
-  margin-bottom: 0.25rem;
+}
+
+.envVarRequired {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.envVarOptional {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #475569;
 }
 
 .branchRow {
@@ -605,6 +628,16 @@
   }
 
   .envVarName {
+    color: #94a3b8;
+  }
+
+  .envVarRequired {
+    background: #7f1d1d;
+    color: #fca5a5;
+  }
+
+  .envVarOptional {
+    background: #1e293b;
     color: #94a3b8;
   }
 
