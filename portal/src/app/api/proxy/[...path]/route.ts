@@ -9,6 +9,11 @@ const DEFAULT_API_BASE_URL =
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
 const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
+const ALLOWED_WEB_ORIGINS = new Set([
+  "https://trythissoftware.com",
+  "https://www.trythissoftware.com",
+  "https://rustgit.fly.dev",
+]);
 const CORS_ALLOW_METHODS = "GET, POST, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS = "Content-Type, Authorization";
 
@@ -69,7 +74,39 @@ function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
 }
 
-function upstreamFailureResponse(error: unknown, path: string): NextResponse {
+function resolveAllowedOrigin(request: NextRequest): string | null {
+  const origin = request.headers.get("origin");
+  if (!origin) {
+    return null;
+  }
+
+  if (
+    process.env.NODE_ENV === "development" &&
+    (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:"))
+  ) {
+    return origin;
+  }
+
+  if (ALLOWED_WEB_ORIGINS.has(origin)) {
+    return origin;
+  }
+
+  if (
+    origin.startsWith("chrome-extension://") ||
+    origin.startsWith("moz-extension://") ||
+    origin.startsWith("safari-web-extension://")
+  ) {
+    return origin;
+  }
+
+  return null;
+}
+
+function upstreamFailureResponse(
+  error: unknown,
+  path: string,
+  allowedOrigin: string | null,
+): NextResponse {
   const isTimeout = isTimeoutError(error);
   if (isTimeout) {
     const timeoutMs = timeoutForPath(path);
@@ -85,14 +122,19 @@ function upstreamFailureResponse(error: unknown, path: string): NextResponse {
     },
     { status: isTimeout ? 504 : 502 },
     ),
+    allowedOrigin,
   );
 }
 
-function withCorsHeaders(response: NextResponse): NextResponse {
-  response.headers.set("Access-Control-Allow-Origin", "*");
+function withCorsHeaders(response: NextResponse, allowedOrigin: string | null): NextResponse {
+  if (!allowedOrigin) {
+    return response;
+  }
+  response.headers.set("Access-Control-Allow-Origin", allowedOrigin);
   response.headers.set("Access-Control-Allow-Methods", CORS_ALLOW_METHODS);
   response.headers.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS);
   response.headers.set("Access-Control-Max-Age", "3600");
+  response.headers.set("Vary", "Origin");
   return response;
 }
 
@@ -101,6 +143,15 @@ async function proxyRequest(
   params: Promise<{ path: string[] }>,
 ): Promise<NextResponse> {
   const resolvedParams = await params;
+  const allowedOrigin = resolveAllowedOrigin(request);
+  const requestOrigin = request.headers.get("origin");
+  if (requestOrigin && !allowedOrigin) {
+    return NextResponse.json(
+      { error: "Origin is not allowed." },
+      { status: 403 },
+    );
+  }
+
   const joinedPath = resolvedParams.path
     .join("/")
     .replace(/\/{2,}/g, "/")
@@ -146,7 +197,7 @@ async function proxyRequest(
   try {
     upstreamResponse = await sendUpstreamRequest(upstreamUrl);
   } catch (error) {
-    return upstreamFailureResponse(error, joinedPath);
+    return upstreamFailureResponse(error, joinedPath, allowedOrigin);
   }
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
@@ -163,7 +214,7 @@ async function proxyRequest(
     try {
       upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
     } catch (error) {
-      return upstreamFailureResponse(error, joinedPath);
+      return upstreamFailureResponse(error, joinedPath, allowedOrigin);
     }
   }
 
@@ -175,6 +226,7 @@ async function proxyRequest(
           upstreamResponse.headers.get("content-type") ?? "application/json",
       },
     }),
+    allowedOrigin,
   );
 }
 
@@ -199,6 +251,10 @@ export async function DELETE(
   return proxyRequest(request, context.params);
 }
 
-export async function OPTIONS() {
-  return withCorsHeaders(new NextResponse(null, { status: 204 }));
+export async function OPTIONS(request: NextRequest) {
+  const allowedOrigin = resolveAllowedOrigin(request);
+  if (!allowedOrigin) {
+    return new NextResponse(null, { status: 403 });
+  }
+  return withCorsHeaders(new NextResponse(null, { status: 204 }), allowedOrigin);
 }
