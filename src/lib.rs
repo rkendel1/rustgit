@@ -12667,6 +12667,34 @@ impl WorkspaceManager {
         rendered
     }
 
+    fn extract_workdir_and_command(command: &str, default_dir: &Path) -> (PathBuf, String) {
+        let trimmed = command.trim();
+        let Some(remainder) = trimmed.strip_prefix("cd ") else {
+            return (default_dir.to_path_buf(), trimmed.to_string());
+        };
+        let (raw_dir, raw_command) = if let Some((dir, rest)) = remainder.split_once("&&") {
+            (dir.trim(), rest.trim())
+        } else {
+            (remainder.trim(), "")
+        };
+        if raw_dir.is_empty() {
+            return (default_dir.to_path_buf(), trimmed.to_string());
+        }
+        let raw_dir = raw_dir.trim_matches('"').trim_matches('\'');
+        let mut workdir = PathBuf::from(raw_dir);
+        if workdir.is_relative() {
+            workdir = default_dir.join(workdir);
+        }
+        let normalized_default =
+            fs::canonicalize(default_dir).unwrap_or_else(|_| default_dir.to_path_buf());
+        let normalized_workdir = fs::canonicalize(&workdir).unwrap_or_else(|_| workdir.clone());
+        if normalized_workdir.starts_with(&normalized_default) {
+            (workdir, raw_command.to_string())
+        } else {
+            (default_dir.to_path_buf(), raw_command.to_string())
+        }
+    }
+
     fn resolved_run_command(ctx: &ExecutionContext, overrides: &LaunchOverrides) -> Option<String> {
         overrides
             .start_command
@@ -12773,16 +12801,24 @@ impl WorkspaceManager {
                 .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
                 .and_then(|n| n.command.clone());
             if let Some(install) = install_cmd {
-                let mut parts = install.split_whitespace();
-                if let Some(program) = parts.next() {
-                    let args: Vec<&str> = parts.collect();
-                    logs.push(format!("installing dependencies: {install}"));
-                    let _ = Command::new(program)
-                        .args(&args)
-                        .current_dir(repo_path)
-                        .envs(&overrides.environment)
-                        .envs(&overrides.versions)
-                        .output();
+                let (install_cwd, install) = Self::extract_workdir_and_command(&install, repo_path);
+                if install.is_empty() {
+                    logs.push(
+                        "install command only changes directory and has no install step; skipping"
+                            .to_string(),
+                    );
+                } else {
+                    let mut parts = install.split_whitespace();
+                    if let Some(program) = parts.next() {
+                        let args: Vec<&str> = parts.collect();
+                        logs.push(format!("installing dependencies: {install}"));
+                        let _ = Command::new(program)
+                            .args(&args)
+                            .current_dir(&install_cwd)
+                            .envs(&overrides.environment)
+                            .envs(&overrides.versions)
+                            .output();
+                    }
                 }
             }
         }
@@ -12829,6 +12865,14 @@ impl WorkspaceManager {
         } else {
             run_cmd
         };
+        let (run_cwd, run_cmd) = Self::extract_workdir_and_command(&run_cmd, repo_path);
+        if run_cmd.is_empty() {
+            logs.push(
+                "run command only changes directory and has no run step; skipping process spawn"
+                    .to_string(),
+            );
+            return (None, None);
+        }
 
         let mut parts = run_cmd.splitn(2, ' ');
         let program = match parts.next() {
@@ -12846,7 +12890,7 @@ impl WorkspaceManager {
 
         let mut cmd = Command::new(&program);
         cmd.args(&args)
-            .current_dir(repo_path)
+            .current_dir(&run_cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(stderr_stdio);
@@ -19263,6 +19307,37 @@ dependencies:
             &overrides,
         );
         assert_eq!(rendered, "nvm use 20 && npm run dev");
+    }
+
+    #[test]
+    fn extract_workdir_and_command_parses_cd_prefix_with_chained_command() {
+        let default_dir = Path::new("/workspace/repo");
+        let (workdir, command) = WorkspaceManager::extract_workdir_and_command(
+            "cd /workspace/repo/apps/server && npm run dev -- --host 0.0.0.0",
+            default_dir,
+        );
+        assert_eq!(workdir, PathBuf::from("/workspace/repo/apps/server"));
+        assert_eq!(command, "npm run dev -- --host 0.0.0.0");
+    }
+
+    #[test]
+    fn extract_workdir_and_command_resolves_relative_cd_path() {
+        let default_dir = Path::new("/workspace/repo");
+        let (workdir, command) =
+            WorkspaceManager::extract_workdir_and_command("cd apps/server && npm ci", default_dir);
+        assert_eq!(workdir, PathBuf::from("/workspace/repo/apps/server"));
+        assert_eq!(command, "npm ci");
+    }
+
+    #[test]
+    fn extract_workdir_and_command_rejects_workdir_outside_default() {
+        let default_dir = temp_dir("extract-workdir-default");
+        let outside_dir = temp_dir("extract-workdir-outside");
+        let command = format!("cd {} && npm run dev", outside_dir.display());
+        let (workdir, extracted) =
+            WorkspaceManager::extract_workdir_and_command(&command, default_dir.as_path());
+        assert_eq!(workdir, default_dir);
+        assert_eq!(extracted, "npm run dev");
     }
 
     #[test]
