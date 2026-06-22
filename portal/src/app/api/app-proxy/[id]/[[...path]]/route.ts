@@ -158,8 +158,9 @@ async function handle(
         id,
       );
       responseHeaders.set("location", rewritten);
-    } catch {
+    } catch (error) {
       // If Location is malformed, leave it as-is rather than failing the proxy response.
+      console.warn("App proxy Location rewrite failed", error);
     }
   }
   // Strip hop-by-hop headers that don't make sense to replay across origins.
