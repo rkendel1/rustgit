@@ -473,8 +473,8 @@ export default function Home() {
       setIntelligence(analyzed.repository_intelligence ?? null);
       setRepoAnswer(analyzed.repository_ask ?? null);
       const missing: string[] = [];
-      if (!analyzed.repository_intelligence) missing.push("repository intelligence panel");
-      if (!analyzed.repository_ask) missing.push("repository ask summary");
+      if (!analyzed.repository_intelligence) missing.push("repository intelligence");
+      if (!analyzed.repository_ask) missing.push("repository ask");
       if (missing.length > 0) {
         setError(`Analysis succeeded, but ${missing.join(" and ")} could not be loaded.`);
       }
