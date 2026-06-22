@@ -9,8 +9,19 @@ const DEFAULT_API_BASE_URL =
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
 const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
-// Keep proxy calls bounded so UI operations (like Analyze) fail fast instead of hanging indefinitely.
-const UPSTREAM_REQUEST_TIMEOUT_MS = 15_000;
+
+// Default timeout for most proxy calls.
+const DEFAULT_TIMEOUT_MS = 30_000;
+// Analyze clones the repo + detects frameworks — allow up to 3 minutes on slow hosts.
+const ANALYZE_TIMEOUT_MS = 180_000;
+
+function timeoutForPath(path: string): number {
+  const normalized = path.replace(/^\/+/, "").toLowerCase();
+  if (normalized === "api/analyze" || normalized.endsWith("/analyze")) {
+    return ANALYZE_TIMEOUT_MS;
+  }
+  return DEFAULT_TIMEOUT_MS;
+}
 
 function resolveApiBaseUrl(request: NextRequest): string {
   const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
@@ -59,8 +70,9 @@ function isTimeoutError(error: unknown): boolean {
 function upstreamFailureResponse(error: unknown, path: string): NextResponse {
   const isTimeout = isTimeoutError(error);
   if (isTimeout) {
+    const timeoutMs = timeoutForPath(path);
     console.warn(
-      `Proxy upstream request timed out after ${UPSTREAM_REQUEST_TIMEOUT_MS}ms for path: ${path}`,
+      `Proxy upstream request timed out after ${timeoutMs}ms for path: ${path}`,
     );
   }
   return NextResponse.json(
@@ -102,9 +114,10 @@ async function proxyRequest(
       ? undefined
       : new Uint8Array(await request.arrayBuffer());
 
+  const requestTimeoutMs = timeoutForPath(joinedPath);
   const sendUpstreamRequest = async (url: URL): Promise<Response> => {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
     try {
       return await fetch(url, {
         method: request.method,
