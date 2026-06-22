@@ -472,10 +472,11 @@ export default function Home() {
       setAnalyzedRepoUrl(repo.repoUrl);
       setIntelligence(analyzed.repository_intelligence ?? null);
       setRepoAnswer(analyzed.repository_ask ?? null);
-      if (!analyzed.repository_intelligence || !analyzed.repository_ask) {
-        setError(
-          "Analysis succeeded, but repository intelligence summary was incomplete.",
-        );
+      const missing: string[] = [];
+      if (!analyzed.repository_intelligence) missing.push("repository intelligence");
+      if (!analyzed.repository_ask) missing.push("repository summary");
+      if (missing.length > 0) {
+        setError(`Analysis succeeded, but ${missing.join(" and ")} could not be loaded.`);
       }
     } catch (caught) {
       setAnalyzeResult(null);
