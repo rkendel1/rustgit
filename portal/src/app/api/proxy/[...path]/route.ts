@@ -138,6 +138,16 @@ function withCorsHeaders(response: NextResponse, allowedOrigin: string | null): 
   return response;
 }
 
+function forbiddenOriginResponse(origin: string): NextResponse {
+  return withCorsHeaders(
+    NextResponse.json(
+      { error: "Origin is not allowed." },
+      { status: 403 },
+    ),
+    origin,
+  );
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
@@ -146,10 +156,7 @@ async function proxyRequest(
   const allowedOrigin = resolveAllowedOrigin(request);
   const requestOrigin = request.headers.get("origin");
   if (requestOrigin && !allowedOrigin) {
-    return NextResponse.json(
-      { error: "Origin is not allowed." },
-      { status: 403 },
-    );
+    return forbiddenOriginResponse(requestOrigin);
   }
 
   const joinedPath = resolvedParams.path
@@ -253,8 +260,12 @@ export async function DELETE(
 
 export async function OPTIONS(request: NextRequest) {
   const allowedOrigin = resolveAllowedOrigin(request);
+  const requestOrigin = request.headers.get("origin");
   if (!allowedOrigin) {
-    return new NextResponse(null, { status: 403 });
+    if (!requestOrigin) {
+      return new NextResponse(null, { status: 403 });
+    }
+    return forbiddenOriginResponse(requestOrigin);
   }
   return withCorsHeaders(new NextResponse(null, { status: 204 }), allowedOrigin);
 }
