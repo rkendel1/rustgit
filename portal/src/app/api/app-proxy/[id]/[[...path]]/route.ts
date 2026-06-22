@@ -26,6 +26,16 @@ type WorkspaceRuntime = {
   last_probe?: string;
   stdout?: string[];
   stderr?: string[];
+  executionHandle?: {
+    workspace_id?: string;
+    provider_id?: string;
+    execution_id?: string;
+    routing_mode?: "Local" | "Wasm" | "Remote" | "Hybrid";
+    endpoint?: string | null;
+    stream_channel?: string | null;
+    readiness_state?: string;
+    authority_node?: string;
+  } | null;
 };
 
 function escapeHtml(value: string): string {
@@ -66,10 +76,13 @@ async function handle(
   const { id, path } = await params;
   const runtime = await getRuntime(id);
   const truth = runtime ?? {};
+  const executionHandle = truth.executionHandle ?? null;
   const port = truth.actual_port ?? null;
-  const isReady = Boolean(truth.http_ready && port);
+  const fallbackLocalEndpoint = port ? `http://127.0.0.1:${port}` : null;
+  const endpoint = executionHandle?.endpoint ?? fallbackLocalEndpoint;
+  const isReady = Boolean(truth.http_ready || truth.readiness_state === "ready");
 
-  if (!isReady || !port) {
+  if (!isReady) {
     const payload = {
       workspaceId: id,
       framework: truth.framework ?? "unknown",
@@ -82,6 +95,7 @@ async function handle(
       actualPort: truth.actual_port ?? null,
       processAlive: truth.alive ?? false,
       httpReady: truth.http_ready ?? false,
+      executionHandle,
       lastProbe: truth.last_http_probe ?? "connection refused",
       detectedStartSignal: truth.detected_start_signal ?? null,
       logs: [...(truth.stdout ?? []), ...(truth.stderr ?? [])].slice(-20),
@@ -97,15 +111,16 @@ async function handle(
     return NextResponse.json(payload, { status: 202 });
   }
 
-  const subPath = path ? path.join("/") : "";
-  const upstreamUrl = `http://127.0.0.1:${port}/${subPath}${request.nextUrl.search}`;
+  const subPath = (path ?? []).map((segment) => encodeURIComponent(segment)).join("/");
+  const upstreamUrl = endpoint
+    ? `${endpoint.replace(/\/$/, "")}/${subPath}${request.nextUrl.search}`
+    : `${BACKEND_BASE}/api/proxy/api/v1/workspaces/${encodeURIComponent(id)}/proxy/${subPath}${request.nextUrl.search}`;
   const forwardHeaders = new Headers();
   request.headers.forEach((value, key) => {
     if (!["host", "connection", "transfer-encoding"].includes(key.toLowerCase())) {
       forwardHeaders.set(key, value);
     }
   });
-  forwardHeaders.set("host", `127.0.0.1:${port}`);
   const body =
     request.method !== "GET" && request.method !== "HEAD"
       ? new Uint8Array(await request.arrayBuffer())
