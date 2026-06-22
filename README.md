@@ -375,6 +375,7 @@ fly deploy --config deploy/fly/postgres.fly.toml
 
 # Create persistent workspace volumes so analyze/runtime caches survive restarts.
 # --size is in GB on Fly; this creates 10GB volumes for each app.
+# Fly volumes are single-machine mounts, so these configs run one warm machine per app.
 fly volumes create workspace_data --app trythissoftware-api --region iad --size 10
 fly volumes create workspace_data --app trythissoftware-workspaces --region iad --size 10
 
