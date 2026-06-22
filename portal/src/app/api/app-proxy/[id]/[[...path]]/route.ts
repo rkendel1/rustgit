@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { rewriteLocationHeader } from "./location-rewrite";
 
 const BACKEND_BASE =
   process.env.NODE_ENV === "development"
@@ -144,10 +145,28 @@ async function handle(
     headers: forwardHeaders,
     body,
     signal: AbortSignal.timeout(MAX_PROBE_TIMEOUT_MS),
+    redirect: "manual",
   });
+  const responseHeaders = new Headers(upstreamRes.headers);
+  const location = responseHeaders.get("location");
+  if (location && endpoint) {
+    try {
+      const rewritten = rewriteLocationHeader(
+        location,
+        endpoint,
+        new URL(request.url).origin,
+        id,
+      );
+      responseHeaders.set("location", rewritten);
+    } catch {
+      // If Location is malformed, leave it as-is.
+    }
+  }
+  responseHeaders.delete("content-encoding");
+  responseHeaders.delete("content-length");
   return new NextResponse(upstreamRes.body, {
     status: upstreamRes.status,
-    headers: upstreamRes.headers,
+    headers: responseHeaders,
   });
 }
 
