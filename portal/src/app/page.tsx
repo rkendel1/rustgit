@@ -866,54 +866,6 @@ export default function Home() {
           <p>Launch and monitor execution from the same workspace.</p>
         </header>
 
-        {runResult?.execution_id ? (
-          <section className={styles.panel}>
-            <h2>Workspace files (pre-heal)</h2>
-            <p className={styles.hint}>
-              Inspect files to decide which environment variables, versions, and start commands to set.
-            </p>
-            {workspaceFilesError ? <p className={styles.hint}>{workspaceFilesError}</p> : null}
-            {workspaceFilesLoading ? (
-              <p className={styles.hint}>Loading files…</p>
-            ) : workspaceFiles.length === 0 ? (
-              <p className={styles.hint}>No files available yet.</p>
-            ) : (
-              <>
-                <div className={styles.fileTree}>
-                  {renderWorkspaceFileTree(workspaceFileTree)}
-                </div>
-                <div className={styles.logSection}>
-                  <div className={styles.logHeader}>
-                    <span className={styles.logTitle}>{selectedWorkspaceFile ?? "Select a file"}</span>
-                    <button
-                      type="button"
-                      className={styles.btnRestart}
-                      onClick={handleSaveWorkspaceFile}
-                      disabled={!selectedWorkspaceFile || !workspaceFileDirty || workspaceFileSaving}
-                    >
-                      {workspaceFileSaving ? "Saving…" : "Save"}
-                    </button>
-                  </div>
-                  {workspaceFileMessage ? <p className={styles.hint}>{workspaceFileMessage}</p> : null}
-                  <textarea
-                    className={styles.fileEditor}
-                    value={workspaceFileDraft}
-                    onChange={(event) => {
-                      const nextValue = event.target.value;
-                      setWorkspaceFileDraft(nextValue);
-                      setWorkspaceFileDirty(nextValue !== selectedWorkspaceFileContent);
-                      if (workspaceFileMessage) setWorkspaceFileMessage(null);
-                    }}
-                    spellCheck={false}
-                    placeholder="No content available."
-                    disabled={!selectedWorkspaceFile}
-                  />
-                </div>
-              </>
-            )}
-          </section>
-        ) : null}
-
         {workspace ? (
           <section className={styles.panel}>
             <div className={styles.workspaceHeader}>
@@ -980,48 +932,6 @@ export default function Home() {
               ))}
             </div>
 
-            {workspace.state === "Failed" && (
-              <div className={styles.healPanel}>
-                <p className={styles.healTitle}>Heal &amp; retry</p>
-                <label htmlFor="heal-branch" className={styles.label}>Branch</label>
-                <input
-                  id="heal-branch"
-                  type="text"
-                  value={branch}
-                  onChange={(e) => setBranch(e.target.value)}
-                  placeholder="main"
-                  className={styles.input}
-                />
-                <label htmlFor="heal-cmd" className={styles.label}>Start command override</label>
-                <input
-                  id="heal-cmd"
-                  type="text"
-                  value={startCommand}
-                  onChange={(e) => setStartCommand(e.target.value)}
-                  placeholder="npm run dev -- --host 0.0.0.0"
-                  className={styles.input}
-                />
-                <label htmlFor="heal-env" className={styles.label}>Environment overrides (KEY=value per line)</label>
-                <textarea
-                  id="heal-env"
-                  value={envOverrides}
-                  onChange={(e) => setEnvOverrides(e.target.value)}
-                  placeholder={"PORT=3000\nNODE_ENV=development"}
-                  className={styles.input}
-                  rows={3}
-                />
-                <label htmlFor="heal-versions" className={styles.label}>Version overrides (KEY=value per line)</label>
-                <textarea
-                  id="heal-versions"
-                  value={versionOverrides}
-                  onChange={(e) => setVersionOverrides(e.target.value)}
-                  placeholder={"NODE_VERSION=20\nPYTHON_VERSION=3.12"}
-                  className={styles.input}
-                  rows={2}
-                />
-              </div>
-            )}
-
             <div className={styles.logSection}>
               <div className={styles.logHeader}>
                 <span className={styles.logTitle}>Logs</span>
@@ -1065,6 +975,97 @@ export default function Home() {
             <p>Run a repository to populate execution status and workspace links.</p>
           </section>
         )}
+
+        <section className={styles.panel}>
+          <h2>Launch overrides</h2>
+          <p className={styles.hint}>
+            Set optional branch, start command, environment, and version values for Run and Retry run.
+          </p>
+          <label htmlFor="launch-branch" className={styles.label}>Branch</label>
+          <input
+            id="launch-branch"
+            type="text"
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            placeholder="main"
+            className={styles.input}
+          />
+          <label htmlFor="launch-cmd" className={styles.label}>Start command override</label>
+          <input
+            id="launch-cmd"
+            type="text"
+            value={startCommand}
+            onChange={(e) => setStartCommand(e.target.value)}
+            placeholder="npm run dev -- --host 0.0.0.0"
+            className={styles.input}
+          />
+          <label htmlFor="launch-env" className={styles.label}>Environment overrides (KEY=value per line)</label>
+          <textarea
+            id="launch-env"
+            value={envOverrides}
+            onChange={(e) => setEnvOverrides(e.target.value)}
+            placeholder={"PORT=3000\nNODE_ENV=development"}
+            className={styles.input}
+            rows={3}
+          />
+          <label htmlFor="launch-versions" className={styles.label}>Version overrides (KEY=value per line)</label>
+          <textarea
+            id="launch-versions"
+            value={versionOverrides}
+            onChange={(e) => setVersionOverrides(e.target.value)}
+            placeholder={"NODE_VERSION=20\nPYTHON_VERSION=3.12"}
+            className={styles.input}
+            rows={2}
+          />
+        </section>
+
+        {runResult?.execution_id ? (
+          <section className={styles.panel}>
+            <h2>Workspace files (pre-heal)</h2>
+            <p className={styles.hint}>
+              Inspect files to decide which environment variables, versions, and start commands to set.
+            </p>
+            {workspaceFilesError ? <p className={styles.hint}>{workspaceFilesError}</p> : null}
+            {workspaceFilesLoading ? (
+              <p className={styles.hint}>Loading files…</p>
+            ) : workspaceFiles.length === 0 ? (
+              <p className={styles.hint}>No files available yet.</p>
+            ) : (
+              <>
+                <div className={styles.fileTree}>
+                  {renderWorkspaceFileTree(workspaceFileTree)}
+                </div>
+                <div className={styles.logSection}>
+                  <div className={styles.logHeader}>
+                    <span className={styles.logTitle}>{selectedWorkspaceFile ?? "Select a file"}</span>
+                    <button
+                      type="button"
+                      className={styles.btnRestart}
+                      onClick={handleSaveWorkspaceFile}
+                      disabled={!selectedWorkspaceFile || !workspaceFileDirty || workspaceFileSaving}
+                    >
+                      {workspaceFileSaving ? "Saving…" : "Save"}
+                    </button>
+                  </div>
+                  {workspaceFileMessage ? <p className={styles.hint}>{workspaceFileMessage}</p> : null}
+                  <textarea
+                    className={styles.fileEditor}
+                    value={workspaceFileDraft}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      setWorkspaceFileDraft(nextValue);
+                      setWorkspaceFileDirty(nextValue !== selectedWorkspaceFileContent);
+                      if (workspaceFileMessage) setWorkspaceFileMessage(null);
+                    }}
+                    spellCheck={false}
+                    placeholder="No content available."
+                    disabled={!selectedWorkspaceFile}
+                  />
+                </div>
+              </>
+            )}
+          </section>
+        ) : null}
 
         {workspace ? (
           <section className={styles.panel}>
