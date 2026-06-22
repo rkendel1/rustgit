@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { rewriteLocationHeader } from "./location-rewrite";
 
 const BACKEND_BASE =
   process.env.NODE_ENV === "development"
@@ -144,10 +145,37 @@ async function handle(
     headers: forwardHeaders,
     body,
     signal: AbortSignal.timeout(MAX_PROBE_TIMEOUT_MS),
+    redirect: "manual",
   });
+  const responseHeaders = new Headers(upstreamRes.headers);
+  const location = responseHeaders.get("location");
+  if (location && endpoint) {
+    try {
+      const rewritten = rewriteLocationHeader(
+        location,
+        endpoint,
+        new URL(request.url).origin,
+        id,
+      );
+      responseHeaders.set("location", rewritten);
+    } catch (error) {
+      // If Location is malformed, leave it as-is rather than failing the proxy response.
+      console.warn("App proxy Location rewrite failed", {
+        location,
+        endpoint,
+        workspaceId: id,
+        error,
+      });
+    }
+  }
+  // Strip hop-by-hop headers that don't make sense to replay across origins.
+  // content-length is recalculated by the runtime if needed; keeping upstream's
+  // value risks mismatches once this proxy rewrites headers/body framing.
+  responseHeaders.delete("content-encoding");
+  responseHeaders.delete("content-length");
   return new NextResponse(upstreamRes.body, {
     status: upstreamRes.status,
-    headers: upstreamRes.headers,
+    headers: responseHeaders,
   });
 }
 
