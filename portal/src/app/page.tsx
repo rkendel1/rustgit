@@ -27,16 +27,31 @@ type AnalyzeResponse = {
   services?: string[];
   manifest?: { version?: number; path?: string };
   execution_intelligence?: ExecutionIntelligence;
+  launch_overrides?: { branches?: LaunchBranch[] };
+  launch_plan?: LaunchPlan;
   repository_intelligence?: RepositoryIntelligenceResponse;
   repository_ask?: RepositoryAskResponse;
+};
+
+type LaunchBranch = {
+  branch?: string;
+  lastCommit?: string;
+  author?: string;
+  timestamp?: string;
+  timestampUnix?: number;
 };
 
 type ExecutionIntelligence = {
   framework?: string;
   execution?: { preferred?: string; fallback?: string; confidence?: number };
+  executionConfidence?: { score?: number; reasons?: string[] };
   docker?: { dockerfile?: boolean; compose?: boolean; command?: string };
   packageManager?: string;
   startCommand?: string;
+  recommendedCommand?: string;
+  preferredRuntime?: string;
+  nodeVersion?: string;
+  autoHealsApplied?: string[];
   buildCommand?: string;
   environmentVariables?: { name?: string; required?: boolean }[];
   workspace?: { requiresDocker?: boolean; requiresSecrets?: boolean };
@@ -114,6 +129,17 @@ type RepositoryAskResponse = {
   answer?: string;
   confidence?: number;
   evidence?: string[];
+};
+
+type LaunchPlan = {
+  repository?: string;
+  branch?: string;
+  runtime?: string;
+  packageManager?: string;
+  nodeVersion?: string;
+  command?: string;
+  environmentCount?: number;
+  autoHealsApplied?: string[];
 };
 
 function createAnonymousId(prefix: string): string {
@@ -631,6 +657,12 @@ export default function Home() {
       const analyzeResponse = await fetch(ANALYZE_PATH, analyzeRequest);
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
+      const discoveredBranches = (analyzed.launch_overrides?.branches ?? [])
+        .map((entry) => entry.branch?.trim())
+        .filter((entry): entry is string => Boolean(entry));
+      if (discoveredBranches.length > 0) {
+        setBranch(discoveredBranches[0]);
+      }
       setIntelligence(analyzed.repository_intelligence ?? null);
       setRepoAnswer(analyzed.repository_ask ?? null);
       const missing: string[] = [];
@@ -725,6 +757,8 @@ export default function Home() {
     : NO_REPOSITORY_SELECTED;
   const avatarLetter = parsedRepo?.owner?.charAt(0).toUpperCase() || DEFAULT_AVATAR_LETTER;
   const executionIntelligence = analyzeResult?.execution_intelligence;
+  const launchPlan = analyzeResult?.launch_plan;
+  const launchBranches = analyzeResult?.launch_overrides?.branches ?? [];
   const requiredEnvVars = (executionIntelligence?.environmentVariables ?? [])
     .filter((entry) => entry?.name)
     .map((entry) => entry.name as string);
@@ -940,6 +974,44 @@ export default function Home() {
         </section>
 
         <section className={styles.panel}>
+          <h2>Launch Plan</h2>
+          <div className={styles.grid}>
+            <div className={styles.tile}>
+              <strong>Repository</strong>
+              <code>{launchPlan?.repository ?? analyzeResult?.repo_url ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Branch</strong>
+              <span>{launchPlan?.branch ?? (branch || "n/a")}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Runtime</strong>
+              <span>{launchPlan?.runtime ?? executionIntelligence?.preferredRuntime ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Package Manager</strong>
+              <span>{launchPlan?.packageManager ?? executionIntelligence?.packageManager ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Node</strong>
+              <span>{launchPlan?.nodeVersion ?? executionIntelligence?.nodeVersion ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Command</strong>
+              <code>{launchPlan?.command ?? executionIntelligence?.recommendedCommand ?? executionIntelligence?.startCommand ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Environment</strong>
+              <span>{launchPlan?.environmentCount ?? requiredEnvVars.length} variables</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Auto Heals</strong>
+              <span>{(launchPlan?.autoHealsApplied ?? executionIntelligence?.autoHealsApplied ?? []).join(", ") || "none"}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className={styles.panel}>
           <h2>Execution Intelligence</h2>
           <div className={styles.grid}>
             <div className={styles.tile}>
@@ -956,7 +1028,7 @@ export default function Home() {
             </div>
             <div className={styles.tile}>
               <strong>Confidence</strong>
-              <span>{executionIntelligence?.execution?.confidence ?? "n/a"}</span>
+              <span>{executionIntelligence?.executionConfidence?.score ?? executionIntelligence?.execution?.confidence ?? "n/a"}%</span>
             </div>
             <div className={styles.tile}>
               <strong>Recommended runtime</strong>
@@ -964,7 +1036,7 @@ export default function Home() {
             </div>
             <div className={styles.tile}>
               <strong>Command</strong>
-              <span>{executionIntelligence?.docker?.command ?? executionIntelligence?.execution?.preferred ?? "n/a"}</span>
+              <span>{executionIntelligence?.recommendedCommand ?? executionIntelligence?.docker?.command ?? executionIntelligence?.execution?.preferred ?? "n/a"}</span>
             </div>
             <div className={styles.tile}>
               <strong>Start command</strong>
@@ -975,6 +1047,13 @@ export default function Home() {
               <code>{analyzeResult?.manifest?.path ?? ".execution.json"}</code>
             </div>
           </div>
+          {(executionIntelligence?.executionConfidence?.reasons ?? []).length > 0 ? (
+            <ul className={styles.fileTreeList}>
+              {(executionIntelligence?.executionConfidence?.reasons ?? []).map((reason) => (
+                <li key={reason}>✓ {reason}</li>
+              ))}
+            </ul>
+          ) : null}
         </section>
 
         <section className={styles.panel}>
@@ -1011,7 +1090,7 @@ export default function Home() {
         </section>
 
         <section className={styles.panel}>
-          <h2>Retry Execution</h2>
+          <h2>Launch Overrides</h2>
           <p className={styles.hint}>
             Override runtime and start command for Retry run.
           </p>
@@ -1029,14 +1108,28 @@ export default function Home() {
             <option value="bun">Bun</option>
           </select>
           <label htmlFor="launch-branch" className={styles.label}>Branch</label>
-          <input
+          <select
             id="launch-branch"
-            type="text"
             value={branch}
             onChange={(e) => setBranch(e.target.value)}
-            placeholder="main"
             className={styles.input}
-          />
+          >
+            {launchBranches.length > 0 ? (
+              launchBranches.map((entry) => {
+                const value = entry.branch ?? "";
+                return (
+                  <option key={`${value}-${entry.lastCommit ?? "none"}`} value={value}>
+                    {value || "unknown"}
+                  </option>
+                );
+              })
+            ) : (
+              <>
+                <option value="main">main</option>
+                <option value="develop">develop</option>
+              </>
+            )}
+          </select>
           <label htmlFor="launch-cmd" className={styles.label}>Start command override</label>
           <input
             id="launch-cmd"

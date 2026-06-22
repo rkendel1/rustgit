@@ -6,7 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, RuntimeError};
 
-const ENVIRONMENT_CANDIDATES: [&str; 4] = [".env", ".env.example", ".env.local.example", ".env.template"];
+const ENVIRONMENT_CANDIDATES: [&str; 6] = [
+    ".env",
+    ".env.local",
+    ".env.example",
+    ".env.local.example",
+    ".env.template",
+    ".sample.env",
+];
 const ENVIRONMENT_CODE_CANDIDATES: [&str; 7] = [
     "docker-compose.yml",
     "docker-compose.yaml",
@@ -21,6 +28,8 @@ const ENVIRONMENT_CODE_CANDIDATES: [&str; 7] = [
 pub struct AnalyzeManifest {
     pub framework: String,
     pub execution: ManifestExecution,
+    #[serde(rename = "executionConfidence")]
+    pub execution_confidence: ManifestExecutionConfidence,
     pub docker: ManifestDocker,
     #[serde(rename = "packageManager")]
     pub package_manager: Option<String>,
@@ -30,6 +39,14 @@ pub struct AnalyzeManifest {
     pub build_command: Option<String>,
     #[serde(rename = "environmentVariables")]
     pub environment_variables: Vec<ManifestEnvironmentVariable>,
+    #[serde(rename = "preferredRuntime")]
+    pub preferred_runtime: String,
+    #[serde(rename = "recommendedCommand")]
+    pub recommended_command: Option<String>,
+    #[serde(rename = "nodeVersion")]
+    pub node_version: Option<String>,
+    #[serde(rename = "autoHealsApplied")]
+    pub auto_heals_applied: Vec<String>,
     pub workspace: ManifestWorkspace,
 }
 
@@ -38,6 +55,12 @@ pub struct ManifestExecution {
     pub preferred: String,
     pub fallback: String,
     pub confidence: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestExecutionConfidence {
+    pub score: u8,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,14 +101,15 @@ impl AnalyzeManifest {
             || root.join("docker-compose.yaml").exists()
             || root.join("compose.yml").exists()
             || root.join("compose.yaml").exists();
-        let preferred = if dockerfile || compose || root.join(".devcontainer/devcontainer.json").exists() {
-            "docker".to_string()
-        } else {
-            package_manager
-                .filter(|value| !value.is_empty())
-                .unwrap_or(runtime)
-                .to_string()
-        };
+        let preferred =
+            if dockerfile || compose || root.join(".devcontainer/devcontainer.json").exists() {
+                "docker".to_string()
+            } else {
+                package_manager
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(runtime)
+                    .to_string()
+            };
         let fallback = package_manager
             .filter(|value| !value.is_empty())
             .unwrap_or(runtime)
@@ -103,17 +127,43 @@ impl AnalyzeManifest {
             runtime,
             framework,
         );
+        let (recommended_command, auto_heals_applied) =
+            start_command.as_deref().map_or((None, vec![]), |command| {
+                let (healed, heals) = apply_safe_command_heals(command, runtime, framework);
+                (Some(healed), heals)
+            });
         let build_command = build_command
             .map(ToString::to_string)
             .or_else(|| package_manager.map(default_build_command));
         let environment_variables = discover_environment_variables(root);
         let requires_secrets = environment_variables.iter().any(|entry| entry.required);
+        let node_version = infer_node_version(root);
+        let mut confidence_reasons = Vec::new();
+        if dockerfile || compose || root.join(".devcontainer/devcontainer.json").exists() {
+            confidence_reasons.push("Docker detected".to_string());
+        }
+        if !environment_variables.is_empty() {
+            confidence_reasons.push("Environment resolved".to_string());
+        }
+        if package_manager.is_some() {
+            confidence_reasons.push("Package manager verified".to_string());
+        }
+        if recommended_command.is_some() {
+            confidence_reasons.push("Start command verified".to_string());
+        }
+        if node_version.is_some() {
+            confidence_reasons.push("Node version verified".to_string());
+        }
         Self {
             framework: framework.to_string(),
             execution: ManifestExecution {
-                preferred,
+                preferred: preferred.clone(),
                 fallback,
                 confidence,
+            },
+            execution_confidence: ManifestExecutionConfidence {
+                score: confidence,
+                reasons: confidence_reasons,
             },
             docker: ManifestDocker {
                 dockerfile,
@@ -121,15 +171,105 @@ impl AnalyzeManifest {
                 command,
             },
             package_manager: package_manager.map(ToString::to_string),
-            start_command,
+            start_command: recommended_command.clone(),
             build_command,
             environment_variables,
+            preferred_runtime: preferred.clone(),
+            recommended_command,
+            node_version,
+            auto_heals_applied,
             workspace: ManifestWorkspace {
                 requires_docker: dockerfile || compose,
                 requires_secrets,
             },
         }
     }
+}
+
+fn apply_safe_command_heals(
+    command: &str,
+    runtime: &str,
+    framework: &str,
+) -> (String, Vec<String>) {
+    let lower = command.to_ascii_lowercase();
+    let should_inject_web_flags =
+        runtime == "node" || runtime == "bun" || framework.eq_ignore_ascii_case("vite");
+    if !should_inject_web_flags {
+        return (command.to_string(), vec![]);
+    }
+
+    let mut healed = command.trim().to_string();
+    let mut heals = Vec::new();
+
+    if !lower.contains("--host") && !lower.contains("hostname") {
+        healed.push_str(" --host 0.0.0.0");
+        heals.push("hostInjection".to_string());
+    }
+    if !lower.contains("--port") {
+        healed.push_str(" --port {PORT}");
+        heals.push("portInjection".to_string());
+    }
+    (healed, heals)
+}
+
+fn infer_node_version(root: &Path) -> Option<String> {
+    for file in [".nvmrc", ".node-version"] {
+        if let Ok(content) = fs::read_to_string(root.join(file)) {
+            let version = content.trim().trim_start_matches('v').to_string();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+    }
+    if let Ok(package_json) = fs::read_to_string(root.join("package.json")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&package_json) {
+            if let Some(engine) = value
+                .get("engines")
+                .and_then(|engines| engines.get("node"))
+                .and_then(serde_json::Value::as_str)
+            {
+                let version = engine
+                    .chars()
+                    .filter(|ch| ch.is_ascii_digit() || *ch == '.')
+                    .collect::<String>();
+                if !version.is_empty() {
+                    return Some(version);
+                }
+            }
+        }
+    }
+    if let Ok(dockerfile) = fs::read_to_string(root.join("Dockerfile")) {
+        for line in dockerfile.lines() {
+            let trimmed = line.trim().to_ascii_lowercase();
+            if trimmed.starts_with("from node:") {
+                let candidate = trimmed
+                    .trim_start_matches("from node:")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches('v')
+                    .to_string();
+                if !candidate.is_empty() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    if let Ok(readme) = fs::read_to_string(root.join("README.md")) {
+        let lower = readme.to_ascii_lowercase();
+        if let Some(index) = lower.find("node ") {
+            let suffix = &lower[index + 5..];
+            let version = suffix
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit())
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+                .collect::<String>();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+    }
+    None
 }
 
 pub fn write_manifest(root: &Path, manifest: &AnalyzeManifest) -> Result<()> {
@@ -188,7 +328,14 @@ fn infer_start_command(
         return Some(command.to_string());
     }
     if let Ok(readme) = fs::read_to_string(root.join("README.md")) {
-        for marker in ["pnpm run dev", "npm run dev", "yarn dev", "bun run dev", "cargo run", "python main.py"] {
+        for marker in [
+            "pnpm run dev",
+            "npm run dev",
+            "yarn dev",
+            "bun run dev",
+            "cargo run",
+            "python main.py",
+        ] {
             if readme.contains(marker) {
                 return Some(marker.to_string());
             }
@@ -264,8 +411,7 @@ fn extract_env_keys_from_text(content: &str) -> BTreeSet<String> {
 }
 
 fn is_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.chars().all(is_env_key_char)
+    !key.is_empty() && key.chars().all(is_env_key_char)
 }
 
 fn is_env_key_char(ch: char) -> bool {
@@ -322,5 +468,63 @@ fn collect_template_env(content: &str, keys: &mut BTreeSet<String>) {
             keys.insert(key);
         }
         rest = &candidate[1.min(candidate.len())..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{infer_node_version, AnalyzeManifest};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{ts}"))
+    }
+
+    #[test]
+    fn synthesize_applies_host_and_port_auto_heals() {
+        let root = unique_temp_dir("rustgit-manifest-heals");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"vite":"5.0.0"}}"#,
+        )
+        .expect("write package");
+
+        let manifest = AnalyzeManifest::synthesize(
+            &root,
+            "vite",
+            "node",
+            Some("pnpm"),
+            None,
+            None,
+            Some("pnpm run dev"),
+            95,
+        );
+
+        assert_eq!(manifest.preferred_runtime, "pnpm");
+        assert_eq!(
+            manifest.recommended_command.as_deref(),
+            Some("pnpm run dev --host 0.0.0.0 --port {PORT}")
+        );
+        assert!(manifest
+            .auto_heals_applied
+            .contains(&"hostInjection".to_string()));
+        assert!(manifest
+            .auto_heals_applied
+            .contains(&"portInjection".to_string()));
+    }
+
+    #[test]
+    fn infer_node_version_prefers_nvmrc() {
+        let root = unique_temp_dir("rustgit-manifest-node-version");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join(".nvmrc"), "v22\n").expect("write nvmrc");
+        assert_eq!(infer_node_version(&root).as_deref(), Some("22"));
     }
 }
