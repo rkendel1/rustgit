@@ -19,8 +19,8 @@ const CORS_ALLOW_HEADERS = "Content-Type, Authorization";
 
 // Default timeout for most proxy calls.
 const DEFAULT_TIMEOUT_MS = 30_000;
-// Analyze clones the repo + detects frameworks — allow up to 3 minutes on slow hosts.
-const ANALYZE_TIMEOUT_MS = 180_000;
+// Analyze clones the repo + detects frameworks — allow close to Fly's 5-minute request ceiling.
+const ANALYZE_TIMEOUT_MS = 295_000;
 
 function timeoutForPath(path: string): number {
   const normalized = path.replace(/^\/+/, "").toLowerCase();
@@ -78,6 +78,10 @@ function resolveAllowedOrigin(request: NextRequest): string | null {
   const origin = request.headers.get("origin");
   if (!origin) {
     return null;
+  }
+
+  if (origin === request.nextUrl.origin) {
+    return origin;
   }
 
   if (
