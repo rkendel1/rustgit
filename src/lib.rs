@@ -8014,8 +8014,23 @@ fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
 }
 
 fn load_execution_manifest_start_command(repo_root: &Path) -> Option<String> {
-    let manifest_path = repo_root.join(".execution.json");
-    let payload = fs::read_to_string(manifest_path).ok()?;
+    let runtime_manifest_path = repo_root.join("runtime-manifest.json");
+    if let Ok(payload) = fs::read_to_string(runtime_manifest_path) {
+        if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+            if let Some(command) = value
+                .get("runtime")
+                .and_then(|runtime| runtime.get("startCommand"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(command.to_string());
+            }
+        }
+    }
+
+    let legacy_manifest_path = repo_root.join(".execution.json");
+    let payload = fs::read_to_string(legacy_manifest_path).ok()?;
     let value = serde_json::from_str::<Value>(&payload).ok()?;
     value
         .get("startCommand")
@@ -20801,6 +20816,25 @@ dependencies:
         assert_eq!(
             load_execution_manifest_start_command(repo.as_path()),
             Some("pnpm run dev -- --host 0.0.0.0 --port {PORT}".to_string())
+        );
+    }
+
+    #[test]
+    fn load_execution_manifest_start_command_prefers_runtime_manifest_v2() {
+        let repo = temp_dir("runtime-manifest-start-command");
+        fs::write(
+            repo.join("runtime-manifest.json"),
+            r#"{"schemaVersion":2,"runtime":{"startCommand":"pnpm dev","packageManager":"pnpm","installCommand":"pnpm install","nodeVersion":"22"},"project":{"framework":"nextjs","language":"typescript"},"network":{"preferredPorts":[3000],"healthCheck":"/"},"providers":{"compatible":["local"]},"confidence":{"overall":99,"framework":95,"runtime":95,"commands":95,"network":90,"providers":90}}"#,
+        )
+        .expect("write runtime manifest");
+        fs::write(
+            repo.join(".execution.json"),
+            r#"{"startCommand":"npm run dev"}"#,
+        )
+        .expect("write legacy manifest");
+        assert_eq!(
+            load_execution_manifest_start_command(repo.as_path()),
+            Some("pnpm dev".to_string())
         );
     }
 
