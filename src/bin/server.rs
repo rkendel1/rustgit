@@ -613,6 +613,42 @@ async fn workspace_logs(
         .map_err(err_response)
 }
 
+async fn workspace_files(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
+    tokio::task::spawn_blocking(move || {
+        let fs = manager.filesystem(&id)?;
+        let snapshot = fs.snapshot()?;
+        let mut files = snapshot.entries.keys().cloned().collect::<Vec<_>>();
+        files.sort();
+        Ok::<_, RuntimeError>(Json(json!({ "files": files })))
+    })
+    .await
+    .expect("task panicked")
+    .map_err(err_response)
+}
+
+async fn workspace_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
+    tokio::task::spawn_blocking(move || {
+        let fs = manager.filesystem(&id)?;
+        let bytes = fs.read(path.trim_start_matches('/'))?;
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        Ok::<_, RuntimeError>(Json(json!({
+            "path": path,
+            "content": content
+        })))
+    })
+    .await
+    .expect("task panicked")
+    .map_err(err_response)
+}
+
 fn json_payload_response(body: String) -> (StatusCode, Json<Value>) {
     match serde_json::from_str::<Value>(&body) {
         Ok(payload) => (StatusCode::OK, Json(payload)),
@@ -710,6 +746,11 @@ fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
             post(restart_workspace),
         )
         .route(&format!("{prefix}/workspaces/:id/logs"), get(workspace_logs))
+        .route(&format!("{prefix}/workspaces/:id/files"), get(workspace_files))
+        .route(
+            &format!("{prefix}/workspaces/:id/files/*path"),
+            get(workspace_file),
+        )
 }
 
 fn cors_layer() -> CorsLayer {
@@ -858,9 +899,13 @@ mod tests {
             ("/api/v1/workspaces/missing", "DELETE"),
             ("/api/v1/workspaces/missing/restart", "POST"),
             ("/api/v1/workspaces/missing/logs", "GET"),
+            ("/api/v1/workspaces/missing/files", "GET"),
+            ("/api/v1/workspaces/missing/files/package.json", "GET"),
             ("/api/proxy/api/v1/workspaces/missing", "DELETE"),
             ("/api/proxy/api/v1/workspaces/missing/restart", "POST"),
             ("/api/proxy/api/v1/workspaces/missing/logs", "GET"),
+            ("/api/proxy/api/v1/workspaces/missing/files", "GET"),
+            ("/api/proxy/api/v1/workspaces/missing/files/package.json", "GET"),
         ];
 
         for (uri, method) in checks {
@@ -971,6 +1016,95 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn workspace_files_endpoints_return_file_list_and_content() {
+        let repo = std::env::temp_dir().join(format!(
+            "rustgit-files-repo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"}}"#,
+        )
+        .expect("write package");
+        fs::write(repo.join("server.js"), "setInterval(() => {}, 1000);\n").expect("write server");
+
+        let app = app(test_state());
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workspaces")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repo_url": repo.to_string_lossy().to_string()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let body = to_bytes(create_response.into_body(), 1024 * 1024)
+            .await
+            .expect("workspace body");
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("workspace json");
+        let id = created["id"].as_str().expect("workspace id");
+
+        let files_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/workspaces/{id}/files"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(files_response.status(), StatusCode::OK);
+        let files_body = to_bytes(files_response.into_body(), 1024 * 1024)
+            .await
+            .expect("files body");
+        let files_payload: serde_json::Value =
+            serde_json::from_slice(&files_body).expect("files payload");
+        let files = files_payload["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(files.iter().any(|path| *path == "package.json"));
+
+        let file_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/workspaces/{id}/files/package.json"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(file_response.status(), StatusCode::OK);
+        let file_body = to_bytes(file_response.into_body(), 1024 * 1024)
+            .await
+            .expect("file body");
+        let file_payload: serde_json::Value =
+            serde_json::from_slice(&file_body).expect("file payload");
+        assert!(file_payload["content"]
+            .as_str()
+            .expect("file content")
+            .contains("\"scripts\""));
     }
 
     #[tokio::test]

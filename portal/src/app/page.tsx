@@ -45,6 +45,15 @@ type LaunchOverridesPayload = {
   versions?: Record<string, string>;
 };
 
+type WorkspaceFilesResponse = {
+  files?: string[];
+};
+
+type WorkspaceFileResponse = {
+  path?: string;
+  content?: string;
+};
+
 type WorkspaceState =
   | "Created" | "Materializing" | "Analyzing" | "Planning" | "Pending"
   | "Provisioning" | "Starting" | "Running" | "Degraded" | "Restarting"
@@ -159,13 +168,21 @@ function parseKeyValueLines(input: string): Record<string, string> {
     .filter(Boolean)
     .reduce<Record<string, string>>((acc, line) => {
       const separatorIndex = line.indexOf("=");
-      if (separatorIndex <= 0) return acc;
+      if (separatorIndex < 0) return acc;
       const key = line.slice(0, separatorIndex).trim();
       const value = line.slice(separatorIndex + 1).trim();
       if (!key) return acc;
       acc[key] = value;
       return acc;
     }, {});
+}
+
+function encodeWorkspacePath(path: string): string {
+  return path
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
 async function readJsonResponse<T>(response: Response): Promise<T> {
@@ -197,6 +214,11 @@ export default function Home() {
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<string[]>([]);
+  const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
+  const [selectedWorkspaceFile, setSelectedWorkspaceFile] = useState<string | null>(null);
+  const [selectedWorkspaceFileContent, setSelectedWorkspaceFileContent] = useState("");
+  const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
+  const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
   const logBoxRef = useRef<HTMLDivElement>(null);
   const anonymousIdentity = useMemo(
@@ -224,6 +246,10 @@ export default function Home() {
     setRunResult(null);
     setWorkspace(null);
     setWorkspaceLogs([]);
+    setWorkspaceFiles([]);
+    setSelectedWorkspaceFile(null);
+    setSelectedWorkspaceFileContent("");
+    setWorkspaceFilesError(null);
     setError(null);
   }
 
@@ -302,6 +328,65 @@ export default function Home() {
     poll();
     return () => { cancelled = true; };
   }, [runResult?.execution_id, fetchWorkspaceData, actionPending]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const wsId = runResult?.execution_id;
+    if (!wsId) return;
+    let cancelled = false;
+
+    async function loadFiles() {
+      setWorkspaceFilesLoading(true);
+      try {
+        const response = await fetch(`/api/proxy/workspaces/${wsId}/files`, { cache: "no-store" });
+        const payload = await readJsonResponse<WorkspaceFilesResponse>(response);
+        if (cancelled) return;
+        const files = (payload.files ?? []).slice(0, 200);
+        setWorkspaceFiles(files);
+        if (files.length === 0) {
+          setSelectedWorkspaceFile(null);
+          setSelectedWorkspaceFileContent("");
+        } else if (!selectedWorkspaceFile || !files.includes(selectedWorkspaceFile)) {
+          setSelectedWorkspaceFile(files[0]);
+        }
+        setWorkspaceFilesError(null);
+      } catch (caught) {
+        if (cancelled) return;
+        setWorkspaceFilesError(caught instanceof Error ? caught.message : "Failed to load workspace files.");
+      } finally {
+        if (!cancelled) setWorkspaceFilesLoading(false);
+      }
+    }
+
+    loadFiles();
+    return () => { cancelled = true; };
+  }, [runResult?.execution_id, actionPending]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const wsId = runResult?.execution_id;
+    if (!wsId || !selectedWorkspaceFile) return;
+    const selectedFile = selectedWorkspaceFile;
+    let cancelled = false;
+
+    async function loadFileContent() {
+      try {
+        const response = await fetch(
+          `/api/proxy/workspaces/${wsId}/files/${encodeWorkspacePath(selectedFile)}`,
+          { cache: "no-store" },
+        );
+        const payload = await readJsonResponse<WorkspaceFileResponse>(response);
+        if (!cancelled) {
+          setSelectedWorkspaceFileContent(payload.content ?? "");
+        }
+      } catch {
+        if (!cancelled) {
+          setSelectedWorkspaceFileContent("");
+        }
+      }
+    }
+
+    loadFileContent();
+    return () => { cancelled = true; };
+  }, [runResult?.execution_id, selectedWorkspaceFile]);
 
   // Auto-scroll log box
   useEffect(() => {
@@ -686,6 +771,45 @@ export default function Home() {
           <p>Launch and monitor execution from the same workspace.</p>
         </header>
 
+        {runResult?.execution_id ? (
+          <section className={styles.panel}>
+            <h2>Workspace files (pre-heal)</h2>
+            <p className={styles.hint}>
+              Inspect files to decide which environment variables, versions, and start commands to set.
+            </p>
+            {workspaceFilesError ? <p className={styles.hint}>{workspaceFilesError}</p> : null}
+            {workspaceFilesLoading ? (
+              <p className={styles.hint}>Loading files…</p>
+            ) : workspaceFiles.length === 0 ? (
+              <p className={styles.hint}>No files available yet.</p>
+            ) : (
+              <>
+                <div className={styles.actions}>
+                  {workspaceFiles.slice(0, 24).map((file) => (
+                    <button
+                      key={file}
+                      type="button"
+                      className={styles.btn}
+                      onClick={() => setSelectedWorkspaceFile(file)}
+                      disabled={selectedWorkspaceFile === file}
+                    >
+                      {file}
+                    </button>
+                  ))}
+                </div>
+                <div className={styles.logSection}>
+                  <div className={styles.logHeader}>
+                    <span className={styles.logTitle}>{selectedWorkspaceFile ?? "Select a file"}</span>
+                  </div>
+                  <div className={styles.logBox}>
+                    <pre>{selectedWorkspaceFileContent || "No content available."}</pre>
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
+        ) : null}
+
         {workspace ? (
           <section className={styles.panel}>
             <div className={styles.workspaceHeader}>
@@ -702,7 +826,10 @@ export default function Home() {
                 </span>
                 <button
                   className={styles.btnRestart}
-                  disabled={actionPending}
+                  disabled={
+                    actionPending
+                    || ["Created", "Materializing", "Analyzing", "Planning", "Provisioning", "Starting", "Restarting", "Stopping", "Destroyed"].includes(workspace.state)
+                  }
                   onClick={handleRestart}
                 >
                   Retry run

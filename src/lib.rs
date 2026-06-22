@@ -12393,7 +12393,13 @@ impl WorkspaceManager {
 
     /// Does the blocking work for a workspace previously allocated by `begin_launch`.
     pub fn complete_launch(&self, id: &str, repo_url: &str) {
-        self.complete_launch_with_overrides(id, repo_url, LaunchOverrides::default());
+        let overrides = self
+            .workspaces
+            .lock()
+            .ok()
+            .and_then(|workspaces| workspaces.get(id).map(|record| record.launch_overrides.clone()))
+            .unwrap_or_default();
+        self.complete_launch_with_overrides(id, repo_url, overrides);
     }
 
     pub fn complete_launch_with_overrides(&self, id: &str, repo_url: &str, overrides: LaunchOverrides) {
@@ -12465,13 +12471,7 @@ impl WorkspaceManager {
             },
             network: analysis.runtime_spec.network_policy.clone(),
         };
-        let planned_command = overrides
-            .start_command
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| ctx.execution_graph.primary_run_command())
+        let planned_command = Self::resolved_run_command(&ctx, &overrides)
             .unwrap_or_else(|| "none".to_string());
         push_log(format!("planned execution command: {planned_command}"));
         if !overrides.environment.is_empty() {
@@ -12526,6 +12526,16 @@ impl WorkspaceManager {
         rendered
     }
 
+    fn resolved_run_command(ctx: &ExecutionContext, overrides: &LaunchOverrides) -> Option<String> {
+        overrides
+            .start_command
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| ctx.execution_graph.primary_run_command())
+    }
+
     fn apply_process_overrides(command: &mut Command, overrides: &LaunchOverrides) {
         for (name, value) in &overrides.environment {
             command.env(name, value);
@@ -12541,14 +12551,7 @@ impl WorkspaceManager {
         overrides: &LaunchOverrides,
         logs: &mut Vec<String>,
     ) -> (Option<std::process::Child>, Option<u16>) {
-        let run_cmd = match overrides
-            .start_command
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| ctx.execution_graph.primary_run_command())
-        {
+        let run_cmd = match Self::resolved_run_command(ctx, overrides) {
             Some(cmd) => cmd,
             None => return (None, None),
         };
