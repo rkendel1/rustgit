@@ -44,19 +44,32 @@ async function handle(
   });
   forwardHeaders.set("host", `127.0.0.1:${port}`);
 
-  let upstreamRes: Response;
-  try {
-    upstreamRes = await fetch(upstreamUrl, {
-      method: request.method,
-      headers: forwardHeaders,
-      body:
-        request.method !== "GET" && request.method !== "HEAD"
-          ? new Uint8Array(await request.arrayBuffer())
-          : undefined,
-    });
-  } catch {
+  const bodyBytes =
+    request.method !== "GET" && request.method !== "HEAD"
+      ? new Uint8Array(await request.arrayBuffer())
+      : undefined;
+
+  // Retry up to 8 times (≈8 s total) to handle slow startup (Django, uvicorn compile, etc.)
+  let upstreamRes: Response | null = null;
+  const MAX_RETRIES = 8;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      upstreamRes = await fetch(upstreamUrl, {
+        method: request.method,
+        headers: forwardHeaders,
+        body: bodyBytes,
+      });
+      break;
+    } catch {
+      if (attempt < MAX_RETRIES - 1) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+
+  if (!upstreamRes) {
     return NextResponse.json(
-      { error: `Could not reach app on port ${port}` },
+      { error: `App on port ${port} did not respond after ${MAX_RETRIES}s — it may still be starting or may have crashed. Check workspace logs.` },
       { status: 502 },
     );
   }

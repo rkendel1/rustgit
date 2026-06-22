@@ -12598,20 +12598,36 @@ impl WorkspaceManager {
         let args_str = parts.next().unwrap_or("");
         let args: Vec<&str> = args_str.split_whitespace().collect();
 
+        // Pipe stderr to a log file in the workspace root so crashes are visible
+        let stderr_log_path = repo_path.join("..").join("stderr.log");
+        let stderr_stdio = std::fs::File::create(&stderr_log_path)
+            .map(std::process::Stdio::from)
+            .unwrap_or_else(|_| std::process::Stdio::null());
+
         let mut cmd = Command::new(&program);
         cmd.args(&args)
             .current_dir(repo_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(stderr_stdio);
         // Always set PORT env var for frameworks that read it (Node.js etc.)
         if let Some(port) = assigned_port {
             cmd.env("PORT", port.to_string());
         }
 
+        logs.push(format!("running: {program} {args_str}"));
         match cmd.spawn() {
             Ok(child) => {
                 logs.push(format!("spawned pid: {} on port {port_str}", child.id()));
+                // Give the process a moment to bind its port, then check stderr for early crashes
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                if let Ok(content) = std::fs::read_to_string(&stderr_log_path) {
+                    for line in content.lines().take(10) {
+                        if !line.trim().is_empty() {
+                            logs.push(format!("  stderr: {line}"));
+                        }
+                    }
+                }
                 (Some(child), assigned_port)
             }
             Err(err) => {
