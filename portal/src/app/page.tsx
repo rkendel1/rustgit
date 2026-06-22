@@ -970,6 +970,15 @@ export default function Home() {
               <strong>Memory</strong>
               <span>{workspace?.resource_quotas?.max_memory_mb ?? "—"} MB</span>
             </div>
+            {(() => {
+              const url = runResult?.workspace_url ?? workspace?.ports?.[0]?.route ?? null;
+              return url ? (
+                <div className={styles.tile} style={{ gridColumn: "1 / -1" }}>
+                  <strong>App URL</strong>
+                  <a href={url} target="_blank" rel="noreferrer">{url}</a>
+                </div>
+              ) : null;
+            })()}
           </div>
         </section>
 
