@@ -12269,6 +12269,10 @@ impl WorkspaceManager {
     }
 
     fn materialize_repository(&self, repo_url: &str, destination: &Path) -> Result<()> {
+        const MIN_FREE_BYTES_TO_CLONE: u64 = 1024 * 1024 * 1024;      // 1 GB
+        const MIN_FREE_BYTES_TO_CACHE: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB
+        const MAX_REPO_BYTES_TO_CACHE: u64 = 200 * 1024 * 1024;        // 200 MB
+
         if destination.exists() {
             fs::remove_dir_all(destination)?;
         }
@@ -12283,6 +12287,15 @@ impl WorkspaceManager {
         {
             copy_directory(&cached, destination)?;
             return Ok(());
+        }
+
+        // Refuse to clone if the disk is already low — large repos can fill it quickly.
+        let free_before = available_disk_bytes(destination).unwrap_or(u64::MAX);
+        if free_before < MIN_FREE_BYTES_TO_CLONE {
+            return Err(RuntimeError::CommandFailed(format!(
+                "insufficient disk space to clone repository: {:.1} GB free, need at least 1 GB",
+                free_before as f64 / 1_073_741_824.0
+            )));
         }
 
         if looks_like_local_path(repo_url) {
@@ -12321,19 +12334,24 @@ impl WorkspaceManager {
             }
         }
 
-        let cache_path = self
-            .root
-            .join("cache")
-            .join(format!("repo-{}", hash_key(repo_url)));
-        if cache_path.exists() {
-            fs::remove_dir_all(&cache_path)?;
+        // Cache the clone only when the repo is small and there is plenty of free space.
+        let repo_size = directory_size_bytes(destination);
+        let free_after = available_disk_bytes(destination).unwrap_or(0);
+        if repo_size <= MAX_REPO_BYTES_TO_CACHE && free_after >= MIN_FREE_BYTES_TO_CACHE {
+            let cache_path = self
+                .root
+                .join("cache")
+                .join(format!("repo-{}", hash_key(repo_url)));
+            if cache_path.exists() {
+                fs::remove_dir_all(&cache_path)?;
+            }
+            fs::create_dir_all(&cache_path)?;
+            copy_directory(destination, &cache_path)?;
+            self.repository_cache
+                .lock()
+                .expect("repo cache lock poisoned")
+                .insert(repo_url.to_string(), cache_path);
         }
-        fs::create_dir_all(&cache_path)?;
-        copy_directory(destination, &cache_path)?;
-        self.repository_cache
-            .lock()
-            .expect("repo cache lock poisoned")
-            .insert(repo_url.to_string(), cache_path);
 
         Ok(())
     }
@@ -17885,6 +17903,45 @@ fn shared_build_command(analysis: &RepositoryAnalysis) -> String {
     } else {
         format!("cd {root}")
     }
+}
+
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    let check = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    // `df -Pk` gives POSIX output (no line wrapping) in 1 K-blocks.
+    let output = Command::new("df").arg("-Pk").arg(&check).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Line 0: headers; Line 1: data — "Filesystem 1K-blocks Used Available ..."
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().nth(1)?;
+    line.split_whitespace().nth(3)?.parse::<u64>().ok().map(|kb| kb * 1024)
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    fn recurse(p: &Path, total: &mut u64) {
+        let Ok(entries) = fs::read_dir(p) else { return };
+        for entry in entries.flatten() {
+            let ep = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                recurse(&ep, total);
+            } else if ft.is_symlink() {
+                if let Ok(meta) = ep.metadata() {
+                    *total += meta.len();
+                }
+            } else {
+                *total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    let mut total = 0u64;
+    recurse(path, &mut total);
+    total
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
