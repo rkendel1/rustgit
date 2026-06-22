@@ -84,11 +84,13 @@ function resolveAllowedOrigin(request: NextRequest): string | null {
     return origin;
   }
 
-  if (
-    process.env.NODE_ENV === "development" &&
-    (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:"))
-  ) {
-    return origin;
+  if (process.env.NODE_ENV === "development") {
+    try {
+      const { hostname } = new URL(origin);
+      if (hostname === "localhost" || hostname === "127.0.0.1") {
+        return origin;
+      }
+    } catch { /* ignore invalid origin */ }
   }
 
   if (ALLOWED_WEB_ORIGINS.has(origin)) {
