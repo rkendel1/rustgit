@@ -25554,6 +25554,7 @@ all = ["network"]
 
     #[test]
     fn runtime_status_never_carries_endpoint_outside_local_mode() {
+        const DEFAULT_TEST_PID: u32 = 1;
         let runtime_root = temp_dir("runtime-status-invariant");
         let local_repo = temp_dir("runtime-status-invariant-repo");
         fs::write(
@@ -25582,7 +25583,11 @@ all = ["network"]
                 .first()
                 .map(|port| port.port)
                 .unwrap_or(3000);
-            let pid = record.child_process.as_ref().map(|child| child.id()).unwrap_or(1);
+            let pid = record
+                .child_process
+                .as_ref()
+                .map(|child| child.id())
+                .unwrap_or(DEFAULT_TEST_PID);
             let mut runtime = ExecutionTruth::new(workspace.id.clone(), requested_port, pid);
             runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(true));
             runtime.update_from_event(ExecutionTruthEvent::ObservedPort(Some(requested_port)));
