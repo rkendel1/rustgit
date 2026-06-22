@@ -58,6 +58,17 @@ type WorkspaceFileResponse = {
   content?: string;
 };
 
+type WorkspaceFileUpdateResponse = {
+  path?: string;
+  saved?: boolean;
+};
+
+type WorkspaceTreeNode = {
+  name: string;
+  path: string | null;
+  children: WorkspaceTreeNode[];
+};
+
 type WorkspaceState =
   | "Created" | "Materializing" | "Analyzing" | "Planning" | "Pending"
   | "Provisioning" | "Starting" | "Running" | "Degraded" | "Restarting"
@@ -202,6 +213,55 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
+function buildWorkspaceFileTree(files: string[]): WorkspaceTreeNode[] {
+  type MutableWorkspaceTreeNode = {
+    name: string;
+    path: string | null;
+    children: Map<string, MutableWorkspaceTreeNode>;
+  };
+
+  const root: MutableWorkspaceTreeNode = {
+    name: "",
+    path: null,
+    children: new Map(),
+  };
+
+  for (const file of files) {
+    const segments = file.split("/").filter(Boolean);
+    if (segments.length === 0) continue;
+    let cursor = root;
+    const resolvedPath: string[] = [];
+    for (const segment of segments) {
+      resolvedPath.push(segment);
+      let next = cursor.children.get(segment);
+      if (!next) {
+        next = { name: segment, path: null, children: new Map() };
+        cursor.children.set(segment, next);
+      }
+      cursor = next;
+    }
+    cursor.path = resolvedPath.join("/");
+  }
+
+  const finalize = (node: MutableWorkspaceTreeNode): WorkspaceTreeNode => {
+    const children = Array.from(node.children.values())
+      .map(finalize)
+      .sort((left, right) => {
+        const leftIsDirectory = left.children.length > 0;
+        const rightIsDirectory = right.children.length > 0;
+        if (leftIsDirectory !== rightIsDirectory) {
+          return leftIsDirectory ? -1 : 1;
+        }
+        return left.name.localeCompare(right.name);
+      });
+    return { name: node.name, path: node.path, children };
+  };
+
+  return Array.from(root.children.values())
+    .map(finalize)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export default function Home() {
   const repoInputRef = useRef<HTMLInputElement>(null);
   const [repository, setRepository] = useState("");
@@ -222,6 +282,10 @@ export default function Home() {
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [selectedWorkspaceFile, setSelectedWorkspaceFile] = useState<string | null>(null);
   const [selectedWorkspaceFileContent, setSelectedWorkspaceFileContent] = useState("");
+  const [workspaceFileDraft, setWorkspaceFileDraft] = useState("");
+  const [workspaceFileDirty, setWorkspaceFileDirty] = useState(false);
+  const [workspaceFileSaving, setWorkspaceFileSaving] = useState(false);
+  const [workspaceFileMessage, setWorkspaceFileMessage] = useState<string | null>(null);
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
   const [workspacePreviewVersion, setWorkspacePreviewVersion] = useState(0);
@@ -230,6 +294,7 @@ export default function Home() {
   const [freeingSpace, setFreeingSpace] = useState(false);
   const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
+  const workspaceFileTree = useMemo(() => buildWorkspaceFileTree(workspaceFiles), [workspaceFiles]);
   const anonymousIdentity = useMemo(
     () => ({
       anonUserId: createAnonymousId("anon-portal"),
@@ -263,6 +328,10 @@ export default function Home() {
     setWorkspaceFiles([]);
     setSelectedWorkspaceFile(null);
     setSelectedWorkspaceFileContent("");
+    setWorkspaceFileDraft("");
+    setWorkspaceFileDirty(false);
+    setWorkspaceFileSaving(false);
+    setWorkspaceFileMessage(null);
     setWorkspaceFilesError(null);
     setWorkspacePreviewVersion(0);
     setWorkspacePreviewError(null);
@@ -358,11 +427,14 @@ export default function Home() {
         const response = await fetch(`/api/proxy/workspaces/${wsId}/files`, { cache: "no-store" });
         const payload = await readJsonResponse<WorkspaceFilesResponse>(response);
         if (cancelled) return;
-        const files = (payload.files ?? []).slice(0, 200);
+        const files = payload.files ?? [];
         setWorkspaceFiles(files);
         if (files.length === 0) {
           setSelectedWorkspaceFile(null);
           setSelectedWorkspaceFileContent("");
+          setWorkspaceFileDraft("");
+          setWorkspaceFileDirty(false);
+          setWorkspaceFileMessage(null);
         } else if (!selectedWorkspaceFile || !files.includes(selectedWorkspaceFile)) {
           setSelectedWorkspaceFile(files[0]);
         }
@@ -393,11 +465,18 @@ export default function Home() {
         );
         const payload = await readJsonResponse<WorkspaceFileResponse>(response);
         if (!cancelled) {
-          setSelectedWorkspaceFileContent(payload.content ?? "");
+          const content = payload.content ?? "";
+          setSelectedWorkspaceFileContent(content);
+          setWorkspaceFileDraft(content);
+          setWorkspaceFileDirty(false);
+          setWorkspaceFileMessage(null);
         }
       } catch {
         if (!cancelled) {
           setSelectedWorkspaceFileContent("");
+          setWorkspaceFileDraft("");
+          setWorkspaceFileDirty(false);
+          setWorkspaceFileMessage("Failed to load file content.");
         }
       }
     }
@@ -441,6 +520,66 @@ export default function Home() {
 
   function formatConfidence(value: number | undefined): string {
     return typeof value === "number" ? value.toFixed(CONFIDENCE_DECIMAL_PLACES) : "n/a";
+  }
+
+  async function handleSaveWorkspaceFile() {
+    const wsId = runResult?.execution_id;
+    const selectedFile = selectedWorkspaceFile;
+    if (!wsId || !selectedFile || !workspaceFileDirty || workspaceFileSaving) return;
+    setWorkspaceFileSaving(true);
+    try {
+      const response = await fetch(
+        `/api/proxy/workspaces/${wsId}/files/${encodeWorkspacePath(selectedFile)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: workspaceFileDraft }),
+        },
+      );
+      await readJsonResponse<WorkspaceFileUpdateResponse>(response);
+      setSelectedWorkspaceFileContent(workspaceFileDraft);
+      setWorkspaceFileDirty(false);
+      setWorkspaceFileMessage("Saved");
+    } catch (caught) {
+      setWorkspaceFileMessage(
+        caught instanceof Error ? caught.message : "Failed to save file.",
+      );
+    } finally {
+      setWorkspaceFileSaving(false);
+    }
+  }
+
+  function renderWorkspaceFileTree(nodes: WorkspaceTreeNode[]) {
+    return (
+      <ul className={styles.fileTreeList}>
+        {nodes.map((node) => {
+          if (node.children.length === 0 && node.path) {
+            const filePath = node.path;
+            return (
+              <li key={filePath}>
+                <button
+                  type="button"
+                  className={`${styles.fileTreeFileButton} ${
+                    selectedWorkspaceFile === filePath ? styles.fileTreeFileButtonActive : ""
+                  }`}
+                  onClick={() => setSelectedWorkspaceFile(filePath)}
+                >
+                  {node.name}
+                </button>
+              </li>
+            );
+          }
+          return (
+            <li key={node.path ?? node.name}>
+              <details className={styles.fileTreeDirectory} open>
+                <summary>{node.name}</summary>
+                {renderWorkspaceFileTree(node.children)}
+              </details>
+            </li>
+          );
+        })}
+      </ul>
+    );
   }
 
   async function handleAnalyze() {
@@ -740,26 +879,35 @@ export default function Home() {
               <p className={styles.hint}>No files available yet.</p>
             ) : (
               <>
-                <div className={styles.actions}>
-                  {workspaceFiles.slice(0, 24).map((file) => (
-                    <button
-                      key={file}
-                      type="button"
-                      className={styles.btn}
-                      onClick={() => setSelectedWorkspaceFile(file)}
-                      disabled={selectedWorkspaceFile === file}
-                    >
-                      {file}
-                    </button>
-                  ))}
+                <div className={styles.fileTree}>
+                  {renderWorkspaceFileTree(workspaceFileTree)}
                 </div>
                 <div className={styles.logSection}>
                   <div className={styles.logHeader}>
                     <span className={styles.logTitle}>{selectedWorkspaceFile ?? "Select a file"}</span>
+                    <button
+                      type="button"
+                      className={styles.btnRestart}
+                      onClick={handleSaveWorkspaceFile}
+                      disabled={!selectedWorkspaceFile || !workspaceFileDirty || workspaceFileSaving}
+                    >
+                      {workspaceFileSaving ? "Saving…" : "Save"}
+                    </button>
                   </div>
-                  <div className={styles.logBox}>
-                    <pre>{selectedWorkspaceFileContent || "No content available."}</pre>
-                  </div>
+                  {workspaceFileMessage ? <p className={styles.hint}>{workspaceFileMessage}</p> : null}
+                  <textarea
+                    className={styles.fileEditor}
+                    value={workspaceFileDraft}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      setWorkspaceFileDraft(nextValue);
+                      setWorkspaceFileDirty(nextValue !== selectedWorkspaceFileContent);
+                      if (workspaceFileMessage) setWorkspaceFileMessage(null);
+                    }}
+                    spellCheck={false}
+                    placeholder="No content available."
+                    disabled={!selectedWorkspaceFile}
+                  />
                 </div>
               </>
             )}

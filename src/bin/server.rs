@@ -101,6 +101,11 @@ struct RestartRequest {
     versions: Option<HashMap<String, String>>,
 }
 
+#[derive(Deserialize)]
+struct WorkspaceFileUpdateRequest {
+    content: String,
+}
+
 impl RestartRequest {
     fn launch_overrides(self) -> LaunchOverrides {
         let start_command = self
@@ -685,7 +690,7 @@ async fn workspace_files(
     tokio::task::spawn_blocking(move || {
         let fs = manager.filesystem(&id)?;
         let mut files = fs
-            .list(1000)?
+            .list(usize::MAX)?
             .into_iter()
             .filter(|path| !is_workspace_internal_file(path))
             .collect::<Vec<_>>();
@@ -740,6 +745,35 @@ async fn workspace_file(
             "path": path,
             "content": content
         })))
+    })
+    .await
+    .expect("task panicked")
+    .map_err(err_response)
+}
+
+async fn update_workspace_file(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+    Json(payload): Json<WorkspaceFileUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if path_segments(&path).any(|segment| segment == "." || segment == "..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid workspace path" })),
+        ));
+    }
+    if is_workspace_internal_file(&path) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "editing internal workspace files is not allowed" })),
+        ));
+    }
+
+    let manager = state.manager;
+    tokio::task::spawn_blocking(move || {
+        let fs = manager.filesystem(&id)?;
+        fs.write(path.trim_start_matches('/'), payload.content.as_bytes())?;
+        Ok::<_, RuntimeError>(Json(json!({ "path": path, "saved": true })))
     })
     .await
     .expect("task panicked")
@@ -858,7 +892,7 @@ fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
         .route(&format!("{prefix}/workspaces/:id/files"), get(workspace_files))
         .route(
             &format!("{prefix}/workspaces/:id/files/*path"),
-            get(workspace_file),
+            get(workspace_file).put(update_workspace_file),
         )
 }
 
@@ -868,6 +902,7 @@ fn cors_layer() -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::DELETE,
             Method::OPTIONS,
         ])
@@ -1012,22 +1047,36 @@ mod tests {
             ("/api/v1/workspaces/missing/logs", "GET"),
             ("/api/v1/workspaces/missing/files", "GET"),
             ("/api/v1/workspaces/missing/files/package.json", "GET"),
+            ("/api/v1/workspaces/missing/files/package.json", "PUT"),
             ("/api/proxy/api/v1/workspaces/missing", "DELETE"),
             ("/api/proxy/api/v1/workspaces/missing/restart", "POST"),
             ("/api/proxy/api/v1/workspaces/missing/logs", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/files", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/files/package.json", "GET"),
+            (
+                "/api/proxy/api/v1/workspaces/missing/files/package.json",
+                "PUT",
+            ),
         ];
 
         for (uri, method) in checks {
             let response = app
                 .clone()
                 .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .body(Body::empty())
-                        .expect("request"),
+                    if method == "PUT" {
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"content":"updated"}"#))
+                            .expect("request")
+                    } else {
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("request")
+                    },
                 )
                 .await
                 .expect("response");
@@ -1145,6 +1194,14 @@ mod tests {
         )
         .expect("write package");
         fs::write(repo.join("server.js"), "setInterval(() => {}, 1000);\n").expect("write server");
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        for index in 0..1_100 {
+            fs::write(
+                repo.join("src").join(format!("file-{index}.txt")),
+                format!("file {index}\n"),
+            )
+            .expect("write source file");
+        }
 
         let app = app(test_state());
         let create_response = app
@@ -1201,6 +1258,22 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
         assert!(files.iter().any(|path| *path == "package.json"));
+        assert!(files.len() > 1000);
+        assert!(files.iter().any(|path| *path == "src/file-1099.txt"));
+
+        let update_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/workspaces/{id}/files/package.json"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"content":"{\"scripts\":{\"dev\":\"node index.js\"}}"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(update_response.status(), StatusCode::OK);
 
         let file_response = app
             .oneshot(
@@ -1221,7 +1294,7 @@ mod tests {
         assert!(file_payload["content"]
             .as_str()
             .expect("file content")
-            .contains("\"scripts\""));
+            .contains("index.js"));
     }
 
     #[test]
