@@ -1,8 +1,9 @@
 use crate::{
-    EidbCommitExecutionResultRecord, EidbCommitRecord, EidbExecutionEventRecord, EidbExecutionRecord,
-    EidbHealingAttemptRecord, EidbJourneyResultRecord, EidbRepositoryAnswerRecord,
-    EidbRepositoryContextSnapshotRecord, EidbRepositoryQuestionRecord, EidbRepositoryRecord,
-    EidbUrlAllocationRecord, EidbWarmPoolUsageRecord, EidbBillingEventRecord, ExecutionIntelligenceDatabase,
+    EidbBillingEventRecord, EidbCommitExecutionResultRecord, EidbCommitRecord,
+    EidbExecutionEventRecord, EidbExecutionRecord, EidbHealingAttemptRecord,
+    EidbJourneyResultRecord, EidbRepositoryAnswerRecord, EidbRepositoryContextSnapshotRecord,
+    EidbRepositoryQuestionRecord, EidbRepositoryRecord, EidbUrlAllocationRecord,
+    EidbWarmPoolUsageRecord, ExecutionIntelligenceDatabase,
 };
 use postgres::NoTls;
 use r2d2::Pool;
@@ -26,12 +27,16 @@ pub enum ExecutionIntelligencePersistenceError {
 impl Display for ExecutionIntelligencePersistenceError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingDatabaseUrl => write!(f, "DATABASE_URL is required for PostgreSQL persistence"),
+            Self::MissingDatabaseUrl => {
+                write!(f, "DATABASE_URL is required for PostgreSQL persistence")
+            }
             Self::InvalidDatabaseUrl(err) => write!(f, "invalid DATABASE_URL: {err}"),
             Self::Pool(err) => write!(f, "postgres pool error: {err}"),
             Self::Postgres(err) => write!(f, "postgres error: {err}"),
             Self::Io(err) => write!(f, "io error: {err}"),
-            Self::TimestampOutOfRange(value) => write!(f, "timestamp out of range for u64: {value}"),
+            Self::TimestampOutOfRange(value) => {
+                write!(f, "timestamp out of range for u64: {value}")
+            }
             Self::Serialization(err) => write!(f, "serialization error: {err}"),
         }
     }
@@ -110,16 +115,23 @@ const MIGRATIONS: &[Migration] = &[
 
 pub trait ExecutionIntelligenceReadStore {
     fn repository(&self, repository_id: &str) -> PersistenceResult<Option<EidbRepositoryRecord>>;
-    fn commits_for_repository(&self, repository_id: &str) -> PersistenceResult<Vec<EidbCommitRecord>>;
-    fn executions_for_repository(&self, repository_id: &str)
-        -> PersistenceResult<Vec<EidbExecutionRecord>>;
+    fn commits_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Vec<EidbCommitRecord>>;
+    fn executions_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Vec<EidbExecutionRecord>>;
     fn journey_results_for_repository(
         &self,
         repository_id: &str,
     ) -> PersistenceResult<Vec<EidbJourneyResultRecord>>;
     fn execution(&self, execution_id: &str) -> PersistenceResult<Option<EidbExecutionRecord>>;
-    fn events_for_execution(&self, execution_id: &str)
-        -> PersistenceResult<Vec<EidbExecutionEventRecord>>;
+    fn events_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> PersistenceResult<Vec<EidbExecutionEventRecord>>;
     fn url_allocations_for_execution(
         &self,
         execution_id: &str,
@@ -140,9 +152,15 @@ pub trait ExecutionIntelligenceReadStore {
         &self,
         execution_id: &str,
     ) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
-    fn billing_events_for_org(&self, org_id: &str) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
+    fn billing_events_for_org(
+        &self,
+        org_id: &str,
+    ) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
     fn billing_events(&self) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
-    fn last_good_commit_for_repository(&self, repository_id: &str) -> PersistenceResult<Option<String>>;
+    fn last_good_commit_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Option<String>>;
 }
 
 impl ExecutionIntelligenceReadStore for ExecutionIntelligenceDatabase {
@@ -150,7 +168,10 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligenceDatabase {
         Ok(self.repositories.get(repository_id).cloned())
     }
 
-    fn commits_for_repository(&self, repository_id: &str) -> PersistenceResult<Vec<EidbCommitRecord>> {
+    fn commits_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Vec<EidbCommitRecord>> {
         Ok(self
             .commits
             .iter()
@@ -263,7 +284,10 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligenceDatabase {
             .collect())
     }
 
-    fn billing_events_for_org(&self, org_id: &str) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+    fn billing_events_for_org(
+        &self,
+        org_id: &str,
+    ) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
         Ok(self
             .billing_events
             .iter()
@@ -276,7 +300,10 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligenceDatabase {
         Ok(self.billing_events.clone())
     }
 
-    fn last_good_commit_for_repository(&self, repository_id: &str) -> PersistenceResult<Option<String>> {
+    fn last_good_commit_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Option<String>> {
         Ok(self
             .last_good_commit_for_repository(repository_id)
             .map(ToString::to_string))
@@ -296,11 +323,9 @@ impl ExecutionIntelligencePostgresStore {
     }
 
     pub fn connect(database_url: &str) -> PersistenceResult<Self> {
-        let config = database_url
-            .parse()
-            .map_err(|err: postgres::Error| {
-                ExecutionIntelligencePersistenceError::InvalidDatabaseUrl(err.to_string())
-            })?;
+        let config = database_url.parse().map_err(|err: postgres::Error| {
+            ExecutionIntelligencePersistenceError::InvalidDatabaseUrl(err.to_string())
+        })?;
         let manager = PostgresConnectionManager::new(config, NoTls);
         let pool = Pool::builder().max_size(16).build(manager)?;
         let store = Self { pool };
@@ -516,18 +541,28 @@ impl ExecutionIntelligencePostgresStore {
         })
     }
 
-    pub fn insert_execution_event(&self, record: &EidbExecutionEventRecord) -> PersistenceResult<()> {
+    pub fn insert_execution_event(
+        &self,
+        record: &EidbExecutionEventRecord,
+    ) -> PersistenceResult<()> {
         self.with_client(|client| {
             client.execute(
                 "INSERT INTO execution_events (execution_id, event_type, created_at)
                  VALUES ($1, $2, to_timestamp($3::double precision))",
-                &[&record.execution_id, &record.event_type, &(record.created_at as f64)],
+                &[
+                    &record.execution_id,
+                    &record.event_type,
+                    &(record.created_at as f64),
+                ],
             )?;
             Ok(())
         })
     }
 
-    pub fn insert_warm_pool_usage(&self, record: &EidbWarmPoolUsageRecord) -> PersistenceResult<()> {
+    pub fn insert_warm_pool_usage(
+        &self,
+        record: &EidbWarmPoolUsageRecord,
+    ) -> PersistenceResult<()> {
         self.with_client(|client| {
             client.execute(
                 "INSERT INTO warm_pool_usage (execution_id, image_id, cache_hit, cold_start, startup_time_ms)
@@ -544,7 +579,10 @@ impl ExecutionIntelligencePostgresStore {
         })
     }
 
-    pub fn insert_healing_attempt(&self, record: &EidbHealingAttemptRecord) -> PersistenceResult<()> {
+    pub fn insert_healing_attempt(
+        &self,
+        record: &EidbHealingAttemptRecord,
+    ) -> PersistenceResult<()> {
         self.with_client(|client| {
             client.execute(
                 "INSERT INTO healing_attempts (repository_id, execution_id, failure_class, repair_strategy, success, created_at)
@@ -592,8 +630,9 @@ impl ExecutionIntelligencePostgresStore {
         status: &str,
     ) -> PersistenceResult<()> {
         self.with_client(|client| {
-            let capabilities = serde_json::to_value(capabilities)
-                .map_err(|err| ExecutionIntelligencePersistenceError::Serialization(err.to_string()))?;
+            let capabilities = serde_json::to_value(capabilities).map_err(|err| {
+                ExecutionIntelligencePersistenceError::Serialization(err.to_string())
+            })?;
             client.execute(
                 "INSERT INTO agents (agent_id, capabilities, last_seen, status)
                  VALUES ($1, $2, to_timestamp($3::double precision), $4)
@@ -693,7 +732,10 @@ impl ExecutionIntelligencePostgresStore {
         })
     }
 
-    pub fn insert_repository_answer(&self, record: &EidbRepositoryAnswerRecord) -> PersistenceResult<()> {
+    pub fn insert_repository_answer(
+        &self,
+        record: &EidbRepositoryAnswerRecord,
+    ) -> PersistenceResult<()> {
         self.with_client(|client| {
             client.execute(
                 "INSERT INTO repository_answers (answer_id, question_id, answer, confidence, outcome, created_at)
@@ -815,7 +857,10 @@ impl ExecutionIntelligencePostgresStore {
         )?;
 
         let rows = client.query("SELECT version FROM schema_migrations", &[])?;
-        let applied: HashSet<String> = rows.into_iter().map(|row| row.get::<_, String>(0)).collect();
+        let applied: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
 
         for migration in MIGRATIONS {
             if applied.contains(migration.version) {
@@ -835,7 +880,8 @@ impl ExecutionIntelligencePostgresStore {
     }
 
     fn to_u64(value: i64) -> PersistenceResult<u64> {
-        u64::try_from(value).map_err(|_| ExecutionIntelligencePersistenceError::TimestampOutOfRange(value))
+        u64::try_from(value)
+            .map_err(|_| ExecutionIntelligencePersistenceError::TimestampOutOfRange(value))
     }
 
     fn optional_epoch_to_pg(value: Option<u64>) -> Option<f64> {
@@ -868,7 +914,10 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
         })
     }
 
-    fn commits_for_repository(&self, repository_id: &str) -> PersistenceResult<Vec<EidbCommitRecord>> {
+    fn commits_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Vec<EidbCommitRecord>> {
         self.with_client(|client| {
             let rows = client.query(
                 "SELECT commit_hash, repository_id,
@@ -1162,7 +1211,10 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
         })
     }
 
-    fn billing_events_for_org(&self, org_id: &str) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+    fn billing_events_for_org(
+        &self,
+        org_id: &str,
+    ) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
         self.with_client(|client| {
             let rows = client.query(
                 "SELECT event_id, org_id, user_id, workspace_id, execution_id,
@@ -1223,7 +1275,10 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
         })
     }
 
-    fn last_good_commit_for_repository(&self, repository_id: &str) -> PersistenceResult<Option<String>> {
+    fn last_good_commit_for_repository(
+        &self,
+        repository_id: &str,
+    ) -> PersistenceResult<Option<String>> {
         self.with_client(|client| {
             let explicit = client.query_opt(
                 "SELECT cer.commit_hash

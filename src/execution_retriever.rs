@@ -15,15 +15,16 @@ impl ExecutionRetriever {
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            right
-                .success
-                .cmp(&left.success)
-                .then_with(|| match (left.duration_seconds, right.duration_seconds) {
-                    (Some(left_duration), Some(right_duration)) => left_duration.cmp(&right_duration),
+            right.success.cmp(&left.success).then_with(|| {
+                match (left.duration_seconds, right.duration_seconds) {
+                    (Some(left_duration), Some(right_duration)) => {
+                        left_duration.cmp(&right_duration)
+                    }
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
-                })
+                }
+            })
         });
         candidates.into_iter().take(limit).collect()
     }
@@ -37,7 +38,9 @@ impl ExecutionRetriever {
         let mut candidates = self
             .patterns
             .iter()
-            .filter(|entry| entry.fingerprint == fingerprint_hash && entry.failure_type == failure_type)
+            .filter(|entry| {
+                entry.fingerprint == fingerprint_hash && entry.failure_type == failure_type
+            })
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {

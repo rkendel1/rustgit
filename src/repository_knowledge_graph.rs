@@ -1,6 +1,7 @@
 use crate::{
-    eidb_execution_status_is_success, DependencyGraph, EidbExecutionRecord, EidbHealingAttemptRecord,
-    ExecutionGraph, ExecutionIntelligenceReadStore, PersistenceResult, RepositoryFingerprint,
+    eidb_execution_status_is_success, DependencyGraph, EidbExecutionRecord,
+    EidbHealingAttemptRecord, ExecutionGraph, ExecutionIntelligenceReadStore, PersistenceResult,
+    RepositoryFingerprint,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -156,7 +157,8 @@ fn failure_history(
 mod tests {
     use super::*;
     use crate::{
-        EidbExecutionRecord, EidbHealingAttemptRecord, EidbRepositoryRecord, ExecutionIntelligenceDatabase,
+        EidbExecutionRecord, EidbHealingAttemptRecord, EidbRepositoryRecord,
+        ExecutionIntelligenceDatabase,
     };
 
     #[test]

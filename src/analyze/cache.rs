@@ -17,7 +17,9 @@ impl AnalyzeCache {
     pub fn get(&self, key: &str) -> Option<CachedAnalyzeResult> {
         self.entries
             .lock()
-            .expect("analyze cache mutex was poisoned; a panic occurred while the cache lock was held")
+            .expect(
+                "analyze cache mutex was poisoned; a panic occurred while the cache lock was held",
+            )
             .get(key)
             .cloned()
     }
@@ -25,7 +27,9 @@ impl AnalyzeCache {
     pub fn put(&self, key: String, payload: Value) {
         self.entries
             .lock()
-            .expect("analyze cache mutex was poisoned; a panic occurred while the cache lock was held")
+            .expect(
+                "analyze cache mutex was poisoned; a panic occurred while the cache lock was held",
+            )
             .insert(key, CachedAnalyzeResult { payload });
     }
 

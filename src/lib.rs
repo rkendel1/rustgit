@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
+pub mod analyze;
 mod architecture_docs;
 mod execution_context;
 mod execution_embeddings;
@@ -18,10 +19,9 @@ mod execution_learning;
 mod execution_memory;
 mod execution_optimizer;
 mod execution_retriever;
-pub mod analyze;
-pub mod preparation;
 pub mod healing;
 mod postgres_db;
+pub mod preparation;
 mod repository_context_builder;
 mod repository_embeddings;
 mod repository_intelligence_service;
@@ -7555,8 +7555,12 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
         analysis,
         &expected_failures,
     );
-    let discovered_execution_spec =
-        discover_execution_specification(root, analysis, &existing_dependency_files, &environment_graph);
+    let discovered_execution_spec = discover_execution_specification(
+        root,
+        analysis,
+        &existing_dependency_files,
+        &environment_graph,
+    );
     let should_fallback_to_derivation = discovered_execution_spec
         .as_ref()
         .map_or(true, |spec| spec.decision == "repair");
@@ -7568,10 +7572,8 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
         &expected_failures,
     );
     let execution_specification = if should_fallback_to_derivation {
-        serde_json::to_value(
-            &derived_execution_specification,
-        )
-        .expect("Failed to serialize derived execution specification to JSON")
+        serde_json::to_value(&derived_execution_specification)
+            .expect("Failed to serialize derived execution specification to JSON")
     } else {
         discovered_execution_spec
             .as_ref()
@@ -7732,7 +7734,8 @@ fn discover_execution_specification(
     environment_graph: &[Value],
 ) -> Option<DiscoveredExecutionSpecification> {
     let candidate = discover_execution_spec_candidate(root)?;
-    let validation = validate_discovered_spec(&candidate, analysis, dependency_files, environment_graph);
+    let validation =
+        validate_discovered_spec(&candidate, analysis, dependency_files, environment_graph);
     let (trust_score, trust_level) = trust_score_for_discovered_spec(&candidate);
     let decision = if validation.overall_valid {
         if trust_score >= 85 {
@@ -7800,7 +7803,11 @@ fn discover_dot_execution_spec_candidate(root: &Path) -> Option<ExecutionSpecDis
 
     read_execution_spec_candidate(root, ".execution/execution.toml", "dot_execution_directory")
         .or_else(|| {
-            read_execution_spec_candidate(root, ".execution/execution.json", "dot_execution_directory")
+            read_execution_spec_candidate(
+                root,
+                ".execution/execution.json",
+                "dot_execution_directory",
+            )
         })
         .or_else(|| {
             let mut candidates = fs::read_dir(dot_execution)
@@ -7896,8 +7903,8 @@ fn validate_discovered_spec(
     let hint = candidate.validation_hint.to_ascii_lowercase();
     let has_runtime_marker = hint.contains("[runtime]") || hint.contains("\"runtime\"");
     let has_version_marker = hint.contains("version") || hint.contains("\"schema_version\"");
-    let schema_valid = candidate.source == "oci_wasi_metadata"
-        || (has_runtime_marker && has_version_marker);
+    let schema_valid =
+        candidate.source == "oci_wasi_metadata" || (has_runtime_marker && has_version_marker);
     let capability_valid = analysis
         .compiled_runtime
         .wasi_component_graph
@@ -7919,7 +7926,9 @@ fn validate_discovered_spec(
     }
 }
 
-fn trust_score_for_discovered_spec(candidate: &ExecutionSpecDiscoveryCandidate) -> (u8, &'static str) {
+fn trust_score_for_discovered_spec(
+    candidate: &ExecutionSpecDiscoveryCandidate,
+) -> (u8, &'static str) {
     if candidate.source == "well_known_execution_toml" || candidate.source == "oci_wasi_metadata" {
         return (90, "published_release_artifact");
     }
@@ -8103,15 +8112,19 @@ fn pre_healing_actions(expected_failures: &[Value]) -> Vec<String> {
         .filter_map(|failure| failure.get("failure").and_then(Value::as_str))
         .map(|failure| match failure {
             "Missing DATABASE_URL" => {
-                "Search repo/env history, synthesize DATABASE_URL, validate connectivity".to_string()
+                "Search repo/env history, synthesize DATABASE_URL, validate connectivity"
+                    .to_string()
             }
             "Node version mismatch" => {
-                "Mutate Node runtime candidate, simulate compatibility, pin selected version".to_string()
+                "Mutate Node runtime candidate, simulate compatibility, pin selected version"
+                    .to_string()
             }
             "pnpm lock mismatch" => {
                 "Reconcile package manager + lock strategy before install".to_string()
             }
-            "Port conflict" => "Reserve free port, rewrite run command and health probes".to_string(),
+            "Port conflict" => {
+                "Reserve free port, rewrite run command and health probes".to_string()
+            }
             _ => "Run compatibility pre-heal".to_string(),
         })
         .collect()
@@ -12312,11 +12325,9 @@ impl WorkspaceManager {
                 .arg("1");
             clone_command.env("GIT_TERMINAL_PROMPT", "0");
             if let Some(extra_header) = github_clone_extra_header(repo_url) {
-                clone_command
-                    .arg("-c")
-                    .arg(format!(
-                        "http.https://github.com/.extraheader={extra_header}"
-                    ));
+                clone_command.arg("-c").arg(format!(
+                    "http.https://github.com/.extraheader={extra_header}"
+                ));
             }
             let output = clone_command
                 .arg(repo_url)
@@ -12375,7 +12386,11 @@ impl WorkspaceManager {
         self.begin_launch_with_overrides(repo_url, LaunchOverrides::default())
     }
 
-    pub fn begin_launch_with_overrides(&self, repo_url: &str, overrides: LaunchOverrides) -> String {
+    pub fn begin_launch_with_overrides(
+        &self,
+        repo_url: &str,
+        overrides: LaunchOverrides,
+    ) -> String {
         let id = self.next_workspace_id();
         let workspace_root = self.root.join("workspaces").join(&id);
         let workspace = Workspace {
@@ -12415,12 +12430,21 @@ impl WorkspaceManager {
             .workspaces
             .lock()
             .ok()
-            .and_then(|workspaces| workspaces.get(id).map(|record| record.launch_overrides.clone()))
+            .and_then(|workspaces| {
+                workspaces
+                    .get(id)
+                    .map(|record| record.launch_overrides.clone())
+            })
             .unwrap_or_default();
         self.complete_launch_with_overrides(id, repo_url, overrides);
     }
 
-    pub fn complete_launch_with_overrides(&self, id: &str, repo_url: &str, overrides: LaunchOverrides) {
+    pub fn complete_launch_with_overrides(
+        &self,
+        id: &str,
+        repo_url: &str,
+        overrides: LaunchOverrides,
+    ) {
         let workspace_root = self.root.join("workspaces").join(id);
         let repository_root = workspace_root.join("repo");
 
@@ -12470,7 +12494,10 @@ impl WorkspaceManager {
         set_state(WorkspaceState::Analyzing);
         let analysis = match analyze_repository(&repository_root) {
             Ok(a) => a,
-            Err(e) => { set_failed(format!("workspace failed: {e}")); return; }
+            Err(e) => {
+                set_failed(format!("workspace failed: {e}"));
+                return;
+            }
         };
         push_log(format!("detected framework: {:?}", analysis.framework));
 
@@ -12489,14 +12516,20 @@ impl WorkspaceManager {
             },
             network: analysis.runtime_spec.network_policy.clone(),
         };
-        let planned_command = Self::resolved_run_command(&ctx, &overrides)
-            .unwrap_or_else(|| "none".to_string());
+        let planned_command =
+            Self::resolved_run_command(&ctx, &overrides).unwrap_or_else(|| "none".to_string());
         push_log(format!("planned execution command: {planned_command}"));
         if !overrides.environment.is_empty() {
-            push_log(format!("applied env overrides: {}", overrides.environment.len()));
+            push_log(format!(
+                "applied env overrides: {}",
+                overrides.environment.len()
+            ));
         }
         if !overrides.versions.is_empty() {
-            push_log(format!("applied version overrides: {}", overrides.versions.len()));
+            push_log(format!(
+                "applied version overrides: {}",
+                overrides.versions.len()
+            ));
         }
 
         workspace.framework = ctx.analysis.framework;
@@ -12576,8 +12609,12 @@ impl WorkspaceManager {
         let repo_path = std::path::Path::new(&ctx.repo_path);
         let is_python = matches!(
             ctx.analysis.framework,
-            Framework::Python | Framework::Flask | Framework::FastApi |
-            Framework::Django | Framework::Streamlit | Framework::Gradio
+            Framework::Python
+                | Framework::Flask
+                | Framework::FastApi
+                | Framework::Django
+                | Framework::Streamlit
+                | Framework::Gradio
         );
 
         // For Python apps, create a venv and install into it
@@ -12591,7 +12628,10 @@ impl WorkspaceManager {
                     .output();
             }
 
-            let install_cmd = ctx.execution_graph.nodes.iter()
+            let install_cmd = ctx
+                .execution_graph
+                .nodes
+                .iter()
                 .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
                 .and_then(|n| n.command.clone());
             if let Some(install) = install_cmd {
@@ -12599,11 +12639,21 @@ impl WorkspaceManager {
                 let pip_path = venv_pip.to_string_lossy().to_string();
                 // Extract everything after "pip " so we get "install -r requirements.txt"
                 let pip_args: Vec<String> = if let Some(idx) = install.find("pip ") {
-                    install[idx + 4..].split_whitespace().map(String::from).collect()
+                    install[idx + 4..]
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect()
                 } else {
-                    install.split_whitespace().skip(1).map(String::from).collect()
+                    install
+                        .split_whitespace()
+                        .skip(1)
+                        .map(String::from)
+                        .collect()
                 };
-                logs.push(format!("installing dependencies: {pip_path} {}", pip_args.join(" ")));
+                logs.push(format!(
+                    "installing dependencies: {pip_path} {}",
+                    pip_args.join(" ")
+                ));
                 match Command::new(&pip_path)
                     .args(&pip_args)
                     .current_dir(repo_path)
@@ -12626,7 +12676,10 @@ impl WorkspaceManager {
             }
         } else {
             // JS/other: run install command as-is
-            let install_cmd = ctx.execution_graph.nodes.iter()
+            let install_cmd = ctx
+                .execution_graph
+                .nodes
+                .iter()
                 .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
                 .and_then(|n| n.command.clone());
             if let Some(install) = install_cmd {
@@ -12666,7 +12719,8 @@ impl WorkspaceManager {
 
         // Substitute {PORT} placeholder used in Python command templates, then
         // rewrite the program path to the venv binary if this is a Python app
-        let run_cmd = Self::apply_command_overrides(&run_cmd, overrides).replace("{PORT}", &port_str);
+        let run_cmd =
+            Self::apply_command_overrides(&run_cmd, overrides).replace("{PORT}", &port_str);
         let run_cmd = if is_python {
             let venv_bin = repo_path.join(".venv").join("bin");
             let mut parts = run_cmd.splitn(2, ' ');
@@ -12748,7 +12802,9 @@ impl WorkspaceManager {
                             record.workspace.state = WorkspaceState::Failed;
                             record.logs.push(format!(
                                 "process exited unexpectedly ({})",
-                                status.code().map_or("signal".to_string(), |c| format!("code {c}"))
+                                status
+                                    .code()
+                                    .map_or("signal".to_string(), |c| format!("code {c}"))
                             ));
                             record.child_process = None;
                         }
@@ -12757,7 +12813,6 @@ impl WorkspaceManager {
                     }
                 }
             }
-
         }
     }
 
@@ -12907,7 +12962,8 @@ impl WasmWorkspace for WorkspaceManager {
         match launch_result {
             Ok((ctx, handle)) => {
                 let overrides = record.launch_overrides.clone();
-                let (child, assigned_port) = Self::spawn_run_command(&ctx, &overrides, &mut record.logs);
+                let (child, assigned_port) =
+                    Self::spawn_run_command(&ctx, &overrides, &mut record.logs);
                 // Patch the port list to use the actual assigned port
                 if let Some(port) = assigned_port {
                     for p in &mut workspace.ports {
@@ -16617,7 +16673,8 @@ fn github_clone_extra_header_with_token(repo_url: &str, token: Option<&str>) -> 
 }
 
 fn github_clone_error_reason(repo_url: &str, stderr: &str) -> String {
-    if repo_url.starts_with("https://github.com/") || repo_url.starts_with("https://www.github.com/")
+    if repo_url.starts_with("https://github.com/")
+        || repo_url.starts_with("https://www.github.com/")
     {
         if stderr.contains("could not read Username for 'https://github.com'")
             || stderr.contains("could not read Password for 'https://github.com'")
@@ -19082,7 +19139,8 @@ dependencies:
             environment: BTreeMap::from([(String::from("PORT"), String::from("4321"))]),
             versions: BTreeMap::from([(String::from("NODE_VERSION"), String::from("20"))]),
         };
-        let id = manager.begin_launch_with_overrides("https://github.com/example/repo.git", overrides);
+        let id =
+            manager.begin_launch_with_overrides("https://github.com/example/repo.git", overrides);
         let workspaces = manager.workspaces.lock().expect("workspace lock");
         let record = workspaces.get(&id).expect("workspace record");
         assert_eq!(
@@ -19090,7 +19148,11 @@ dependencies:
             Some("npm run custom")
         );
         assert_eq!(
-            record.launch_overrides.environment.get("PORT").map(String::as_str),
+            record
+                .launch_overrides
+                .environment
+                .get("PORT")
+                .map(String::as_str),
             Some("4321")
         );
         assert_eq!(
@@ -22062,8 +22124,11 @@ services:
         )
         .expect("write env example");
         fs::create_dir_all(repo.join("prisma")).expect("create prisma");
-        fs::write(repo.join("prisma/schema.prisma"), "datasource db { provider = \"sqlite\" }\n")
-            .expect("write prisma schema");
+        fs::write(
+            repo.join("prisma/schema.prisma"),
+            "datasource db { provider = \"sqlite\" }\n",
+        )
+        .expect("write prisma schema");
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
         let (_, analyze_body) = repositories_analyze_endpoint(
@@ -24001,8 +24066,10 @@ all = ["network"]
 
     #[test]
     fn github_clone_extra_header_ignores_non_github_urls() {
-        let header =
-            github_clone_extra_header_with_token("https://gitlab.com/group/repo.git", Some("token"));
+        let header = github_clone_extra_header_with_token(
+            "https://gitlab.com/group/repo.git",
+            Some("token"),
+        );
         assert!(header.is_none());
     }
 

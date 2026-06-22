@@ -35,11 +35,7 @@ pub struct RepairPlan {
 
 #[allow(async_fn_in_trait)]
 pub trait RepairKnowledgeProvider {
-    async fn recommend_repair(
-        &self,
-        repository_id: Uuid,
-        failure: FailureSignal,
-    ) -> RepairPlan;
+    async fn recommend_repair(&self, repository_id: Uuid, failure: FailureSignal) -> RepairPlan;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,7 +73,9 @@ impl RepositoryIntelligenceService {
             .embedding_pipeline
             .build_embeddings(repository_id_text.as_str(), &context)
             .await
-            .map_err(|err| crate::ExecutionIntelligencePersistenceError::Serialization(err.to_string()))?;
+            .map_err(|err| {
+                crate::ExecutionIntelligencePersistenceError::Serialization(err.to_string())
+            })?;
         Ok(answer_question(question, &graph, &context, &embeddings))
     }
 
@@ -108,7 +106,8 @@ fn answer_question(
     let latest_failure = graph.failure_history.last();
     let latest_healing = graph.healing_history.last();
     let best_runtime = best_runtime(graph);
-    let answer = if question_lower.contains("can this run") || question_lower.contains("can this repository run")
+    let answer = if question_lower.contains("can this run")
+        || question_lower.contains("can this repository run")
     {
         if successful_execution.is_some() {
             "Yes. This repository has prior successful executions and can run with the previously successful runtime.".to_string()
@@ -130,7 +129,9 @@ fn answer_question(
         }
     } else if question_lower.contains("runtime") && question_lower.contains("best") {
         match best_runtime {
-            Some(runtime) => format!("The best observed runtime is {runtime} based on success history."),
+            Some(runtime) => {
+                format!("The best observed runtime is {runtime} based on success history.")
+            }
             None => "No runtime performance history is available yet.".to_string(),
         }
     } else if question_lower.contains("heal") || question_lower.contains("repair") {
@@ -220,7 +221,9 @@ fn evidence(
     });
     evidence.push(RepositoryEvidence {
         evidence_type: "repair".to_string(),
-        reference_id: repair_strategy.clone().unwrap_or_else(|| "none".to_string()),
+        reference_id: repair_strategy
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
         detail: repair_strategy.unwrap_or_else(|| "No recorded repair".to_string()),
     });
     evidence
@@ -229,7 +232,9 @@ fn evidence(
 fn best_runtime(graph: &RepositoryKnowledgeGraph) -> Option<String> {
     let mut stats = HashMap::<String, (usize, usize)>::new();
     for execution in &graph.execution_history {
-        let entry = stats.entry(execution.execution_tier.clone()).or_insert((0, 0));
+        let entry = stats
+            .entry(execution.execution_tier.clone())
+            .or_insert((0, 0));
         entry.0 += 1;
         if execution.status.eq_ignore_ascii_case("success") {
             entry.1 += 1;
@@ -252,7 +257,8 @@ mod tests {
     use super::*;
     use crate::{
         repository_knowledge_graph::{
-            ArchitectureGraph, RepositoryFailureRecord, RepositoryRuntimeRecord, TemporalRecoveryRecord,
+            ArchitectureGraph, RepositoryFailureRecord, RepositoryRuntimeRecord,
+            TemporalRecoveryRecord,
         },
         DependencyGraph,
     };
@@ -310,10 +316,22 @@ mod tests {
         );
 
         assert_eq!(answer.evidence.len(), 4);
-        assert!(answer.evidence.iter().any(|entry| entry.evidence_type == "file"));
-        assert!(answer.evidence.iter().any(|entry| entry.evidence_type == "execution"));
-        assert!(answer.evidence.iter().any(|entry| entry.evidence_type == "failure"));
-        assert!(answer.evidence.iter().any(|entry| entry.evidence_type == "repair"));
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.evidence_type == "file"));
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.evidence_type == "execution"));
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.evidence_type == "failure"));
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.evidence_type == "repair"));
         assert!(answer.confidence > 0.0);
     }
 }
