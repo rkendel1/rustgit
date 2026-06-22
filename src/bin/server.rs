@@ -313,6 +313,75 @@ fn hash_key(input: &str) -> String {
     format!("{:x}", hasher.finish())
 }
 
+fn discover_launch_override_branches(repo_root: &FsPath) -> Vec<Value> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("for-each-ref")
+        .arg("refs/remotes/origin")
+        .arg("--format=%(refname:short)\t%(objectname)\t%(authorname)\t%(committerdate:iso8601)\t%(committerdate:unix)")
+        .output();
+    let Ok(output) = output else {
+        return vec![];
+    };
+    if !output.status.success() {
+        return vec![];
+    }
+
+    let mut branches = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let ref_name = parts.next()?.trim();
+            let commit = parts.next()?.trim();
+            let author = parts.next()?.trim();
+            let committed_at = parts.next()?.trim();
+            let committed_at_unix = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let branch = ref_name.strip_prefix("origin/").unwrap_or(ref_name);
+            if branch.is_empty() || branch == "HEAD" {
+                return None;
+            }
+            Some(json!({
+                "branch": branch,
+                "lastCommit": commit,
+                "author": author,
+                "timestamp": committed_at,
+                "timestampUnix": committed_at_unix
+            }))
+        })
+        .collect::<Vec<_>>();
+    branches.sort_by(|left, right| {
+        right["timestampUnix"]
+            .as_i64()
+            .unwrap_or_default()
+            .cmp(&left["timestampUnix"].as_i64().unwrap_or_default())
+    });
+    branches
+}
+
+fn build_launch_plan(payload: &Value, branch: &str) -> Value {
+    let execution_intelligence = payload.get("execution_intelligence").cloned().unwrap_or_default();
+    let env_count = execution_intelligence
+        .get("environmentVariables")
+        .and_then(Value::as_array)
+        .map(|vars| vars.len())
+        .unwrap_or_default();
+    json!({
+        "repository": payload.get("repo_url").or_else(|| payload.get("repo")).and_then(Value::as_str),
+        "branch": branch,
+        "runtime": execution_intelligence
+            .get("preferredRuntime")
+            .or_else(|| execution_intelligence.get("execution").and_then(|v| v.get("preferred"))),
+        "packageManager": execution_intelligence.get("packageManager"),
+        "nodeVersion": execution_intelligence.get("nodeVersion"),
+        "command": execution_intelligence
+            .get("recommendedCommand")
+            .or_else(|| execution_intelligence.get("startCommand")),
+        "environmentCount": env_count,
+        "autoHealsApplied": execution_intelligence.get("autoHealsApplied"),
+    })
+}
+
 async fn health() -> StatusCode {
     StatusCode::OK
 }
@@ -428,6 +497,11 @@ async fn analyze_repository(
     };
     let result = AnalyzeEngine::analyze(&repo_root, &request).map_err(err_response)?;
     let mut payload = result.payload;
+    let launch_branches = discover_launch_override_branches(&repo_root);
+    payload["launch_overrides"] = json!({
+        "branches": launch_branches
+    });
+    payload["launch_plan"] = build_launch_plan(&payload, &request.branch);
     payload["cached"] = json!(false);
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
     if include_repository_summary {
@@ -1435,6 +1509,28 @@ mod tests {
             payload["execution_intelligence"]["execution"]["preferred"].as_str(),
             Some("pnpm")
         );
+        assert_eq!(
+            payload["execution_intelligence"]["preferredRuntime"].as_str(),
+            Some("pnpm")
+        );
+        assert!(
+            payload["execution_intelligence"]["recommendedCommand"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("--host 0.0.0.0")
+        );
+        assert!(
+            payload["execution_intelligence"]["recommendedCommand"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("--port {PORT}")
+        );
+        assert_eq!(
+            payload["execution_intelligence"]["autoHealsApplied"][0].as_str(),
+            Some("hostInjection")
+        );
+        assert_eq!(payload["launch_plan"]["branch"].as_str(), Some("main"));
+        assert!(payload["launch_overrides"]["branches"].is_array());
 
         let second = app
             .oneshot(

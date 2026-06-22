@@ -13086,13 +13086,51 @@ impl WorkspaceManager {
         }
 
         if output.status.success() {
-            Ok(())
-        } else {
-            Err(RuntimeError::CommandFailed(format!(
-                "install command exited with status {}",
-                output.status
-            )))
+            return Ok(());
         }
+
+        let lowered = install_cmd.to_ascii_lowercase();
+        if lowered.contains("pnpm")
+            && lowered.contains("install")
+            && lowered.contains("--frozen-lockfile")
+        {
+            Self::update_runtime_line(
+                workspaces,
+                id,
+                "stderr: pnpm frozen lockfile install failed, retrying with regenerated lockfile".to_string(),
+                true,
+            );
+            let retry = Command::new("pnpm")
+                .arg("install")
+                .current_dir(&install_cwd)
+                .envs(&overrides.environment)
+                .envs(&overrides.versions)
+                .output()
+                .map_err(|err| RuntimeError::CommandFailed(format!("failed to run pnpm install retry: {err}")))?;
+
+            for line in String::from_utf8_lossy(&retry.stdout).lines() {
+                if !line.trim().is_empty() {
+                    Self::update_runtime_line(workspaces, id, format!("stdout: {}", line.trim()), false);
+                }
+            }
+            for line in String::from_utf8_lossy(&retry.stderr).lines() {
+                if !line.trim().is_empty() {
+                    Self::update_runtime_line(workspaces, id, format!("stderr: {}", line.trim()), true);
+                }
+            }
+            if retry.status.success() {
+                Self::update_runtime_line(workspaces, id, "stdout: lockfile regenerated".to_string(), false);
+                return Ok(());
+            }
+            return Err(RuntimeError::CommandFailed(format!(
+                "pnpm install retry exited with status {}",
+                retry.status
+            )));
+        }
+        Err(RuntimeError::CommandFailed(format!(
+            "install command exited with status {}",
+            output.status
+        )))
     }
 
     fn spawn_supervised_process(ctx: &ExecutionContext, overrides: &LaunchOverrides) -> Result<(Child, u16)> {
@@ -13112,8 +13150,10 @@ impl WorkspaceManager {
         let (requested_port, prebound_port_listener) = Self::reserve_prebound_port()
             .ok_or_else(|| RuntimeError::CommandFailed("failed to reserve runtime port via bind(127.0.0.1:0)".to_string()))?;
 
-        let run_cmd = Self::apply_command_overrides(&run_cmd, overrides)
-            .replace("{PORT}", &requested_port.to_string());
+        let run_cmd = Self::auto_heal_runtime_command(
+            &Self::apply_command_overrides(&run_cmd, overrides)
+                .replace("{PORT}", &requested_port.to_string())
+        );
         let run_cmd = if is_python {
             let venv_bin = repo_path.join(".venv").join("bin");
             let mut parts = run_cmd.splitn(2, ' ');
@@ -13159,6 +13199,26 @@ impl WorkspaceManager {
             .spawn()
             .map_err(|err| RuntimeError::CommandFailed(format!("spawn failed: {err}")))?;
         Ok((child, requested_port))
+    }
+
+    fn auto_heal_runtime_command(command: &str) -> String {
+        let lower = command.to_ascii_lowercase();
+        let mut healed = command.trim().to_string();
+        let is_node_like = ["npm ", "pnpm ", "yarn ", "bun ", "vite ", "next "]
+            .iter()
+            .any(|marker| lower.contains(marker));
+        if !is_node_like {
+            return healed;
+        }
+        if !lower.contains("--host") && !lower.contains("hostname") {
+            healed.push_str(" --host 0.0.0.0");
+        }
+        if !lower.contains("--port") && !lower.contains("port=") {
+            let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+            healed.push_str(" --port ");
+            healed.push_str(&port);
+        }
+        healed
     }
 
     fn wait_for_runtime_readiness(&self, id: &str) -> Result<()> {
