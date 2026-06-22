@@ -374,6 +374,7 @@ Store API credentials/secrets as Fly secrets instead of committing them to confi
 fly deploy --config deploy/fly/postgres.fly.toml
 
 # Create persistent workspace volumes so analyze/runtime caches survive restarts.
+# --size is in GB on Fly; this creates 10GB volumes for each app.
 fly volumes create workspace_data --app trythissoftware-api --region iad --size 10
 fly volumes create workspace_data --app trythissoftware-workspaces --region iad --size 10
 
