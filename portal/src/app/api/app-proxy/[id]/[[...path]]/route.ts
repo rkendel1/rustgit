@@ -80,7 +80,16 @@ async function handle(
   if (contentType.includes("text/html")) {
     let html = await upstreamRes.text();
     const rewriteAbsoluteToProxy = (value: string): string =>
-      value.replace(/=(["'])\/(?!\/)/g, `=$1${proxyBase}`);
+      value
+        .replace(
+          /=\s*(["'])\/(?!\/)([^"']*)\1/g,
+          (_match, quote: string, path: string) =>
+            `=${quote}${proxyBase}${path}${quote}`,
+        )
+        .replace(
+          /=\s*\/(?!\/)([^\s"'=<>`]+)/g,
+          (_match, path: string) => `=${proxyBase}${path}`,
+        );
 
     html = rewriteAbsoluteToProxy(html);
     // Make relative URLs resolve through our proxy
