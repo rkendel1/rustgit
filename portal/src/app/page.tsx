@@ -231,11 +231,7 @@ export default function Home() {
 
   const parsedRepo = useMemo(() => parseRepositoryInput(repository), [repository]);
   const canAnalyze = Boolean(parsedRepo) && !analyzing;
-  const canRun =
-    !running &&
-    Boolean(parsedRepo) &&
-    Boolean(analyzeResult) &&
-    analyzedRepoUrl === parsedRepo?.repoUrl;
+  const canRun = Boolean(parsedRepo) && !running;
 
   function resetResults(nextRepositoryValue: string) {
     setRepository(nextRepositoryValue);
@@ -597,9 +593,6 @@ export default function Home() {
 
         <div className={styles.sidebarMeta}>
           <p>
-            Branch <strong>{branch.trim() || "main"}</strong>
-          </p>
-          <p>
             API <code>{API_BASE_URL}</code>
           </p>
         </div>
@@ -608,7 +601,7 @@ export default function Home() {
       <section className={styles.listPane}>
         <header className={styles.paneHeader}>
           <h1>Repository workspace</h1>
-          <p>Paste a GitHub URL, analyze metadata, and prepare execution.</p>
+          <p>Paste a GitHub URL and run it. Override options appear after a failure.</p>
         </header>
 
         <section className={styles.panel}>
@@ -640,56 +633,6 @@ export default function Home() {
             />
             <p className={styles.hint}>
               You can also use <code>owner/repo</code>.
-            </p>
-
-            <div className={styles.branchRow}>
-              <label htmlFor="branch" className={styles.label}>
-                Branch
-              </label>
-              <input
-                id="branch"
-                type="text"
-                value={branch}
-                onChange={(event) => setBranch(event.target.value)}
-                placeholder="main"
-                className={styles.input}
-              />
-            </div>
-            <label htmlFor="start-command" className={styles.label}>
-              Start command override (pre-heal)
-            </label>
-            <input
-              id="start-command"
-              type="text"
-              value={startCommand}
-              onChange={(event) => setStartCommand(event.target.value)}
-              placeholder="npm run dev -- --host 0.0.0.0"
-              className={styles.input}
-            />
-            <label htmlFor="env-overrides" className={styles.label}>
-              Environment overrides (KEY=value per line)
-            </label>
-            <textarea
-              id="env-overrides"
-              value={envOverrides}
-              onChange={(event) => setEnvOverrides(event.target.value)}
-              placeholder={"PORT=3000\nNODE_ENV=development"}
-              className={styles.input}
-              rows={4}
-            />
-            <label htmlFor="version-overrides" className={styles.label}>
-              Version overrides (KEY=value per line)
-            </label>
-            <textarea
-              id="version-overrides"
-              value={versionOverrides}
-              onChange={(event) => setVersionOverrides(event.target.value)}
-              placeholder={"NODE_VERSION=20\nPYTHON_VERSION=3.12"}
-              className={styles.input}
-              rows={3}
-            />
-            <p className={styles.hint}>
-              These overrides are applied before launch and on every retry so you can iterate indefinitely.
             </p>
 
             <div className={styles.actions}>
@@ -827,8 +770,10 @@ export default function Home() {
                 <button
                   className={styles.btnRestart}
                   disabled={
-                    actionPending
-                    || ["Created", "Materializing", "Analyzing", "Planning", "Provisioning", "Starting", "Restarting", "Stopping", "Destroyed"].includes(workspace.state)
+                    actionPending ||
+                    ["Created", "Materializing", "Analyzing", "Planning",
+                     "Provisioning", "Starting", "Restarting", "Stopping",
+                     "Running", "Destroyed"].includes(workspace.state)
                   }
                   onClick={handleRestart}
                 >
@@ -873,6 +818,48 @@ export default function Home() {
                 </div>
               ))}
             </div>
+
+            {workspace.state === "Failed" && (
+              <div className={styles.healPanel}>
+                <p className={styles.healTitle}>Heal &amp; retry</p>
+                <label htmlFor="heal-branch" className={styles.label}>Branch</label>
+                <input
+                  id="heal-branch"
+                  type="text"
+                  value={branch}
+                  onChange={(e) => setBranch(e.target.value)}
+                  placeholder="main"
+                  className={styles.input}
+                />
+                <label htmlFor="heal-cmd" className={styles.label}>Start command override</label>
+                <input
+                  id="heal-cmd"
+                  type="text"
+                  value={startCommand}
+                  onChange={(e) => setStartCommand(e.target.value)}
+                  placeholder="npm run dev -- --host 0.0.0.0"
+                  className={styles.input}
+                />
+                <label htmlFor="heal-env" className={styles.label}>Environment overrides (KEY=value per line)</label>
+                <textarea
+                  id="heal-env"
+                  value={envOverrides}
+                  onChange={(e) => setEnvOverrides(e.target.value)}
+                  placeholder={"PORT=3000\nNODE_ENV=development"}
+                  className={styles.input}
+                  rows={3}
+                />
+                <label htmlFor="heal-versions" className={styles.label}>Version overrides (KEY=value per line)</label>
+                <textarea
+                  id="heal-versions"
+                  value={versionOverrides}
+                  onChange={(e) => setVersionOverrides(e.target.value)}
+                  placeholder={"NODE_VERSION=20\nPYTHON_VERSION=3.12"}
+                  className={styles.input}
+                  rows={2}
+                />
+              </div>
+            )}
 
             <div className={styles.logSection}>
               <div className={styles.logHeader}>

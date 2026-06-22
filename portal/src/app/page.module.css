@@ -327,6 +327,23 @@
   cursor: not-allowed;
 }
 
+.healPanel {
+  margin-top: 0.85rem;
+  border-top: 1px solid #fecaca;
+  padding-top: 0.75rem;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.healTitle {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #b91c1c;
+  margin-bottom: 0.15rem;
+}
+
 .logSection {
   margin-top: 0.85rem;
   border-top: 1px solid #e2e8f0;
@@ -489,6 +506,14 @@
     border-color: #7f1d1d;
     color: #fecaca;
     background: #3f1115;
+  }
+
+  .healPanel {
+    border-top-color: #7f1d1d;
+  }
+
+  .healTitle {
+    color: #fca5a5;
   }
 
   .logSection {
