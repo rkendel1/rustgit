@@ -93,12 +93,12 @@ type WorkspaceTreeNode = {
 
 type WorkspaceState =
   | "Created" | "Materializing" | "Analyzing" | "Planning" | "Pending"
-  | "Provisioning" | "Starting" | "Running" | "Degraded" | "Restarting"
+  | "Provisioning" | "Initializing" | "Starting" | "Running" | "Degraded" | "Restarting"
   | "Migrating" | "Paused" | "Failed" | "Stopping" | "Stopped" | "Destroyed";
 
 const ACTIVE_WORKSPACE_STATES = new Set<WorkspaceState>([
   "Created", "Materializing", "Analyzing", "Planning",
-  "Provisioning", "Starting", "Running", "Restarting",
+  "Provisioning", "Initializing", "Starting", "Running", "Restarting",
 ]);
 
 type Workspace = {
@@ -957,7 +957,7 @@ export default function Home() {
                   disabled={
                     actionPending ||
                     ["Created", "Materializing", "Analyzing", "Planning",
-                     "Provisioning", "Starting", "Restarting", "Stopping",
+                     "Provisioning", "Initializing", "Starting", "Restarting", "Stopping",
                      "Running", "Destroyed"].includes(workspace.state)
                   }
                   onClick={handleRestart}
@@ -992,16 +992,17 @@ export default function Home() {
               <span>{workspace?.resource_quotas?.max_memory_mb ?? "—"} MB</span>
             </div>
             {workspace?.ports && workspace.ports.length > 0 ? (
-              workspace.ports.map((p) => (
-                <div key={p.port} className={styles.tile} style={{ gridColumn: "1 / -1" }}>
-                  <strong>App URL{workspace.ports.length > 1 ? ` :${p.port}` : ""}</strong>
-                  {p.route ? (
-                    <a href={p.route} target="_blank" rel="noreferrer">{p.route}</a>
-                  ) : (
-                    <span>port {p.port} ({p.protocol})</span>
-                  )}
-                </div>
-              ))
+              workspace.ports.map((p) => {
+                const appUrl = p.route?.startsWith("http")
+                  ? p.route
+                  : `http://127.0.0.1:${p.port}${p.route ?? "/"}`;
+                return (
+                  <div key={p.port} className={styles.tile} style={{ gridColumn: "1 / -1" }}>
+                    <strong>App URL{workspace.ports.length > 1 ? ` :${p.port}` : ""}</strong>
+                    <a href={appUrl} target="_blank" rel="noreferrer">{appUrl}</a>
+                  </div>
+                );
+              })
             ) : null}
           </div>
         </section>
