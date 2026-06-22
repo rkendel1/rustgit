@@ -6,8 +6,13 @@ primary_region = "iad"
 
 [env]
   BASE_DOMAIN = "trythissoftware.com"
+  WORKSPACE_ROOT = "/data/workspaces"
   # DATABASE_URL, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, JWT_SECRET set via:
   # fly secrets set --app trythissoftware-api KEY=value
+
+[[mounts]]
+  source = "workspace_data"
+  destination = "/data/workspaces"
 
 [http_service]
   internal_port = 8080
@@ -20,6 +25,6 @@ primary_region = "iad"
   idle_timeout = 300
 
 [[vm]]
-  memory = "512mb"
+  memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
