@@ -29,12 +29,10 @@ const FRAMEWORK_STARTUP_TIMEOUTS_MS: Record<string, number> = {
   angular: 60_000,
   django: 60_000,
   fastapi: 30_000,
-  fast_api: 30_000,
-  "fast api": 30_000,
 };
 
 function startupTimeoutMs(framework?: string): number {
-  const normalized = framework?.toLowerCase();
+  const normalized = framework?.toLowerCase().replace(/[_\s]+/g, "");
   if (!normalized) return 45_000;
   return FRAMEWORK_STARTUP_TIMEOUTS_MS[normalized] ?? 45_000;
 }
@@ -61,7 +59,7 @@ function probeError(error: unknown): string {
   return error instanceof Error ? error.message : "connection failed";
 }
 
-function processHint(logs: string[]): string {
+function extractProcessInfo(logs: string[]): string {
   const pidLine = logs.find((line) => line.includes("spawned pid:"));
   if (!pidLine) return "unknown";
   const match = pidLine.match(/spawned pid:\s*(\d+)/i);
@@ -132,9 +130,6 @@ async function handle(
   while (Date.now() < deadline) {
     const now = Date.now();
     const remaining = deadline - now;
-    if (remaining <= 0) {
-      break;
-    }
     if (remaining < MIN_POLL_INTERVAL_MS) {
       break;
     }
@@ -204,7 +199,7 @@ async function handle(
           error: "Workspace failed to become ready.",
           status: "failed",
           framework: workspace.framework ?? "unknown",
-          process: processHint(logs),
+          process: extractProcessInfo(logs),
           workspaceState: workspace.state,
           port: workspace.ports?.[0]?.port ?? null,
           lastProbe,
@@ -221,7 +216,7 @@ async function handle(
       if (logs.length > 0) {
         lastLogs = logs.slice(-5);
         if (lastProbe === "port unavailable" && READY_LOG_PATTERN.test(lastLogs.join("\n"))) {
-          lastProbe = "startup logs indicate server is initializing";
+          lastProbe = "startup logs indicate server may be ready";
         }
       }
     }
@@ -250,7 +245,7 @@ async function handle(
     {
       status: "starting",
       framework: workspace.framework ?? "unknown",
-      process: processHint(lastLogs),
+      process: extractProcessInfo(lastLogs),
       workspaceState: workspace.state ?? "unknown",
       port: workspace.ports?.[0]?.port ?? null,
       progress: progressPercent(elapsed, maxWaitMs),
