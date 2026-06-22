@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12515,17 +12515,27 @@ fn run_command_with_timeout(command: &mut Command, timeout_secs: u64) -> Result<
         .spawn()
         .map_err(|err| RuntimeError::CommandFailed(format!("failed to spawn command: {err}")))?;
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| {
+            RuntimeError::CommandFailed(format!(
+                "command timeout value too large: {timeout_secs}s"
+            ))
+        })?;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let mut stdout = Vec::new();
                 let mut stderr = Vec::new();
                 if let Some(mut out) = child.stdout.take() {
-                    let _ = std::io::Read::read_to_end(&mut out, &mut stdout);
+                    out.read_to_end(&mut stdout).map_err(|err| {
+                        RuntimeError::CommandFailed(format!("failed to read command stdout: {err}"))
+                    })?;
                 }
                 if let Some(mut err) = child.stderr.take() {
-                    let _ = std::io::Read::read_to_end(&mut err, &mut stderr);
+                    err.read_to_end(&mut stderr).map_err(|err| {
+                        RuntimeError::CommandFailed(format!("failed to read command stderr: {err}"))
+                    })?;
                 }
                 return Ok(std::process::Output {
                     status,
@@ -12535,8 +12545,16 @@ fn run_command_with_timeout(command: &mut Command, timeout_secs: u64) -> Result<
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.kill().map_err(|err| {
+                        RuntimeError::CommandFailed(format!(
+                            "command timed out after {timeout_secs}s but failed to kill process: {err}"
+                        ))
+                    })?;
+                    if let Err(err) = child.wait() {
+                        return Err(RuntimeError::CommandFailed(format!(
+                            "command timed out after {timeout_secs}s, process was killed but wait failed: {err}"
+                        )));
+                    }
                     return Err(RuntimeError::CommandFailed(format!(
                         "command timed out after {timeout_secs}s and was killed"
                     )));
@@ -20552,6 +20570,7 @@ dependencies:
         assert_eq!(extracted, "npm run dev");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_command_with_timeout_kills_hung_process_and_fails_cleanly() {
         let mut cmd = Command::new("sleep");
