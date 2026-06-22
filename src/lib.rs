@@ -17516,16 +17516,29 @@ impl DockerExecutionProvider {
         "DockerExecutionProvider"
     }
 
-    fn is_docker_command(command: &str) -> bool {
+    fn docker_command_lowercase(command: &str) -> Option<String> {
         let trimmed = command.trim();
         if trimmed.is_empty() {
-            return false;
+            return None;
         }
         let lower = trimmed.to_ascii_lowercase();
-        lower == "docker"
+        if lower == "docker"
             || lower.starts_with("docker ")
             || lower.starts_with("docker-compose ")
             || lower.starts_with("docker compose ")
+        {
+            Some(lower)
+        } else {
+            None
+        }
+    }
+
+    fn is_docker_command(command: &str) -> bool {
+        Self::docker_command_lowercase(command).is_some()
+    }
+
+    fn is_compose_command(lower_command: &str) -> bool {
+        lower_command.starts_with("docker compose ") || lower_command.starts_with("docker-compose ")
     }
 
     fn command_for_context(ctx: &ExecutionContext) -> Option<String> {
@@ -17536,8 +17549,13 @@ impl DockerExecutionProvider {
     }
 
     fn ensure_docker_ready(command: &str) -> Result<()> {
-        if !Self::is_docker_command(command) {
+        let Some(lower) = Self::docker_command_lowercase(command) else {
             return Ok(());
+        };
+        if lower == "docker" {
+            return Err(RuntimeError::CommandFailed(
+                "docker command is missing a subcommand".to_string(),
+            ));
         }
 
         let mut docker_version = Command::new("docker");
@@ -17546,8 +17564,7 @@ impl DockerExecutionProvider {
             RuntimeError::CommandFailed(format!("docker runtime readiness check failed: {err}"))
         })?;
 
-        let lower = command.to_ascii_lowercase();
-        if lower.starts_with("docker compose ") || lower.starts_with("docker-compose ") {
+        if Self::is_compose_command(&lower) {
             let mut docker_compose_version = Command::new("docker");
             docker_compose_version.args(["compose", "version"]);
             run_command_with_timeout(&mut docker_compose_version, INSTALL_TIMEOUT_SECS).map_err(
@@ -22034,6 +22051,26 @@ dependencies:
         let selection = router.select(&ctx).expect("select docker provider");
         assert_eq!(selection.provider_id, "DockerExecutionProvider");
         assert_eq!(selection.selected_tier, ExecutionTier::LocalDocker);
+    }
+
+    #[test]
+    fn docker_provider_rejects_bare_docker_command() {
+        let err = DockerExecutionProvider::ensure_docker_ready("docker")
+            .expect_err("bare docker command should be rejected");
+        assert!(matches!(
+            err,
+            RuntimeError::CommandFailed(message)
+                if message.contains("missing a subcommand")
+        ));
+    }
+
+    #[test]
+    fn docker_provider_detects_compose_command_prefixes() {
+        assert!(DockerExecutionProvider::is_compose_command("docker compose up"));
+        assert!(DockerExecutionProvider::is_compose_command(
+            "docker-compose up --build"
+        ));
+        assert!(!DockerExecutionProvider::is_compose_command("docker run hello-world"));
     }
 
     #[test]
