@@ -19,7 +19,7 @@ primary_region = "iad"
   auto_stop_machines = "off"
   min_machines_running = 1
 
-[vm]
+[[vm]]
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
