@@ -10,6 +10,15 @@
 - `WorkspaceRouter::route_request` resolves workspace and proxy target (`src/lib.rs:11898-11914`).
 - `route_workspace_request` updates runtime health timestamps (`src/lib.rs:11881-11895`).
 
+## Workspace proxy HTTP routes
+- Routes are registered for all prefixes via `with_workspace_routes` (`src/bin/server.rs:1178-1212`).
+- Workspace proxy path is `workspaces/:id/proxy/*path` for:
+  - `/workspaces/:id/proxy/*path`
+  - `/api/v1/workspaces/:id/proxy/*path`
+  - `/api/proxy/api/v1/workspaces/:id/proxy/*path`
+  (`src/bin/server.rs:1230-1236`, `1201-1203`)
+- Route handler is `workspace_app_proxy`, which forwards through `WorkspaceRouter::route_workspace_request` (`src/bin/server.rs:503-552`, `src/lib.rs:11881-11914`).
+
 ## API proxy (`/api/proxy/...`)
 - Generic upstream forwarder with request timeout (`DEFAULT_TIMEOUT_MS=30s`, `ANALYZE_TIMEOUT_MS=295s`) (`portal/src/app/api/proxy/[...path]/route.ts:20-31`).
 - Retries once with `api/proxy/` prefix on upstream 404 (`portal/src/app/api/proxy/[...path]/route.ts:223-239`).
@@ -31,4 +40,4 @@
 ## Streaming / WebSocket support
 - Streamed log ingestion from child stdout/stderr is implemented (`src/lib.rs:12416-12437`).
 - `WorkspaceProxyProtocol` enum includes `WebSocket` and `Sse` (`src/lib.rs:11685-11690`).
-- No concrete WebSocket route/upgrade handler found in `src/bin/server.rs`.
+- Current Axum router wiring does not expose a dedicated WebSocket upgrade route in `src/bin/server.rs` (proxy transport enum support is metadata/model-level only).

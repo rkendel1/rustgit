@@ -40,3 +40,4 @@
 
 ## Notes
 - Analyze-only execution planning artifacts (`.execution-plan.json`, `.runtime-capabilities.json`, `.launch-plan.json`) are written by `AnalyzeEngine` (`src/analyze/analyzer.rs:150-175`) and do not directly invoke a runtime.
+- Backend also exposes workspace proxy forwarding routes under `/workspaces/:id/proxy/*path`, `/api/v1/workspaces/:id/proxy/*path`, and `/api/proxy/api/v1/workspaces/:id/proxy/*path` (`src/bin/server.rs:1178-1212`, `1230-1236`).

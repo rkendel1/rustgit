@@ -53,3 +53,10 @@ Verified from source only. No new functionality was added.
 ## Assumptions / unknowns
 - “Current production usage” is inferred only from wiring/routes in this repository (no live telemetry source in-code).
 - A provider appearing in analyze payloads is treated as metadata capability unless it is also registered in `WorkspaceManager::new`.
+
+## Runtime capabilities endpoint routes
+- Runtime capabilities are served by `runtime_capabilities` (`src/bin/server.rs:403-422`).
+- Endpoint is exposed at both:
+  - `/api/runtime/capabilities`
+  - `/api/proxy/api/runtime/capabilities`
+  (`src/bin/server.rs:1239-1242`)
