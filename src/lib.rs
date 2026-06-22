@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +73,8 @@ const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
 const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
+const INSTALL_TIMEOUT_SECS: u64 = 180;
+const INSTALL_POLL_INTERVAL_MS: u64 = 250;
 static WASI_KERNEL_TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MIN_BILLABLE_DURATION_SECONDS: f64 = 1.0;
 const RETRY_PENALTY_UNITS: f64 = 0.25;
@@ -12507,6 +12509,67 @@ impl ExecutionEngine {
     }
 }
 
+fn run_command_with_timeout(command: &mut Command, timeout_secs: u64) -> Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|err| RuntimeError::CommandFailed(format!("failed to spawn command: {err}")))?;
+
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| {
+            RuntimeError::CommandFailed(format!(
+                "command timeout value too large: {timeout_secs}s"
+            ))
+        })?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    out.read_to_end(&mut stdout).map_err(|err| {
+                        RuntimeError::CommandFailed(format!("failed to read command stdout: {err}"))
+                    })?;
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    err.read_to_end(&mut stderr).map_err(|err| {
+                        RuntimeError::CommandFailed(format!("failed to read command stderr: {err}"))
+                    })?;
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    child.kill().map_err(|err| {
+                        RuntimeError::CommandFailed(format!(
+                            "command timed out after {timeout_secs}s but failed to kill process: {err}"
+                        ))
+                    })?;
+                    if let Err(err) = child.wait() {
+                        return Err(RuntimeError::CommandFailed(format!(
+                            "command timed out after {timeout_secs}s, process was killed but wait failed: {err}"
+                        )));
+                    }
+                    return Err(RuntimeError::CommandFailed(format!(
+                        "command timed out after {timeout_secs}s and was killed"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(INSTALL_POLL_INTERVAL_MS));
+            }
+            Err(err) => {
+                return Err(RuntimeError::CommandFailed(format!(
+                    "failed to poll command status: {err}"
+                )));
+            }
+        }
+    }
+}
+
 impl WorkspaceManager {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let requested_root: PathBuf = root.into();
@@ -13316,15 +13379,13 @@ impl WorkspaceManager {
             return Ok(());
         };
         let args: Vec<&str> = parts.collect();
-        let output = Command::new(program)
+        let mut install_cmd_handle = Command::new(program);
+        install_cmd_handle
             .args(&args)
             .current_dir(&install_cwd)
             .envs(&overrides.environment)
-            .envs(&overrides.versions)
-            .output()
-            .map_err(|err| {
-                RuntimeError::CommandFailed(format!("failed to run install command: {err}"))
-            })?;
+            .envs(&overrides.versions);
+        let output = run_command_with_timeout(&mut install_cmd_handle, INSTALL_TIMEOUT_SECS)?;
 
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if !line.trim().is_empty() {
@@ -13358,15 +13419,13 @@ impl WorkspaceManager {
                     .to_string(),
                 true,
             );
-            let retry = Command::new("pnpm")
+            let mut retry_cmd_handle = Command::new("pnpm");
+            retry_cmd_handle
                 .arg("install")
                 .current_dir(&install_cwd)
                 .envs(&overrides.environment)
-                .envs(&overrides.versions)
-                .output()
-                .map_err(|err| {
-                    RuntimeError::CommandFailed(format!("failed to run pnpm install retry: {err}"))
-                })?;
+                .envs(&overrides.versions);
+            let retry = run_command_with_timeout(&mut retry_cmd_handle, INSTALL_TIMEOUT_SECS)?;
 
             for line in String::from_utf8_lossy(&retry.stdout).lines() {
                 if !line.trim().is_empty() {
@@ -20509,6 +20568,26 @@ dependencies:
             WorkspaceManager::extract_workdir_and_command(&command, default_dir.as_path());
         assert_eq!(workdir, default_dir);
         assert_eq!(extracted, "npm run dev");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_hung_process_and_fails_cleanly() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let result = run_command_with_timeout(&mut cmd, 1);
+        assert!(
+            matches!(result, Err(RuntimeError::CommandFailed(msg)) if msg.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_output_for_fast_command() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+        let output = run_command_with_timeout(&mut cmd, 5).expect("echo should succeed");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
     }
 
     #[test]
