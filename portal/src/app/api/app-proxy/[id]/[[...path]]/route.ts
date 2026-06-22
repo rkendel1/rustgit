@@ -79,6 +79,10 @@ async function handle(
 
   if (contentType.includes("text/html")) {
     let html = await upstreamRes.text();
+    const rewriteAbsoluteToProxy = (value: string): string =>
+      value.replace(/=(["'])\/(?!\/)/g, `=$1${proxyBase}`);
+
+    html = rewriteAbsoluteToProxy(html);
     // Make relative URLs resolve through our proxy
     const baseTag = `<base href="${proxyBase}">`;
     if (html.includes("<head>")) {
