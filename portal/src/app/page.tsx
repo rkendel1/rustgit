@@ -285,7 +285,7 @@ export default function Home() {
   const [workspaceFileDraft, setWorkspaceFileDraft] = useState("");
   const [workspaceFileDirty, setWorkspaceFileDirty] = useState(false);
   const [workspaceFileSaving, setWorkspaceFileSaving] = useState(false);
-  const [workspaceFileSaveMessage, setWorkspaceFileSaveMessage] = useState<string | null>(null);
+  const [workspaceFileMessage, setWorkspaceFileMessage] = useState<string | null>(null);
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
   const [workspacePreviewVersion, setWorkspacePreviewVersion] = useState(0);
@@ -331,7 +331,7 @@ export default function Home() {
     setWorkspaceFileDraft("");
     setWorkspaceFileDirty(false);
     setWorkspaceFileSaving(false);
-    setWorkspaceFileSaveMessage(null);
+    setWorkspaceFileMessage(null);
     setWorkspaceFilesError(null);
     setWorkspacePreviewVersion(0);
     setWorkspacePreviewError(null);
@@ -434,7 +434,7 @@ export default function Home() {
           setSelectedWorkspaceFileContent("");
           setWorkspaceFileDraft("");
           setWorkspaceFileDirty(false);
-          setWorkspaceFileSaveMessage(null);
+          setWorkspaceFileMessage(null);
         } else if (!selectedWorkspaceFile || !files.includes(selectedWorkspaceFile)) {
           setSelectedWorkspaceFile(files[0]);
         }
@@ -469,14 +469,14 @@ export default function Home() {
           setSelectedWorkspaceFileContent(content);
           setWorkspaceFileDraft(content);
           setWorkspaceFileDirty(false);
-          setWorkspaceFileSaveMessage(null);
+          setWorkspaceFileMessage(null);
         }
       } catch {
         if (!cancelled) {
           setSelectedWorkspaceFileContent("");
           setWorkspaceFileDraft("");
           setWorkspaceFileDirty(false);
-          setWorkspaceFileSaveMessage("Failed to load file content.");
+          setWorkspaceFileMessage("Failed to load file content.");
         }
       }
     }
@@ -539,9 +539,9 @@ export default function Home() {
       await readJsonResponse<WorkspaceFileUpdateResponse>(response);
       setSelectedWorkspaceFileContent(workspaceFileDraft);
       setWorkspaceFileDirty(false);
-      setWorkspaceFileSaveMessage("Saved");
+      setWorkspaceFileMessage("Saved");
     } catch (caught) {
-      setWorkspaceFileSaveMessage(
+      setWorkspaceFileMessage(
         caught instanceof Error ? caught.message : "Failed to save file.",
       );
     } finally {
@@ -554,14 +554,15 @@ export default function Home() {
       <ul className={styles.fileTreeList}>
         {nodes.map((node) => {
           if (node.children.length === 0 && node.path) {
+            const filePath = node.path;
             return (
-              <li key={node.path}>
+              <li key={filePath}>
                 <button
                   type="button"
                   className={`${styles.fileTreeFileButton} ${
-                    selectedWorkspaceFile === node.path ? styles.fileTreeFileButtonActive : ""
+                    selectedWorkspaceFile === filePath ? styles.fileTreeFileButtonActive : ""
                   }`}
-                  onClick={() => setSelectedWorkspaceFile(node.path)}
+                  onClick={() => setSelectedWorkspaceFile(filePath)}
                 >
                   {node.name}
                 </button>
@@ -893,7 +894,7 @@ export default function Home() {
                       {workspaceFileSaving ? "Saving…" : "Save"}
                     </button>
                   </div>
-                  {workspaceFileSaveMessage ? <p className={styles.hint}>{workspaceFileSaveMessage}</p> : null}
+                  {workspaceFileMessage ? <p className={styles.hint}>{workspaceFileMessage}</p> : null}
                   <textarea
                     className={styles.fileEditor}
                     value={workspaceFileDraft}
@@ -901,7 +902,7 @@ export default function Home() {
                       const nextValue = event.target.value;
                       setWorkspaceFileDraft(nextValue);
                       setWorkspaceFileDirty(nextValue !== selectedWorkspaceFileContent);
-                      if (workspaceFileSaveMessage) setWorkspaceFileSaveMessage(null);
+                      if (workspaceFileMessage) setWorkspaceFileMessage(null);
                     }}
                     spellCheck={false}
                     placeholder="No content available."
