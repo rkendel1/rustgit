@@ -12516,21 +12516,32 @@ impl WorkspaceManager {
                 .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
                 .and_then(|n| n.command.clone());
             if let Some(install) = install_cmd {
-                // Rewrite the install command to use the venv pip
                 let venv_pip = venv_path.join("bin").join("pip");
                 let pip_path = venv_pip.to_string_lossy().to_string();
-                // Strip leading "python -m pip" or "pip" and replace with venv pip
-                let install_args: Vec<&str> = if install.contains("pip install") {
-                    let idx = install.find("pip install").unwrap();
-                    install[idx + 4..].split_whitespace().collect()
+                // Extract everything after "pip " so we get "install -r requirements.txt"
+                let pip_args: Vec<String> = if let Some(idx) = install.find("pip ") {
+                    install[idx + 4..].split_whitespace().map(String::from).collect()
                 } else {
-                    install.split_whitespace().skip(1).collect()
+                    install.split_whitespace().skip(1).map(String::from).collect()
                 };
-                logs.push(format!("installing dependencies: {pip_path} {}", install_args.join(" ")));
-                let _ = Command::new(&pip_path)
-                    .args(&install_args)
+                logs.push(format!("installing dependencies: {pip_path} {}", pip_args.join(" ")));
+                match Command::new(&pip_path)
+                    .args(&pip_args)
                     .current_dir(repo_path)
-                    .output();
+                    .output()
+                {
+                    Ok(out) => {
+                        if !out.status.success() {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            for line in stderr.lines().take(8) {
+                                if !line.trim().is_empty() {
+                                    logs.push(format!("  pip: {line}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => logs.push(format!("  pip failed to launch: {e}")),
+                }
             }
         } else {
             // JS/other: run install command as-is
