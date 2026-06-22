@@ -35,11 +35,19 @@ impl AnalyzeEngine {
 
         let stage_start = Instant::now();
         let framework = detect_framework(root);
-        traceability.push(stage_trace("framework_detection", &framework.evidence, stage_start));
+        traceability.push(stage_trace(
+            "framework_detection",
+            &framework.evidence,
+            stage_start,
+        ));
 
         let stage_start = Instant::now();
         let runtime = detect_runtime(root, Some(&framework.framework));
-        traceability.push(stage_trace("runtime_detection", &runtime.evidence, stage_start));
+        traceability.push(stage_trace(
+            "runtime_detection",
+            &runtime.evidence,
+            stage_start,
+        ));
 
         let stage_start = Instant::now();
         let blueprint = build_blueprint(&runtime.runtime);

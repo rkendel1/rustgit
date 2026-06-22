@@ -1,9 +1,9 @@
 use rustgit_wasm_runtime::{
     execution_history_endpoint_with_store, repository_healing_history_endpoint_with_store,
     repository_history_endpoint_with_store, repository_last_good_commit_endpoint_with_store,
-    EidbBillingEventRecord,
-    EidbCommitExecutionResultRecord, EidbCommitRecord, EidbExecutionEventRecord, EidbExecutionRecord,
-    EidbHealingAttemptRecord, EidbJourneyResultRecord, EidbRepositoryRecord, EidbUrlAllocationRecord,
+    EidbBillingEventRecord, EidbCommitExecutionResultRecord, EidbCommitRecord,
+    EidbExecutionEventRecord, EidbExecutionRecord, EidbHealingAttemptRecord,
+    EidbJourneyResultRecord, EidbRepositoryRecord, EidbUrlAllocationRecord,
     ExecutionIntelligencePostgresStore,
 };
 use serde_json::json;
@@ -170,7 +170,8 @@ fn postgres_store_round_trips_history_endpoints() -> Result<(), Box<dyn std::err
     assert!(execution_history_body.contains("\"event_id\":\"bill-postgres-1\""));
     assert!(execution_history_body.contains("workspace-1.trythissoftware.com"));
 
-    let (healing_path, healing_body) = repository_healing_history_endpoint_with_store("repo-eidb", &store)?;
+    let (healing_path, healing_body) =
+        repository_healing_history_endpoint_with_store("repo-eidb", &store)?;
     assert_eq!(healing_path, "/repositories/repo-eidb/healing");
     assert!(healing_body.contains("\"failure_class\":\"WrongPackageManager\""));
 

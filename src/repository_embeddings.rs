@@ -169,9 +169,9 @@ impl RepositoryEmbeddingPipeline {
 }
 
 fn deterministic_embedding(input: &str, dimensions: usize) -> Vec<f32> {
-    let mut state = input
-        .bytes()
-        .fold(0x9E3779B97F4A7C15_u64, |acc, byte| acc ^ ((byte as u64) + 0x9E37));
+    let mut state = input.bytes().fold(0x9E3779B97F4A7C15_u64, |acc, byte| {
+        acc ^ ((byte as u64) + 0x9E37)
+    });
     (0..dimensions)
         .map(|index| {
             state = state
@@ -203,8 +203,16 @@ mod tests {
             .expect("embeddings should generate");
 
         assert_eq!(embeddings.len(), 4);
-        assert!(embeddings.iter().any(|entry| entry.artifact_kind == "operational"));
-        assert_eq!(embeddings[0].embedding.len(), pipeline.embedding_dimensions());
-        assert!(RepositoryEmbeddingPipeline::embedding_literal(&embeddings[0].embedding).starts_with('['));
+        assert!(embeddings
+            .iter()
+            .any(|entry| entry.artifact_kind == "operational"));
+        assert_eq!(
+            embeddings[0].embedding.len(),
+            pipeline.embedding_dimensions()
+        );
+        assert!(
+            RepositoryEmbeddingPipeline::embedding_literal(&embeddings[0].embedding)
+                .starts_with('[')
+        );
     }
 }

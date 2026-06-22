@@ -621,13 +621,41 @@ async fn workspace_files(
     tokio::task::spawn_blocking(move || {
         let fs = manager.filesystem(&id)?;
         let snapshot = fs.snapshot()?;
-        let mut files = snapshot.entries.keys().cloned().collect::<Vec<_>>();
-        files.sort();
+        let mut files = snapshot
+            .entries
+            .keys()
+            .filter(|path| !is_workspace_internal_file(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| {
+            workspace_file_priority(left)
+                .cmp(&workspace_file_priority(right))
+                .then_with(|| left.cmp(right))
+        });
         Ok::<_, RuntimeError>(Json(json!({ "files": files })))
     })
     .await
     .expect("task panicked")
     .map_err(err_response)
+}
+
+fn is_workspace_internal_file(path: &str) -> bool {
+    path == ".git" || path.starts_with(".git/")
+}
+
+fn workspace_file_priority(path: &str) -> (u8, u8) {
+    let Some(name) = FsPath::new(path).file_name().and_then(|value| value.to_str()) else {
+        return (1, u8::MAX);
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "package.json" => (0, 0),
+        "requirements.txt" => (0, 1),
+        "readme.md" | "readme" => (0, 2),
+        "pyproject.toml" => (0, 3),
+        "cargo.toml" => (0, 4),
+        "go.mod" => (0, 5),
+        _ => (1, u8::MAX),
+    }
 }
 
 async fn workspace_file(
@@ -1071,10 +1099,16 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(files_response.status(), StatusCode::OK);
+        let files_status = files_response.status();
         let files_body = to_bytes(files_response.into_body(), 1024 * 1024)
             .await
             .expect("files body");
+        assert_eq!(
+            files_status,
+            StatusCode::OK,
+            "files endpoint payload: {}",
+            String::from_utf8_lossy(&files_body)
+        );
         let files_payload: serde_json::Value =
             serde_json::from_slice(&files_body).expect("files payload");
         let files = files_payload["files"]
@@ -1105,6 +1139,33 @@ mod tests {
             .as_str()
             .expect("file content")
             .contains("\"scripts\""));
+    }
+
+    #[test]
+    fn workspace_files_prioritize_useful_files_and_ignore_git_internal_entries() {
+        let mut files = vec![
+            ".git/config".to_string(),
+            "src/main.rs".to_string(),
+            "README.md".to_string(),
+            "requirements.txt".to_string(),
+            "package.json".to_string(),
+            ".git/hooks/pre-commit.sample".to_string(),
+        ];
+        files.retain(|path| !super::is_workspace_internal_file(path));
+        files.sort_by(|left, right| {
+            super::workspace_file_priority(left)
+                .cmp(&super::workspace_file_priority(right))
+                .then_with(|| left.cmp(right))
+        });
+        assert_eq!(
+            files,
+            vec![
+                "package.json",
+                "requirements.txt",
+                "README.md",
+                "src/main.rs",
+            ]
+        );
     }
 
     #[tokio::test]

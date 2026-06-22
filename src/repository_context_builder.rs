@@ -98,7 +98,8 @@ fn failure_context(
 }
 
 fn recovery_context(graph: &RepositoryKnowledgeGraph) -> Vec<String> {
-    graph.temporal_recovery_history
+    graph
+        .temporal_recovery_history
         .iter()
         .map(|entry| {
             format!(

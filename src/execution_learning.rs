@@ -33,15 +33,18 @@ impl ExecutionLearningEngine {
         duration_seconds: f64,
         cost_units: f64,
     ) {
-        if let Some(existing) = patterns
-            .iter_mut()
-            .find(|entry| entry.fingerprint == fingerprint && entry.failure_type == failure_type && entry.repair == repair)
-        {
+        if let Some(existing) = patterns.iter_mut().find(|entry| {
+            entry.fingerprint == fingerprint
+                && entry.failure_type == failure_type
+                && entry.repair == repair
+        }) {
             let current = existing.execution_count as f64;
             let next = current + 1.0;
             existing.execution_count += 1;
-            existing.success_rate = ((existing.success_rate * current) + if success { 1.0 } else { 0.0 }) / next;
-            existing.average_duration = ((existing.average_duration * current) + duration_seconds) / next;
+            existing.success_rate =
+                ((existing.success_rate * current) + if success { 1.0 } else { 0.0 }) / next;
+            existing.average_duration =
+                ((existing.average_duration * current) + duration_seconds) / next;
             existing.average_cost = ((existing.average_cost * current) + cost_units) / next;
             return;
         }
