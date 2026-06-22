@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import styles from "./page.module.css";
+import { buildAppUrl } from "./buildAppUrl";
 
 const DEFAULT_ASK_QUESTION = "Summarize what this repository does and the best way to run it.";
 const SCORE_DECIMAL_PLACES = 1;
@@ -993,9 +994,8 @@ export default function Home() {
             </div>
             {workspace?.ports && workspace.ports.length > 0 ? (
               workspace.ports.map((p) => {
-                const appUrl = p.route?.startsWith("http")
-                  ? p.route
-                  : `http://127.0.0.1:${p.port}${p.route ?? "/"}`;
+                const appUrl = buildAppUrl(workspace.id, p.route);
+                if (!appUrl) return null;
                 return (
                   <div key={p.port} className={styles.tile} style={{ gridColumn: "1 / -1" }}>
                     <strong>App URL{workspace.ports.length > 1 ? ` :${p.port}` : ""}</strong>
