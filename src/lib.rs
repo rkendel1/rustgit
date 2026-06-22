@@ -14025,13 +14025,21 @@ fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
     pid_hint.to_string()
 }
 
+const LOCAL_AGENT_TRANSPORT_MODE: ExecutionRoutingMode = ExecutionRoutingMode::Local;
+static WASM_PROVIDER_FOR_TRANSPORT: WasmExecutionProvider = WasmExecutionProvider;
+static NODE_PROVIDER_FOR_TRANSPORT: NodeRuntimeProvider = NodeRuntimeProvider;
+static RUST_PROVIDER_FOR_TRANSPORT: RustRuntimeProvider = RustRuntimeProvider;
+static STATIC_PROVIDER_FOR_TRANSPORT: StaticRuntimeProvider = StaticRuntimeProvider;
+
 fn transport_for_provider_id(provider_id: &str) -> ExecutionRoutingMode {
     match provider_id {
-        "WasmExecutionProvider" => WasmExecutionProvider.transport(),
-        "LocalAgentProvider" => ExecutionRoutingMode::Local,
-        "NodeRuntimeProvider" => NodeRuntimeProvider.transport(),
-        "RustRuntimeProvider" => RustRuntimeProvider.transport(),
-        "StaticRuntimeProvider" => StaticRuntimeProvider.transport(),
+        "WasmExecutionProvider" => WASM_PROVIDER_FOR_TRANSPORT.transport(),
+        // LocalAgentProvider requires an agent instance, so it cannot be
+        // instantiated as a stateless singleton just to call the default trait method.
+        "LocalAgentProvider" => LOCAL_AGENT_TRANSPORT_MODE,
+        "NodeRuntimeProvider" => NODE_PROVIDER_FOR_TRANSPORT.transport(),
+        "RustRuntimeProvider" => RUST_PROVIDER_FOR_TRANSPORT.transport(),
+        "StaticRuntimeProvider" => STATIC_PROVIDER_FOR_TRANSPORT.transport(),
         _ => ExecutionRoutingMode::Local,
     }
 }
