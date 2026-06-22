@@ -12238,32 +12238,29 @@ impl ExecutionTruth {
             }
             return;
         }
-        let ready_signal = self.process_alive || self.http_ready || self.detected_start_signal.is_some();
-        if ready_signal {
-            if self.http_ready {
-                self.readiness_state = ExecutionReadinessState::Ready;
-                if matches!(
-                    self.lifecycle_state,
-                    WorkspaceState::Launching | WorkspaceState::Initializing | WorkspaceState::Ready
-                ) {
-                    self.lifecycle_state = WorkspaceState::Ready;
-                    self.process_state = ProcessStatus::Ready;
-                }
-            } else if self.detected_start_signal.is_some() {
-                self.readiness_state = ExecutionReadinessState::SignalDetected;
-                if matches!(
-                    self.lifecycle_state,
-                    WorkspaceState::Launching | WorkspaceState::Initializing
-                ) {
-                    self.lifecycle_state = WorkspaceState::Initializing;
-                    self.process_state = ProcessStatus::Initializing;
-                }
-            } else if matches!(
+        if self.http_ready {
+            self.readiness_state = ExecutionReadinessState::Ready;
+            if matches!(
+                self.lifecycle_state,
+                WorkspaceState::Launching | WorkspaceState::Initializing | WorkspaceState::Ready
+            ) {
+                self.lifecycle_state = WorkspaceState::Ready;
+                self.process_state = ProcessStatus::Ready;
+            }
+        } else if self.detected_start_signal.is_some() {
+            self.readiness_state = ExecutionReadinessState::SignalDetected;
+            if matches!(
                 self.lifecycle_state,
                 WorkspaceState::Launching | WorkspaceState::Initializing
             ) {
-                self.readiness_state = ExecutionReadinessState::Starting;
+                self.lifecycle_state = WorkspaceState::Initializing;
+                self.process_state = ProcessStatus::Initializing;
             }
+        } else if matches!(
+            self.lifecycle_state,
+            WorkspaceState::Launching | WorkspaceState::Initializing
+        ) {
+            self.readiness_state = ExecutionReadinessState::Starting;
         }
     }
 }
@@ -12572,7 +12569,7 @@ impl WorkspaceManager {
                 record.workspace.state = WorkspaceState::Failed;
                 Self::append_capped(&mut record.logs, message.clone());
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime.update_from_event(ExecutionTruthEvent::ProcessExited(runtime.exit_code));
+                    runtime.update_from_event(ExecutionTruthEvent::ProcessExited(None));
                     runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Failed));
                 }
             }
