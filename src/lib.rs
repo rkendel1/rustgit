@@ -12325,6 +12325,17 @@ impl WorkspaceManager {
         evicted
     }
 
+    pub fn cleanup(&self) -> (usize, u64) {
+        let evicted = self.evict_terminal_workspaces();
+        // Also wipe any rustgit-analyze temp dirs created by the analyze endpoint.
+        let analyze_tmp = std::env::temp_dir().join("rustgit-analyze");
+        if analyze_tmp.exists() {
+            let _ = fs::remove_dir_all(&analyze_tmp);
+        }
+        let free_bytes = available_disk_bytes(&self.root).unwrap_or(0);
+        (evicted, free_bytes)
+    }
+
     fn materialize_repository(&self, repo_url: &str, branch: Option<&str>, destination: &Path) -> Result<()> {
         const MIN_FREE_BYTES_TO_CLONE: u64 = 1024 * 1024 * 1024;      // 1 GB
         const MIN_FREE_BYTES_TO_CACHE: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB

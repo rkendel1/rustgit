@@ -222,6 +222,8 @@ export default function Home() {
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
+  const [freeingSpace, setFreeingSpace] = useState(false);
+  const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
   const anonymousIdentity = useMemo(
     () => ({
@@ -561,6 +563,25 @@ export default function Home() {
     }
   }
 
+  async function handleFreeSpace() {
+    setFreeingSpace(true);
+    setFreeSpaceResult(null);
+    try {
+      const response = await fetch("/api/proxy/api/cleanup", { method: "POST" });
+      if (response.ok) {
+        const data = await response.json() as { evicted_workspaces: number; free_gb: number };
+        const gb = data.free_gb?.toFixed(1) ?? "?";
+        setFreeSpaceResult(`Freed ${data.evicted_workspaces} workspace(s). ${gb} GB now available.`);
+      } else {
+        setFreeSpaceResult("Cleanup request failed.");
+      }
+    } catch {
+      setFreeSpaceResult("Cleanup request failed.");
+    } finally {
+      setFreeingSpace(false);
+    }
+  }
+
   const healthScore = scoreValue(
     intelligence?.repository_identity?.health_score,
     intelligence?.health_score,
@@ -592,6 +613,13 @@ export default function Home() {
         <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.analyzeButton}>
           {analyzing ? "Analyzing..." : "Analyze Repository"}
         </button>
+
+        <button type="button" onClick={handleFreeSpace} disabled={freeingSpace} className={styles.freeSpaceButton}>
+          {freeingSpace ? "Cleaning..." : "Free Space"}
+        </button>
+        {freeSpaceResult ? (
+          <p className={styles.freeSpaceResult}>{freeSpaceResult}</p>
+        ) : null}
 
         <nav className={styles.navSection} aria-label="Portal sections">
           <p className={styles.navHeading}>Workspace</p>

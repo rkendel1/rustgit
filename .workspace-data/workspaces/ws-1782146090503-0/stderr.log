@@ -1,0 +1,8 @@
+sh: tsx: command not found
+npm error Lifecycle script `dev` failed with error:
+npm error code 127
+npm error path /Users/randy/Desktop/rustgit/.workspace-data/workspaces/ws-1782146090503-0/repo/apps/server
+npm error workspace server@0.0.0
+npm error location /Users/randy/Desktop/rustgit/.workspace-data/workspaces/ws-1782146090503-0/repo/apps/server
+npm error command failed
+npm error command sh -c tsx watch src/index.ts --host 0.0.0.0

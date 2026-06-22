@@ -753,6 +753,18 @@ async fn list_workspaces(State(state): State<AppState>) -> Json<Vec<Workspace>> 
     Json(state.manager.list_workspaces())
 }
 
+async fn cleanup_disk(State(state): State<AppState>) -> Json<Value> {
+    let manager = state.manager;
+    let (evicted, free_bytes) = tokio::task::spawn_blocking(move || manager.cleanup())
+        .await
+        .expect("task panicked");
+    Json(json!({
+        "evicted_workspaces": evicted,
+        "free_bytes": free_bytes,
+        "free_gb": (free_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+    }))
+}
+
 async fn get_workspace(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -825,6 +837,8 @@ fn app(state: AppState) -> Router {
             "/api/proxy/api/v1/repositories/analyze",
             post(analyze_repository),
         )
+        .route("/api/cleanup", post(cleanup_disk))
+        .route("/api/proxy/api/cleanup", post(cleanup_disk))
         .route("/api/badges/generate", post(generate_badge))
         .route("/api/badge/generate", post(generate_badge))
         .route("/badge/:owner/:repo.svg", get(runtime_badge))
