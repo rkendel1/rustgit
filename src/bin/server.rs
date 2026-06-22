@@ -16,7 +16,7 @@ use rustgit_wasm_runtime::{
     analyze::{AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
     healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, LaunchOverrides,
-    RuntimeError, WasmWorkspace, Workspace, WorkspaceManager,
+    RuntimeError, WasmWorkspace, Workspace, WorkspaceManager, WorkspaceRuntimeStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -682,6 +682,18 @@ async fn workspace_logs(
         .map_err(err_response)
 }
 
+async fn workspace_runtime(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<WorkspaceRuntimeStatus>, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
+    tokio::task::spawn_blocking(move || manager.runtime_status(&id))
+        .await
+        .expect("task panicked")
+        .map(Json)
+        .map_err(err_response)
+}
+
 async fn workspace_files(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -889,6 +901,7 @@ fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
             post(restart_workspace),
         )
         .route(&format!("{prefix}/workspaces/:id/logs"), get(workspace_logs))
+        .route(&format!("{prefix}/workspaces/:id/runtime"), get(workspace_runtime))
         .route(&format!("{prefix}/workspaces/:id/files"), get(workspace_files))
         .route(
             &format!("{prefix}/workspaces/:id/files/*path"),
@@ -1045,12 +1058,14 @@ mod tests {
             ("/api/v1/workspaces/missing", "DELETE"),
             ("/api/v1/workspaces/missing/restart", "POST"),
             ("/api/v1/workspaces/missing/logs", "GET"),
+            ("/api/v1/workspaces/missing/runtime", "GET"),
             ("/api/v1/workspaces/missing/files", "GET"),
             ("/api/v1/workspaces/missing/files/package.json", "GET"),
             ("/api/v1/workspaces/missing/files/package.json", "PUT"),
             ("/api/proxy/api/v1/workspaces/missing", "DELETE"),
             ("/api/proxy/api/v1/workspaces/missing/restart", "POST"),
             ("/api/proxy/api/v1/workspaces/missing/logs", "GET"),
+            ("/api/proxy/api/v1/workspaces/missing/runtime", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/files", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/files/package.json", "GET"),
             (
