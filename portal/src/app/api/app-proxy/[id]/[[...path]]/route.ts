@@ -160,7 +160,12 @@ async function handle(
       responseHeaders.set("location", rewritten);
     } catch (error) {
       // If Location is malformed, leave it as-is rather than failing the proxy response.
-      console.warn("App proxy Location rewrite failed", { location, error });
+      console.warn("App proxy Location rewrite failed", {
+        location,
+        endpoint,
+        workspaceId: id,
+        error,
+      });
     }
   }
   // Strip hop-by-hop headers that don't make sense to replay across origins.
