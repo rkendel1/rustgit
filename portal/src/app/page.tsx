@@ -199,6 +199,7 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
 }
 
 export default function Home() {
+  const repoInputRef = useRef<HTMLInputElement>(null);
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
   const [startCommand, setStartCommand] = useState("");
@@ -422,8 +423,12 @@ export default function Home() {
   }
 
   async function handleAnalyze() {
-    if (!parsedRepo) {
-      setError("Paste a GitHub repository URL or owner/repo.");
+    // If autofill filled the DOM but skipped React state, sync now
+    const domValue = repoInputRef.current?.value ?? "";
+    if (domValue && domValue !== repository) resetResults(domValue);
+    const repo = parsedRepo ?? parseRepositoryInput(domValue);
+    if (!repo) {
+      setError("Enter a valid GitHub URL — e.g. https://github.com/owner/repo");
       return;
     }
 
@@ -447,7 +452,7 @@ export default function Home() {
           anon_user_id: anonymousIdentity.anonUserId,
           anon_session_id: anonymousIdentity.anonSessionId,
           device_fingerprint: PORTAL_DEVICE_FINGERPRINT,
-          repo_url: parsedRepo.repoUrl,
+          repo_url: repo.repoUrl,
           branch: branch.trim() || "main",
           commit: null,
         }),
@@ -455,7 +460,7 @@ export default function Home() {
       const analyzeResponse = await fetch(ANALYZE_PATH, analyzeRequest);
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
-      setAnalyzedRepoUrl(parsedRepo.repoUrl);
+      setAnalyzedRepoUrl(repo.repoUrl);
 
       if (!analyzed.fingerprint_id) {
         return;
@@ -514,8 +519,11 @@ export default function Home() {
   }
 
   async function handleRun() {
-    if (!parsedRepo) {
-      setError("Paste a GitHub repository first.");
+    const domValue = repoInputRef.current?.value ?? "";
+    if (domValue && domValue !== repository) resetResults(domValue);
+    const repo = parsedRepo ?? parseRepositoryInput(domValue);
+    if (!repo) {
+      setError("Enter a valid GitHub URL — e.g. https://github.com/owner/repo");
       return;
     }
 
@@ -533,7 +541,7 @@ export default function Home() {
           anon_user_id: createAnonymousId("anon-portal"),
           anon_session_id: createAnonymousId("portal-session"),
           device_fingerprint: "portal-home",
-          repo_url: parsedRepo.repoUrl,
+          repo_url: repo.repoUrl,
           branch: branch.trim() || "main",
           commit: null,
           ...buildLaunchOverrides(),
@@ -625,11 +633,17 @@ export default function Home() {
               GitHub repository URL or owner/repo
             </label>
             <input
+              ref={repoInputRef}
               id="github-repo-url"
               type="text"
               autoComplete="off"
               value={repository}
               onChange={(event) => resetResults(event.target.value)}
+              onInput={(event) => {
+                // Catches browser autofill which may skip onChange
+                const val = (event.target as HTMLInputElement).value;
+                if (val !== repository) resetResults(val);
+              }}
               onPaste={(event) => {
                 const pasted = event.clipboardData.getData("text");
                 if (pasted) {
@@ -645,10 +659,10 @@ export default function Home() {
             </p>
 
             <div className={styles.actions}>
-              <button type="submit" disabled={!canAnalyze} className={styles.primaryButton}>
+              <button type="submit" disabled={analyzing} className={styles.primaryButton}>
                 {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
               </button>
-              <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
+              <button type="button" onClick={handleRun} disabled={running} className={styles.secondaryButton}>
                 {running ? "Starting run..." : "Run repository"}
               </button>
             </div>
