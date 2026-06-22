@@ -5,7 +5,9 @@ const BACKEND_BASE =
     ? "http://localhost:8080"
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 
-const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v)\b/i;
+const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v\d)\b/i;
+const MIN_POLL_INTERVAL_MS = 100;
+const MAX_PROBE_TIMEOUT_MS = 500;
 
 type WorkspaceState = "Running" | "Failed" | string;
 
@@ -133,6 +135,9 @@ async function handle(
     if (remaining <= 0) {
       break;
     }
+    if (remaining < MIN_POLL_INTERVAL_MS) {
+      break;
+    }
     const port = workspace.ports?.[0]?.port ?? null;
     if (!port) {
       lastProbe = "port unavailable";
@@ -143,7 +148,7 @@ async function handle(
           method: request.method,
           headers: forwardHeaders,
           body: bodyBytes,
-          signal: AbortSignal.timeout(Math.max(100, Math.min(500, remaining))),
+          signal: AbortSignal.timeout(Math.min(MAX_PROBE_TIMEOUT_MS, remaining)),
         });
 
         const contentType = upstreamRes.headers.get("content-type") ?? "";
@@ -224,10 +229,13 @@ async function handle(
     const delay = retryDelayMs(attempt);
     const elapsed = Date.now() - startedAt;
     const remainingAfterWork = maxWaitMs - elapsed;
-    if (remainingAfterWork < 100) {
+    if (remainingAfterWork < MIN_POLL_INTERVAL_MS) {
       break;
     }
-    const waitMs = Math.max(100, Math.min(delay, remainingAfterWork));
+    const waitMs = Math.max(
+      MIN_POLL_INTERVAL_MS,
+      Math.min(delay, remainingAfterWork),
+    );
     await new Promise((r) => setTimeout(r, waitMs));
     attempt += 1;
     const refreshed = await getWorkspace(id);

@@ -91,7 +91,7 @@ export async function GET(
       error instanceof Error && error.name === "TimeoutError"
         ? "Workspace app did not finish loading within 15 seconds."
         : error instanceof Error && error.message.includes("ERR_CONNECTION_REFUSED")
-          ? "Workspace app is still starting."
+          ? "Workspace app is still starting. Please retry in a few seconds."
         : "Failed to capture preview screenshot.";
     return NextResponse.json(
       { error: message },
