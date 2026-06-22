@@ -199,9 +199,7 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
 }
 
 export default function Home() {
-  const [repository, setRepository] = useState(() =>
-    typeof window !== "undefined" ? (localStorage.getItem("rustgit:lastRepoUrl") ?? "") : ""
-  );
+  const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
   const [startCommand, setStartCommand] = useState("");
   const [envOverrides, setEnvOverrides] = useState("");
@@ -230,6 +228,14 @@ export default function Home() {
     }),
     [],
   );
+
+  // Restore last URL from localStorage after hydration (safe — runs client-only)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("rustgit:lastRepoUrl");
+      if (saved) setRepository(saved);
+    } catch { /* ignore */ }
+  }, []);
 
   const parsedRepo = useMemo(() => parseRepositoryInput(repository), [repository]);
   const canAnalyze = Boolean(parsedRepo) && !analyzing;
