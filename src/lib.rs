@@ -12647,6 +12647,32 @@ impl WorkspaceManager {
             }
         }
     }
+
+    /// Checks if the child process has exited and marks the workspace Failed if so.
+    /// Called on every GET /workspaces/:id so the UI reflects reality quickly.
+    pub fn sync_process_health(&self, id: &str) {
+        if let Ok(mut workspaces) = self.workspaces.lock() {
+            if let Some(record) = workspaces.get_mut(id) {
+                if record.workspace.state != WorkspaceState::Running {
+                    return;
+                }
+                if let Some(child) = record.child_process.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            record.workspace.state = WorkspaceState::Failed;
+                            record.logs.push(format!(
+                                "process exited unexpectedly ({})",
+                                status.code().map_or("signal".to_string(), |c| format!("code {c}"))
+                            ));
+                            record.child_process = None;
+                        }
+                        Ok(None) => {} // still running
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl WasmWorkspace for WorkspaceManager {
@@ -12782,31 +12808,44 @@ impl WasmWorkspace for WorkspaceManager {
     }
 
     fn restart(&self, id: &str) -> Result<()> {
+        // Kill old process and snapshot what we need before releasing the lock
+        let ctx = {
+            let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+            let record = workspaces
+                .get_mut(id)
+                .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
+            Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
+            if let Some(child) = record.child_process.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            record.child_process = None;
+            record.process_handle = None;
+            record.logs.push("restarting…".to_string());
+            record
+                .execution_context
+                .clone()
+                .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?
+        }; // lock released here
+
+        // Spawn the new process without holding the lock (can take seconds)
+        let mut spawn_logs: Vec<String> = vec![];
+        let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut spawn_logs);
+
         let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
         let record = workspaces
             .get_mut(id)
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
-        Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
-        if let Some(child) = record.child_process.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        for line in spawn_logs {
+            record.logs.push(line);
         }
-        record.child_process = None;
-        let mut execution_context = record
-            .execution_context
-            .clone()
-            .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?;
-        let handle = self.execution_engine.start(&mut execution_context)?;
-        let (child, assigned_port) = Self::spawn_run_command(&execution_context, &mut record.logs);
         if let Some(port) = assigned_port {
             for p in &mut record.workspace.ports {
                 p.port = port;
             }
         }
-        Self::transition_state(&mut record.workspace, WorkspaceState::Running)?;
-        record.execution_context = Some(execution_context);
-        record.process_handle = Some(handle);
         record.child_process = child;
+        record.workspace.state = WorkspaceState::Running;
         record.logs.push("workspace restarted".to_string());
         Ok(())
     }

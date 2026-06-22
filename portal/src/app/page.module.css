@@ -306,6 +306,27 @@
   50%       { opacity: 0.3; }
 }
 
+.btnRestart,
+.btnStop {
+  border: 0;
+  border-radius: 0.5rem;
+  padding: 0.3rem 0.75rem;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  color: #fff;
+}
+
+.btnRestart { background: #334155; }
+.btnStop    { background: #b91c1c; }
+
+.btnRestart:disabled,
+.btnStop:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .logSection {
   margin-top: 0.85rem;
   border-top: 1px solid #e2e8f0;

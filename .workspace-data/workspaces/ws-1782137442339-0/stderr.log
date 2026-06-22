@@ -1,0 +1,7 @@
+Error: querySrv ENOTFOUND _mongodb._tcp.cluster0.hcds1.mongodb.net
+    at QueryReqWrap.onresolve [as oncomplete] (node:internal/dns/callback_resolver:45:19) {
+  errno: undefined,
+  code: 'ENOTFOUND',
+  syscall: 'querySrv',
+  hostname: '_mongodb._tcp.cluster0.hcds1.mongodb.net'
+}

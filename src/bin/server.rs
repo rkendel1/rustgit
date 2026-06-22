@@ -609,11 +609,15 @@ async fn get_workspace(
     Path(id): Path<String>,
 ) -> Result<Json<Workspace>, (StatusCode, Json<Value>)> {
     let manager = state.manager;
-    tokio::task::spawn_blocking(move || manager.get_workspace(&id))
-        .await
-        .expect("task panicked")
-        .map(Json)
-        .map_err(err_response)
+    tokio::task::spawn_blocking(move || {
+        // Update state if the spawned process has exited unexpectedly
+        manager.sync_process_health(&id);
+        manager.get_workspace(&id)
+    })
+    .await
+    .expect("task panicked")
+    .map(Json)
+    .map_err(err_response)
 }
 
 fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> {

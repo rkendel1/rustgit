@@ -172,6 +172,7 @@ export default function Home() {
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<string[]>([]);
+  const [actionPending, setActionPending] = useState(false);
   const logBoxRef = useRef<HTMLDivElement>(null);
   const anonymousIdentity = useMemo(
     () => ({
@@ -213,10 +214,37 @@ export default function Home() {
     return ws;
   }, []);
 
-  // Poll workspace when a run is in flight
+  async function handleStop() {
+    const wsId = runResult?.execution_id;
+    if (!wsId) return;
+    setActionPending(true);
+    try {
+      await fetch(`/api/proxy/workspaces/${wsId}`, { method: "DELETE" });
+      await fetchWorkspaceData(wsId);
+    } finally {
+      setActionPending(false);
+    }
+  }
+
+  async function handleRestart() {
+    const wsId = runResult?.execution_id;
+    if (!wsId) return;
+    setActionPending(true);
+    try {
+      await fetch(`/api/proxy/workspaces/${wsId}/restart`, { method: "POST" });
+      // Re-enable polling by touching state; the existing poll effect picks it up
+      await fetchWorkspaceData(wsId);
+    } finally {
+      setActionPending(false);
+    }
+  }
+
+  // Poll workspace while it's active (or after restart kicks it back to active)
   useEffect(() => {
     const wsId = runResult?.execution_id;
     if (!wsId) return;
+    // If we already have a terminal state and no pending action, skip re-polling
+    if (workspace && !ACTIVE_WORKSPACE_STATES.has(workspace.state) && !actionPending) return;
     let cancelled = false;
 
     async function poll() {
@@ -227,14 +255,13 @@ export default function Home() {
           setTimeout(poll, 3000);
         }
       } catch {
-        // silently retry
         if (!cancelled) setTimeout(poll, 3000);
       }
     }
 
     poll();
     return () => { cancelled = true; };
-  }, [runResult?.execution_id, fetchWorkspaceData]);
+  }, [runResult?.execution_id, fetchWorkspaceData, actionPending]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-scroll log box
   useEffect(() => {
@@ -586,15 +613,31 @@ export default function Home() {
           <section className={styles.panel}>
             <div className={styles.workspaceHeader}>
               <h2>Run status</h2>
-              <span className={`${styles.badge} ${
-                workspace.state === "Running" ? styles.badgeRunning :
-                workspace.state === "Failed" ? styles.badgeFailed :
-                workspace.state === "Stopped" || workspace.state === "Destroyed" ? styles.badgeStopped :
-                styles.badgeStarting
-              }`}>
-                {ACTIVE_WORKSPACE_STATES.has(workspace.state) && <span className={styles.dot} />}
-                {workspace.state}
-              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                <span className={`${styles.badge} ${
+                  workspace.state === "Running" ? styles.badgeRunning :
+                  workspace.state === "Failed" ? styles.badgeFailed :
+                  workspace.state === "Stopped" || workspace.state === "Destroyed" ? styles.badgeStopped :
+                  styles.badgeStarting
+                }`}>
+                  {ACTIVE_WORKSPACE_STATES.has(workspace.state) && <span className={styles.dot} />}
+                  {workspace.state}
+                </span>
+                <button
+                  className={styles.btnRestart}
+                  disabled={actionPending || !["Running","Failed","Stopped","Degraded"].includes(workspace.state)}
+                  onClick={handleRestart}
+                >
+                  Restart
+                </button>
+                <button
+                  className={styles.btnStop}
+                  disabled={actionPending || ["Stopped","Destroyed","Stopping"].includes(workspace.state)}
+                  onClick={handleStop}
+                >
+                  Stop
+                </button>
+              </div>
             </div>
             <div className={styles.grid}>
               <div className={styles.tile}>
