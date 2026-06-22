@@ -471,6 +471,18 @@
   gap: 0.15rem;
 }
 
+.fileEditor {
+  width: 100%;
+  min-height: 260px;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.6rem;
+  padding: 0.75rem 0.85rem;
+  font: 0.82rem/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  background: #0b1220;
+  color: #e2e8f0;
+  resize: vertical;
+}
+
 .logLine {
   display: flex;
   gap: 0.75rem;
@@ -649,6 +661,12 @@
 
   .logBox {
     background: #020617;
+  }
+
+  .fileEditor {
+    border-color: #334155;
+    background: #020617;
+    color: #e2e8f0;
   }
 
   .logLine { color: #94a3b8; }

@@ -58,6 +58,11 @@ type WorkspaceFileResponse = {
   content?: string;
 };
 
+type WorkspaceFileUpdateResponse = {
+  path?: string;
+  saved?: boolean;
+};
+
 type WorkspaceTreeNode = {
   name: string;
   path: string | null;
@@ -277,6 +282,10 @@ export default function Home() {
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [selectedWorkspaceFile, setSelectedWorkspaceFile] = useState<string | null>(null);
   const [selectedWorkspaceFileContent, setSelectedWorkspaceFileContent] = useState("");
+  const [workspaceFileDraft, setWorkspaceFileDraft] = useState("");
+  const [workspaceFileDirty, setWorkspaceFileDirty] = useState(false);
+  const [workspaceFileSaving, setWorkspaceFileSaving] = useState(false);
+  const [workspaceFileSaveMessage, setWorkspaceFileSaveMessage] = useState<string | null>(null);
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
   const [workspacePreviewVersion, setWorkspacePreviewVersion] = useState(0);
@@ -319,6 +328,10 @@ export default function Home() {
     setWorkspaceFiles([]);
     setSelectedWorkspaceFile(null);
     setSelectedWorkspaceFileContent("");
+    setWorkspaceFileDraft("");
+    setWorkspaceFileDirty(false);
+    setWorkspaceFileSaving(false);
+    setWorkspaceFileSaveMessage(null);
     setWorkspaceFilesError(null);
     setWorkspacePreviewVersion(0);
     setWorkspacePreviewError(null);
@@ -419,6 +432,9 @@ export default function Home() {
         if (files.length === 0) {
           setSelectedWorkspaceFile(null);
           setSelectedWorkspaceFileContent("");
+          setWorkspaceFileDraft("");
+          setWorkspaceFileDirty(false);
+          setWorkspaceFileSaveMessage(null);
         } else if (!selectedWorkspaceFile || !files.includes(selectedWorkspaceFile)) {
           setSelectedWorkspaceFile(files[0]);
         }
@@ -449,11 +465,18 @@ export default function Home() {
         );
         const payload = await readJsonResponse<WorkspaceFileResponse>(response);
         if (!cancelled) {
-          setSelectedWorkspaceFileContent(payload.content ?? "");
+          const content = payload.content ?? "";
+          setSelectedWorkspaceFileContent(content);
+          setWorkspaceFileDraft(content);
+          setWorkspaceFileDirty(false);
+          setWorkspaceFileSaveMessage(null);
         }
       } catch {
         if (!cancelled) {
           setSelectedWorkspaceFileContent("");
+          setWorkspaceFileDraft("");
+          setWorkspaceFileDirty(false);
+          setWorkspaceFileSaveMessage("Failed to load file content.");
         }
       }
     }
@@ -497,6 +520,33 @@ export default function Home() {
 
   function formatConfidence(value: number | undefined): string {
     return typeof value === "number" ? value.toFixed(CONFIDENCE_DECIMAL_PLACES) : "n/a";
+  }
+
+  async function handleSaveWorkspaceFile() {
+    const wsId = runResult?.execution_id;
+    const selectedFile = selectedWorkspaceFile;
+    if (!wsId || !selectedFile || !workspaceFileDirty || workspaceFileSaving) return;
+    setWorkspaceFileSaving(true);
+    try {
+      const response = await fetch(
+        `/api/proxy/workspaces/${wsId}/files/${encodeWorkspacePath(selectedFile)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: workspaceFileDraft }),
+        },
+      );
+      await readJsonResponse<WorkspaceFileUpdateResponse>(response);
+      setSelectedWorkspaceFileContent(workspaceFileDraft);
+      setWorkspaceFileDirty(false);
+      setWorkspaceFileSaveMessage("Saved");
+    } catch (caught) {
+      setWorkspaceFileSaveMessage(
+        caught instanceof Error ? caught.message : "Failed to save file.",
+      );
+    } finally {
+      setWorkspaceFileSaving(false);
+    }
   }
 
   function renderWorkspaceFileTree(nodes: WorkspaceTreeNode[]) {
@@ -834,10 +884,29 @@ export default function Home() {
                 <div className={styles.logSection}>
                   <div className={styles.logHeader}>
                     <span className={styles.logTitle}>{selectedWorkspaceFile ?? "Select a file"}</span>
+                    <button
+                      type="button"
+                      className={styles.btnRestart}
+                      onClick={handleSaveWorkspaceFile}
+                      disabled={!selectedWorkspaceFile || !workspaceFileDirty || workspaceFileSaving}
+                    >
+                      {workspaceFileSaving ? "Saving…" : "Save"}
+                    </button>
                   </div>
-                  <div className={styles.logBox}>
-                    <pre>{selectedWorkspaceFileContent || "No content available."}</pre>
-                  </div>
+                  {workspaceFileSaveMessage ? <p className={styles.hint}>{workspaceFileSaveMessage}</p> : null}
+                  <textarea
+                    className={styles.fileEditor}
+                    value={workspaceFileDraft}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      setWorkspaceFileDraft(nextValue);
+                      setWorkspaceFileDirty(nextValue !== selectedWorkspaceFileContent);
+                      if (workspaceFileSaveMessage) setWorkspaceFileSaveMessage(null);
+                    }}
+                    spellCheck={false}
+                    placeholder="No content available."
+                    disabled={!selectedWorkspaceFile}
+                  />
                 </div>
               </>
             )}
