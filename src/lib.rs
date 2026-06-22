@@ -12662,11 +12662,10 @@ impl WorkspaceManager {
         }
     }
 
-    fn find_free_port() -> Option<u16> {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .ok()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port())
+    fn reserve_prebound_port() -> Option<(u16, std::net::TcpListener)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let port = listener.local_addr().ok()?.port();
+        Some((port, listener))
     }
 
     // Returns (child, assigned_port)
@@ -12851,7 +12850,10 @@ impl WorkspaceManager {
                 .output();
         }
 
-        let assigned_port = Self::find_free_port();
+        let (assigned_port, prebound_port_listener) = match Self::reserve_prebound_port() {
+            Some((port, listener)) => (Some(port), Some(listener)),
+            None => (None, None),
+        };
         let port_str = assigned_port.map_or("8000".to_string(), |p| p.to_string());
 
         // Substitute {PORT} placeholder used in Python command templates, then
@@ -12912,6 +12914,7 @@ impl WorkspaceManager {
         Self::apply_process_overrides(&mut cmd, overrides);
 
         logs.push(format!("running: {program} {args_str}"));
+        drop(prebound_port_listener);
         match cmd.spawn() {
             Ok(child) => {
                 logs.push(format!("spawned pid: {} on port {port_str}", child.id()));
@@ -19321,6 +19324,15 @@ dependencies:
             &overrides,
         );
         assert_eq!(rendered, "nvm use 20 && npm run dev");
+    }
+
+    #[test]
+    fn reserve_prebound_port_keeps_port_unavailable_until_released() {
+        let (port, listener) =
+            WorkspaceManager::reserve_prebound_port().expect("prebound port should allocate");
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        drop(listener);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
 
     #[test]

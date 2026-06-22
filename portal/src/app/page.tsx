@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Image from "next/image";
 import styles from "./page.module.css";
 
 const API_BASE_URL =
@@ -223,6 +224,8 @@ export default function Home() {
   const [selectedWorkspaceFileContent, setSelectedWorkspaceFileContent] = useState("");
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
+  const [workspacePreviewVersion, setWorkspacePreviewVersion] = useState(0);
+  const [workspacePreviewError, setWorkspacePreviewError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
   const [freeingSpace, setFreeingSpace] = useState(false);
   const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
@@ -261,6 +264,8 @@ export default function Home() {
     setSelectedWorkspaceFile(null);
     setSelectedWorkspaceFileContent("");
     setWorkspaceFilesError(null);
+    setWorkspacePreviewVersion(0);
+    setWorkspacePreviewError(null);
     setError(null);
   }
 
@@ -400,6 +405,15 @@ export default function Home() {
     loadFileContent();
     return () => { cancelled = true; };
   }, [runResult?.execution_id, selectedWorkspaceFile]);
+
+  useEffect(() => {
+    const firstPort = workspace?.ports?.[0]?.port;
+    if (workspace?.id && workspace.state === "Running" && firstPort) {
+      setWorkspacePreviewVersion((version) => version + 1);
+      return;
+    }
+    setWorkspacePreviewError(null);
+  }, [workspace?.id, workspace?.state, workspace?.ports?.[0]?.port]);
 
   // Auto-scroll log box
   useEffect(() => {
@@ -564,6 +578,9 @@ export default function Home() {
     ? `${parsedRepo.owner}/${parsedRepo.repo}`
     : NO_REPOSITORY_SELECTED;
   const avatarLetter = parsedRepo?.owner?.charAt(0).toUpperCase() || DEFAULT_AVATAR_LETTER;
+  const workspacePreviewSrc = workspace?.id
+    ? `/api/workspace-preview/${workspace.id}?v=${workspacePreviewVersion}`
+    : null;
 
   return (
     <main className={styles.page}>
@@ -900,6 +917,31 @@ export default function Home() {
             <p>Run a repository to populate execution status and workspace links.</p>
           </section>
         )}
+
+        {workspace ? (
+          <section className={styles.panel}>
+            <h2>App preview</h2>
+            {workspace.state === "Running" && workspacePreviewSrc ? (
+              <>
+                <div className={styles.previewFrame}>
+                  <Image
+                    src={workspacePreviewSrc}
+                    alt="Workspace app preview screenshot"
+                    width={1280}
+                    height={720}
+                    unoptimized
+                    className={styles.previewImage}
+                    onLoad={() => setWorkspacePreviewError(null)}
+                    onError={() => setWorkspacePreviewError("Preview capture failed. The app may still be starting.")}
+                  />
+                </div>
+                {workspacePreviewError ? <p className={styles.hint}>{workspacePreviewError}</p> : null}
+              </>
+            ) : (
+              <p className={styles.hint}>Preview will appear once the workspace is running.</p>
+            )}
+          </section>
+        ) : null}
 
         <section className={styles.footerInfo}>
           <p>
