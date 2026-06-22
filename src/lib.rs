@@ -14447,17 +14447,50 @@ impl BuildPlanner {
             "bun" => "bun run build".to_string(),
             _ => "npm run build".to_string(),
         };
-        let js_dev_fallback = match package_manager {
-            "pnpm" => "pnpm run dev -- --host 0.0.0.0".to_string(),
-            "yarn" => "yarn dev --host 0.0.0.0".to_string(),
-            "bun" => "bun run dev -- --host 0.0.0.0".to_string(),
-            _ => "npm run dev -- --host 0.0.0.0".to_string(),
-        };
         let js_test_fallback = match package_manager {
             "pnpm" => "pnpm run test".to_string(),
             "yarn" => "yarn test".to_string(),
             "bun" => "bun test".to_string(),
             _ => "npm test".to_string(),
+        };
+
+        // Pick the best available run script, preferring Vite-style dev servers.
+        // - "dev" / "preview" / "serve": Vite-based, need --host 0.0.0.0 to bind all interfaces.
+        // - "start" / "develop": CRA/webpack/custom toolchain; they bind 0.0.0.0 by default,
+        //   read PORT env var, and typically reject unknown CLI args via --.
+        let js_dev_command = {
+            let pm_run = match package_manager {
+                "pnpm" => "pnpm run",
+                "yarn" => "yarn",
+                "bun" => "bun run",
+                _ => "npm run",
+            };
+            // Check if the chosen script body contains "vite" to decide on --host
+            let vite_host_flag = |name: &str| -> &str {
+                let body = scripts.get(name).map(|s| s.as_str()).unwrap_or("");
+                if body.contains("vite") || name == "dev" || name == "preview" || name == "serve" {
+                    " -- --host 0.0.0.0"
+                } else {
+                    ""
+                }
+            };
+
+            // Vite-style first (explicit dev/preview/serve script)
+            if scripts.contains_key("dev") {
+                format!("{pm_run} dev{}", vite_host_flag("dev"))
+            } else if scripts.contains_key("preview") {
+                format!("{pm_run} preview{}", vite_host_flag("preview"))
+            } else if scripts.contains_key("serve") {
+                format!("{pm_run} serve{}", vite_host_flag("serve"))
+            // CRA / custom toolchain (start / develop)
+            } else if scripts.contains_key("start") {
+                format!("{pm_run} start")
+            } else if scripts.contains_key("develop") {
+                format!("{pm_run} develop")
+            } else {
+                // Nothing matched — log what scripts exist and fall back to dev
+                format!("{pm_run} dev -- --host 0.0.0.0")
+            }
         };
         let py_install = match package_manager {
             "poetry" => "poetry install".to_string(),
@@ -14544,7 +14577,7 @@ impl BuildPlanner {
                 let dev = ExecutionNode {
                     id: "dev".to_string(),
                     node_type: ExecutionNodeType::DevServer,
-                    command: Some(js_script("dev", &js_dev_fallback)),
+                    command: Some(js_dev_command.clone()),
                     execution_mode: ExecutionMode::Native,
                     inputs: build.outputs.clone(),
                     outputs: vec!["http://0.0.0.0:3000/".to_string()],
