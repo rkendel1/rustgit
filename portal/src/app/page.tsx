@@ -472,6 +472,11 @@ export default function Home() {
       setAnalyzedRepoUrl(repo.repoUrl);
       setIntelligence(analyzed.repository_intelligence ?? null);
       setRepoAnswer(analyzed.repository_ask ?? null);
+      if (!analyzed.repository_intelligence || !analyzed.repository_ask) {
+        setError(
+          "Analysis succeeded, but repository intelligence summary was incomplete.",
+        );
+      }
     } catch (caught) {
       setAnalyzeResult(null);
       setAnalyzedRepoUrl(null);
