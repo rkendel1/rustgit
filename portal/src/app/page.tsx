@@ -199,7 +199,9 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
 }
 
 export default function Home() {
-  const [repository, setRepository] = useState("");
+  const [repository, setRepository] = useState(() =>
+    typeof window !== "undefined" ? (localStorage.getItem("rustgit:lastRepoUrl") ?? "") : ""
+  );
   const [branch, setBranch] = useState("main");
   const [startCommand, setStartCommand] = useState("");
   const [envOverrides, setEnvOverrides] = useState("");
@@ -235,6 +237,7 @@ export default function Home() {
 
   function resetResults(nextRepositoryValue: string) {
     setRepository(nextRepositoryValue);
+    try { localStorage.setItem("rustgit:lastRepoUrl", nextRepositoryValue); } catch { /* ignore */ }
     setAnalyzeResult(null);
     setAnalyzedRepoUrl(null);
     setIntelligence(null);
