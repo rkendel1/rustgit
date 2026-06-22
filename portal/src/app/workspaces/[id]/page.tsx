@@ -192,12 +192,12 @@ export default function WorkspacePage({
           <span>{workspace.resource_quotas.max_cpu_millis} m</span>
         </div>
         {workspace.ports.map((p, i) => {
-          const url = `${p.protocol}://localhost:${p.port}${p.route || "/"}`;
+          const proxyUrl = `/api/app-proxy/${workspace.id}${p.route || "/"}`;
           return (
             <div key={i} className={styles.tile}>
               <strong>Port {p.port}</strong>
-              <a href={url} target="_blank" rel="noopener noreferrer">
-                {p.protocol} · {p.route || "/"}
+              <a href={proxyUrl} target="_blank" rel="noopener noreferrer">
+                Open app ↗
               </a>
             </div>
           );

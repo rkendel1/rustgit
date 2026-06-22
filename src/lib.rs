@@ -12453,19 +12453,17 @@ impl WorkspaceManager {
             ctx.execution_graph.primary_run_command().unwrap_or_else(|| "none".to_string())
         ));
 
-        set_state(WorkspaceState::Starting);
-        let handle = match self.execution_engine.start(&mut ctx) {
-            Ok(h) => h,
-            Err(e) => { set_failed(format!("workspace failed: {e}")); return; }
-        };
-        push_log(format!("started process: {}", handle.pid_hint));
-
         workspace.framework = ctx.analysis.framework;
         workspace.ports = ports_for_framework(ctx.analysis.framework);
         workspace.network_policy = ctx.network.clone();
         workspace.resource_quotas = ctx.resources.clone();
 
-        let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut vec![]);
+        set_state(WorkspaceState::Starting);
+        let mut spawn_logs: Vec<String> = vec![];
+        let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut spawn_logs);
+        for line in &spawn_logs {
+            push_log(line.clone());
+        }
         if let Some(port) = assigned_port {
             for p in &mut workspace.ports {
                 p.port = port;
@@ -12476,11 +12474,7 @@ impl WorkspaceManager {
             if let Some(r) = workspaces.get_mut(id) {
                 r.workspace = workspace;
                 r.workspace.state = WorkspaceState::Running;
-                if let Some(port) = assigned_port {
-                    push_log(format!("spawned pid: {} on port {port}", child.as_ref().map_or(0, |c| c.id())));
-                }
                 r.execution_context = Some(ctx);
-                r.process_handle = Some(handle);
                 r.child_process = child;
                 r.logs.push("workspace running".to_string());
             }
