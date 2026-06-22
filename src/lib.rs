@@ -13954,10 +13954,14 @@ impl WorkspaceManager {
             | ExecutionRoutingMode::Remote
             | ExecutionRoutingMode::Hybrid => None,
         };
-        let stream_channel = endpoint
-            .as_ref()
-            .is_none()
-            .then(|| format!("/api/v1/workspaces/{}/runtime", runtime.workspace_id));
+        let stream_channel = if endpoint.is_none() {
+            Some(format!(
+                "/api/v1/workspaces/{}/runtime",
+                runtime.workspace_id
+            ))
+        } else {
+            None
+        };
         let execution_handle = Some(ExecutionHandle {
             workspace_id: runtime.workspace_id.clone(),
             provider_id: runtime.provider_selected.clone(),
@@ -13998,12 +14002,16 @@ impl WorkspaceManager {
 
     fn routing_mode_for_provider(provider: &str) -> ExecutionRoutingMode {
         let normalized = provider.to_ascii_lowercase();
-        if normalized.contains("wasm") {
-            ExecutionRoutingMode::Wasm
-        } else if normalized.contains("cloud") || normalized.contains("remote") {
-            ExecutionRoutingMode::Remote
-        } else if normalized.contains("hybrid") {
+        let is_wasm = normalized.contains("wasm");
+        let is_remote = normalized.contains("cloud") || normalized.contains("remote");
+        let is_hybrid = normalized.contains("hybrid");
+
+        if is_hybrid || (is_wasm && is_remote) {
             ExecutionRoutingMode::Hybrid
+        } else if is_remote {
+            ExecutionRoutingMode::Remote
+        } else if is_wasm {
+            ExecutionRoutingMode::Wasm
         } else {
             ExecutionRoutingMode::Local
         }
@@ -25512,6 +25520,10 @@ all = ["network"]
         ));
         assert!(matches!(
             WorkspaceManager::routing_mode_for_provider("HybridRuntime"),
+            ExecutionRoutingMode::Hybrid
+        ));
+        assert!(matches!(
+            WorkspaceManager::routing_mode_for_provider("WasmCloudBridge"),
             ExecutionRoutingMode::Hybrid
         ));
         assert!(matches!(

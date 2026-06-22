@@ -80,7 +80,9 @@ async function handle(
   const port = truth.actual_port ?? null;
   const fallbackLocalEndpoint = port ? `http://127.0.0.1:${port}` : null;
   const endpoint = executionHandle?.endpoint ?? fallbackLocalEndpoint;
-  const isReady = Boolean(truth.http_ready || truth.readiness_state === "ready");
+  const readinessState = executionHandle?.readiness_state ?? truth.readiness_state;
+  const normalizedReadiness = readinessState?.toLowerCase();
+  const isReady = Boolean(truth.http_ready || normalizedReadiness === "ready");
 
   if (!isReady) {
     const payload = {
@@ -111,9 +113,11 @@ async function handle(
     return NextResponse.json(payload, { status: 202 });
   }
 
-  const subPath = (path ?? []).map((segment) => encodeURIComponent(segment)).join("/");
+  const subPath = path ? path.join("/") : "";
   const upstreamUrl = endpoint
     ? `${endpoint.replace(/\/$/, "")}/${subPath}${request.nextUrl.search}`
+    // Keep the mirrored `/api/proxy/api/v1` alias so portal requests stay on the
+    // same stable public proxy surface while backend routing remains provider-aware.
     : `${BACKEND_BASE}/api/proxy/api/v1/workspaces/${encodeURIComponent(id)}/proxy/${subPath}${request.nextUrl.search}`;
   const forwardHeaders = new Headers();
   request.headers.forEach((value, key) => {
@@ -121,6 +125,16 @@ async function handle(
       forwardHeaders.set(key, value);
     }
   });
+  if (endpoint) {
+    try {
+      const parsed = new URL(endpoint);
+      if (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost") {
+        forwardHeaders.set("host", parsed.host);
+      }
+    } catch {
+      // ignore malformed endpoint hosts and rely on default fetch host header handling
+    }
+  }
   const body =
     request.method !== "GET" && request.method !== "HEAD"
       ? new Uint8Array(await request.arrayBuffer())
