@@ -1839,13 +1839,15 @@ mod tests {
             "analyze should only include repository summary projections when explicitly requested"
         );
         assert!(repo.join(".execution.json").exists());
+        assert!(repo.join("runtime-manifest.json").exists());
         assert!(repo.join(".execution-plan.json").exists());
         assert!(repo.join(".runtime-capabilities.json").exists());
         assert!(repo.join(".launch-plan.json").exists());
         assert_eq!(
             payload["manifest"]["path"].as_str(),
-            Some(".execution.json")
+            Some("runtime-manifest.json")
         );
+        assert_eq!(payload["manifest"]["version"].as_u64(), Some(2));
         assert_eq!(
             payload["execution_intelligence"]["execution"]["preferred"].as_str(),
             Some("pnpm")

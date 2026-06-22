@@ -31,10 +31,26 @@ pub fn detect_framework(root: &Path) -> FrameworkDetection {
                 evidence,
             };
         }
+        if package_lc.contains("\"svelte\"") {
+            evidence.push("package.json:svelte".to_string());
+            return FrameworkDetection {
+                framework: "svelte".to_string(),
+                language: infer_node_language(root, &package_lc),
+                evidence,
+            };
+        }
         if package_lc.contains("\"react\"") {
             evidence.push("package.json:react".to_string());
             return FrameworkDetection {
                 framework: "react".to_string(),
+                language: infer_node_language(root, &package_lc),
+                evidence,
+            };
+        }
+        if package_lc.contains("\"express\"") {
+            evidence.push("package.json:express".to_string());
+            return FrameworkDetection {
+                framework: "express".to_string(),
                 language: infer_node_language(root, &package_lc),
                 evidence,
             };
@@ -58,6 +74,26 @@ pub fn detect_framework(root: &Path) -> FrameworkDetection {
         };
     }
     if root.join("pyproject.toml").exists() || root.join("requirements.txt").exists() {
+        if root.join("manage.py").exists() || file_contains_token(root, "requirements.txt", "django")
+        {
+            evidence.push("python:django".to_string());
+            return FrameworkDetection {
+                framework: "django".to_string(),
+                language: "python".to_string(),
+                evidence,
+            };
+        }
+        if file_contains_token(root, "requirements.txt", "fastapi")
+            || file_contains_token(root, "pyproject.toml", "fastapi")
+            || file_contains_token(root, "main.py", "fastapi")
+        {
+            evidence.push("python:fastapi".to_string());
+            return FrameworkDetection {
+                framework: "fastapi".to_string(),
+                language: "python".to_string(),
+                evidence,
+            };
+        }
         evidence.push("python-manifest".to_string());
         return FrameworkDetection {
             framework: "python".to_string(),
@@ -111,4 +147,10 @@ fn infer_node_language(root: &Path, package_json_lc: &str) -> String {
     } else {
         "javascript".to_string()
     }
+}
+
+fn file_contains_token(root: &Path, relative_path: &str, token: &str) -> bool {
+    fs::read_to_string(root.join(relative_path))
+        .map(|content| content.to_ascii_lowercase().contains(token))
+        .unwrap_or(false)
 }

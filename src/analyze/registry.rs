@@ -42,6 +42,26 @@ pub fn runtime_registry() -> HashMap<&'static str, RuntimeRegistryEntry> {
             },
         ),
         (
+            "svelte",
+            RuntimeRegistryEntry {
+                runtime: "node",
+                package_manager: Some("npm"),
+                dev: Some("npm run dev"),
+                build: Some("npm run build"),
+                start: Some("npm run dev"),
+            },
+        ),
+        (
+            "express",
+            RuntimeRegistryEntry {
+                runtime: "node",
+                package_manager: Some("npm"),
+                dev: Some("npm run dev"),
+                build: Some("npm run build"),
+                start: Some("npm run start"),
+            },
+        ),
+        (
             "rust",
             RuntimeRegistryEntry {
                 runtime: "rust",
@@ -63,6 +83,26 @@ pub fn runtime_registry() -> HashMap<&'static str, RuntimeRegistryEntry> {
         ),
         (
             "python",
+            RuntimeRegistryEntry {
+                runtime: "python",
+                package_manager: Some("pip"),
+                dev: Some("python main.py"),
+                build: None,
+                start: Some("python main.py"),
+            },
+        ),
+        (
+            "fastapi",
+            RuntimeRegistryEntry {
+                runtime: "python",
+                package_manager: Some("pip"),
+                dev: Some("python main.py"),
+                build: None,
+                start: Some("python main.py"),
+            },
+        ),
+        (
+            "django",
             RuntimeRegistryEntry {
                 runtime: "python",
                 package_manager: Some("pip"),
