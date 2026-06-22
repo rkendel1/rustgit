@@ -90,6 +90,8 @@ export async function GET(
     const message =
       error instanceof Error && error.name === "TimeoutError"
         ? "Workspace app did not finish loading within 15 seconds."
+        // Keep this fallback to handle brief races between successful readiness checks
+        // and browser navigation while the upstream process is still finalizing binds.
         : error instanceof Error && error.message.includes("ERR_CONNECTION_REFUSED")
           ? "Workspace app is still starting. Please retry in a few seconds."
         : "Failed to capture preview screenshot.";

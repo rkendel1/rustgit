@@ -5,7 +5,7 @@ const BACKEND_BASE =
     ? "http://localhost:8080"
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 
-const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v\d)\b/i;
+const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v\d+)\b/i;
 const MIN_POLL_INTERVAL_MS = 100;
 const MAX_PROBE_TIMEOUT_MS = 500;
 
@@ -49,6 +49,7 @@ function progressPercent(elapsedMs: number, maxWaitMs: number): number {
 }
 
 function shouldFetchLogs(attempt: number, hasLogs: boolean): boolean {
+  // Fetch immediately, then every other probe to balance startup visibility and API load.
   return !hasLogs || attempt % 2 === 0;
 }
 
@@ -215,7 +216,7 @@ async function handle(
       const logs = await getWorkspaceLogs(id);
       if (logs.length > 0) {
         lastLogs = logs.slice(-5);
-        if (lastProbe === "port unavailable" && READY_LOG_PATTERN.test(lastLogs.join("\n"))) {
+        if (READY_LOG_PATTERN.test(lastLogs.join("\n"))) {
           lastProbe = "startup logs indicate server may be ready";
         }
       }
