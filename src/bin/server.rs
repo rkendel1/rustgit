@@ -494,15 +494,33 @@ async fn analyze_repository(
         return Ok((StatusCode::OK, Json(payload)));
     }
 
-    let repo_root = prepare_repository_for_analysis(&repo_url, &branch, &requested_commit)
-        .map_err(err_response)?;
-    let resolved_commit = resolve_repository_commit(&repo_root).unwrap_or_else(|| {
-        if requested_commit.is_empty() {
-            "unknown".to_string()
-        } else {
-            requested_commit.clone()
-        }
-    });
+    let repo_url_for_prepare = repo_url.clone();
+    let branch_for_prepare = branch.clone();
+    let requested_commit_for_prepare = requested_commit.clone();
+    let (repo_root, resolved_commit) = tokio::task::spawn_blocking(
+        move || -> rustgit_wasm_runtime::Result<(PathBuf, String)> {
+            let repo_root = prepare_repository_for_analysis(
+                &repo_url_for_prepare,
+                &branch_for_prepare,
+                &requested_commit_for_prepare,
+            )?;
+            let resolved_commit = resolve_repository_commit(&repo_root).unwrap_or_else(|| {
+                if requested_commit_for_prepare.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    requested_commit_for_prepare.clone()
+                }
+            });
+            Ok((repo_root, resolved_commit))
+        },
+    )
+    .await
+    .map_err(|join_error| {
+        err_response(RuntimeError::CommandFailed(format!(
+            "analyze task panicked: {join_error}"
+        )))
+    })?
+    .map_err(err_response)?;
     let resolved_cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit);
 
     if let Some(cached) = state.analyze_cache.get(&resolved_cache_key) {
@@ -521,18 +539,31 @@ async fn analyze_repository(
         return Ok((StatusCode::OK, Json(payload)));
     }
 
-    let request = AnalyzeEngineRequest {
-        repo: repo_url.clone(),
-        branch,
-        commit: resolved_commit.clone(),
-    };
-    let result = AnalyzeEngine::analyze(&repo_root, &request).map_err(err_response)?;
-    let mut payload = result.payload;
-    let launch_branches = discover_launch_override_branches(&repo_root);
-    payload["launch_overrides"] = json!({
-        "branches": launch_branches
-    });
-    payload["launch_plan"] = build_launch_plan(&payload, &request.branch);
+    let repo_url_for_analysis = repo_url.clone();
+    let branch_for_analysis = branch.clone();
+    let mut payload = tokio::task::spawn_blocking(move || -> rustgit_wasm_runtime::Result<Value> {
+        let request = AnalyzeEngineRequest {
+            repo: repo_url_for_analysis,
+            branch: branch_for_analysis.clone(),
+            commit: resolved_commit.clone(),
+        };
+        let result = AnalyzeEngine::analyze(&repo_root, &request)?;
+        let mut payload = result.payload;
+        let launch_branches = discover_launch_override_branches(&repo_root);
+        payload["launch_overrides"] = json!({
+            "branches": launch_branches
+        });
+        payload["launch_plan"] = build_launch_plan(&payload, &request.branch);
+        Ok(payload)
+    })
+    .await
+    .map_err(|join_error| {
+        err_response(RuntimeError::CommandFailed(format!(
+            "analyze task panicked: {join_error}"
+        )))
+    })?
+    .map_err(err_response)?;
+
     payload["cached"] = json!(false);
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
     if include_repository_summary {
