@@ -265,9 +265,11 @@ fn extract_env_keys_from_text(content: &str) -> BTreeSet<String> {
 
 fn is_env_key(key: &str) -> bool {
     !key.is_empty()
-        && key
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && key.chars().all(is_env_key_char)
+}
+
+fn is_env_key_char(ch: char) -> bool {
+    ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'
 }
 
 fn collect_dot_notation(content: &str, prefix: &str, keys: &mut BTreeSet<String>) {
@@ -276,7 +278,7 @@ fn collect_dot_notation(content: &str, prefix: &str, keys: &mut BTreeSet<String>
         let candidate = &rest[index + prefix.len()..];
         let key: String = candidate
             .chars()
-            .take_while(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || *ch == '_')
+            .take_while(|ch| is_env_key_char(*ch))
             .collect();
         if is_env_key(&key) {
             keys.insert(key);
@@ -314,7 +316,7 @@ fn collect_template_env(content: &str, keys: &mut BTreeSet<String>) {
         let candidate = &rest[index + 2..];
         let key: String = candidate
             .chars()
-            .take_while(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || *ch == '_')
+            .take_while(|ch| is_env_key_char(*ch))
             .collect();
         if is_env_key(&key) {
             keys.insert(key);

@@ -956,7 +956,7 @@ export default function Home() {
             </div>
             <div className={styles.tile}>
               <strong>Confidence</strong>
-              <span>{executionIntelligence?.execution?.confidence ?? analyzeResult?.repository_intelligence?.health_score ?? "n/a"}</span>
+              <span>{executionIntelligence?.execution?.confidence ?? "n/a"}</span>
             </div>
             <div className={styles.tile}>
               <strong>Recommended runtime</strong>

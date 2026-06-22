@@ -15331,7 +15331,18 @@ fn persist_execution_manifest(root: &Path, analysis: &RepositoryAnalysis) {
         .map(String::as_str);
     let runtime = analysis.runtime_spec.language.as_str();
     let package_manager = analysis.build_intelligence.package_manager.as_deref();
-    let framework = format!("{:?}", analysis.framework).to_ascii_lowercase();
+    let framework = if analysis.runtime_spec.framework.trim().is_empty()
+        || analysis.runtime_spec.framework == UNKNOWN_SIGNATURE
+    {
+        analysis
+            .fingerprint
+            .framework_signature
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_SIGNATURE.to_string())
+            .to_ascii_lowercase()
+    } else {
+        analysis.runtime_spec.framework.clone()
+    };
     let manifest = analyze::manifest_builder::AnalyzeManifest::synthesize(
         root,
         &framework,
