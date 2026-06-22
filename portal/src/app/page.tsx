@@ -623,12 +623,7 @@ export default function Home() {
 
         <section className={styles.panel}>
           <h2>Repository input</h2>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              handleAnalyze();
-            }}
-          >
+          <div>
             <label htmlFor="github-repo-url" className={styles.label}>
               GitHub repository URL or owner/repo
             </label>
@@ -659,14 +654,14 @@ export default function Home() {
             </p>
 
             <div className={styles.actions}>
-              <button type="submit" disabled={analyzing} className={styles.primaryButton}>
+              <button type="button" onClick={handleAnalyze} disabled={analyzing} className={styles.primaryButton}>
                 {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
               </button>
               <button type="button" onClick={handleRun} disabled={running} className={styles.secondaryButton}>
                 {running ? "Starting run..." : "Run repository"}
               </button>
             </div>
-          </form>
+          </div>
         </section>
 
         {error ? (
