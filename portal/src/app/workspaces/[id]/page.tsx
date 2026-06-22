@@ -191,12 +191,17 @@ export default function WorkspacePage({
           <strong>CPU</strong>
           <span>{workspace.resource_quotas.max_cpu_millis} m</span>
         </div>
-        {workspace.ports.map((p, i) => (
-          <div key={i} className={styles.tile}>
-            <strong>Port {p.port}</strong>
-            <span>{p.protocol}{p.route ? ` · ${p.route}` : ""}</span>
-          </div>
-        ))}
+        {workspace.ports.map((p, i) => {
+          const url = `${p.protocol}://localhost:${p.port}${p.route || "/"}`;
+          return (
+            <div key={i} className={styles.tile}>
+              <strong>Port {p.port}</strong>
+              <a href={url} target="_blank" rel="noopener noreferrer">
+                {p.protocol} · {p.route || "/"}
+              </a>
+            </div>
+          );
+        })}
       </div>
 
       <div className={styles.section}>

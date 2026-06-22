@@ -12106,6 +12106,7 @@ struct LocalWorkspaceRecord {
     logs: Vec<String>,
     execution_context: Option<ExecutionContext>,
     process_handle: Option<ProcessHandle>,
+    child_process: Option<std::process::Child>,
 }
 
 pub struct ExecutionEngine {
@@ -12341,6 +12342,67 @@ impl WorkspaceManager {
             .map(|r| r.workspace.clone())
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))
     }
+
+    fn find_free_port() -> Option<u16> {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+    }
+
+    // Returns (child, assigned_port)
+    fn spawn_run_command(ctx: &ExecutionContext, logs: &mut Vec<String>) -> (Option<std::process::Child>, Option<u16>) {
+        let run_cmd = match ctx.execution_graph.primary_run_command() {
+            Some(cmd) => cmd,
+            None => return (None, None),
+        };
+        let repo_path = std::path::Path::new(&ctx.repo_path);
+
+        // Run install step (npm install, pip install, etc.) if present in the graph
+        let install_cmd = ctx.execution_graph.nodes.iter()
+            .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
+            .and_then(|n| n.command.clone());
+        if let Some(install) = install_cmd {
+            let mut parts = install.split_whitespace();
+            if let Some(program) = parts.next() {
+                let args: Vec<&str> = parts.collect();
+                logs.push(format!("installing dependencies: {install}"));
+                let _ = Command::new(program)
+                    .args(&args)
+                    .current_dir(repo_path)
+                    .output();
+            }
+        }
+
+        let assigned_port = Self::find_free_port();
+        let mut parts = run_cmd.split_whitespace();
+        let program = match parts.next() {
+            Some(p) => p,
+            None => return (None, None),
+        };
+        let args: Vec<&str> = parts.collect();
+
+        let mut cmd = Command::new(program);
+        cmd.args(&args)
+            .current_dir(repo_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(port) = assigned_port {
+            cmd.env("PORT", port.to_string());
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                logs.push(format!("spawned pid: {} on port {}", child.id(), assigned_port.map_or("default".to_string(), |p| p.to_string())));
+                (Some(child), assigned_port)
+            }
+            Err(err) => {
+                logs.push(format!("spawn failed: {err}"));
+                (None, None)
+            }
+        }
+    }
 }
 
 impl WasmWorkspace for WorkspaceManager {
@@ -12376,6 +12438,7 @@ impl WasmWorkspace for WorkspaceManager {
                     logs: vec!["workspace created".to_string()],
                     execution_context: None,
                     process_handle: None,
+                    child_process: None,
                 },
             );
         }
@@ -12431,10 +12494,18 @@ impl WasmWorkspace for WorkspaceManager {
 
         match launch_result {
             Ok((ctx, handle)) => {
+                let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut record.logs);
+                // Patch the port list to use the actual assigned port
+                if let Some(port) = assigned_port {
+                    for p in &mut workspace.ports {
+                        p.port = port;
+                    }
+                }
                 record.workspace = workspace.clone();
                 record.logs.extend(logs);
                 record.execution_context = Some(ctx);
                 record.process_handle = Some(handle);
+                record.child_process = child;
                 Ok(workspace)
             }
             Err(err) => {
@@ -12455,6 +12526,11 @@ impl WasmWorkspace for WorkspaceManager {
         if let (Some(ctx), Some(handle)) = (&record.execution_context, &record.process_handle) {
             self.execution_engine.stop(ctx, handle)?;
         }
+        if let Some(child) = record.child_process.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        record.child_process = None;
         record.process_handle = None;
         Self::transition_state(&mut record.workspace, WorkspaceState::Stopped)?;
         record.logs.push("workspace stopped".to_string());
@@ -12467,14 +12543,26 @@ impl WasmWorkspace for WorkspaceManager {
             .get_mut(id)
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
         Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
+        if let Some(child) = record.child_process.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        record.child_process = None;
         let mut execution_context = record
             .execution_context
             .clone()
             .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?;
         let handle = self.execution_engine.start(&mut execution_context)?;
+        let (child, assigned_port) = Self::spawn_run_command(&execution_context, &mut record.logs);
+        if let Some(port) = assigned_port {
+            for p in &mut record.workspace.ports {
+                p.port = port;
+            }
+        }
         Self::transition_state(&mut record.workspace, WorkspaceState::Running)?;
         record.execution_context = Some(execution_context);
         record.process_handle = Some(handle);
+        record.child_process = child;
         record.logs.push("workspace restarted".to_string());
         Ok(())
     }
