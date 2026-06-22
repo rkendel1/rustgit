@@ -159,9 +159,10 @@ async function handle(
       );
       responseHeaders.set("location", rewritten);
     } catch {
-      // If Location is malformed, leave it as-is.
+      // If Location is malformed, leave it as-is rather than failing the proxy response.
     }
   }
+  // Strip hop-by-hop headers that don't make sense to replay across origins.
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
   return new NextResponse(upstreamRes.body, {

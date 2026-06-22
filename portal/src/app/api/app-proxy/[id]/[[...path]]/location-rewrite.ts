@@ -10,5 +10,6 @@ export function rewriteLocationHeader(
     proxyOrigin,
   );
   rewritten.search = absoluteLocation.search;
+  rewritten.hash = absoluteLocation.hash;
   return rewritten.toString();
 }
