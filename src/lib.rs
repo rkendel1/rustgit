@@ -12674,8 +12674,6 @@ impl WorkspaceManager {
         };
         let (raw_dir, raw_command) = if let Some((dir, rest)) = remainder.split_once("&&") {
             (dir.trim(), rest.trim())
-        } else if let Some((dir, rest)) = remainder.split_once(';') {
-            (dir.trim(), rest.trim())
         } else {
             (remainder.trim(), "")
         };
@@ -12687,7 +12685,14 @@ impl WorkspaceManager {
         if workdir.is_relative() {
             workdir = default_dir.join(workdir);
         }
-        (workdir, raw_command.to_string())
+        let normalized_default =
+            fs::canonicalize(default_dir).unwrap_or_else(|_| default_dir.to_path_buf());
+        let normalized_workdir = fs::canonicalize(&workdir).unwrap_or_else(|_| workdir.clone());
+        if normalized_workdir.starts_with(&normalized_default) {
+            (workdir, raw_command.to_string())
+        } else {
+            (default_dir.to_path_buf(), raw_command.to_string())
+        }
     }
 
     fn resolved_run_command(ctx: &ExecutionContext, overrides: &LaunchOverrides) -> Option<String> {
@@ -12798,7 +12803,10 @@ impl WorkspaceManager {
             if let Some(install) = install_cmd {
                 let (install_cwd, install) = Self::extract_workdir_and_command(&install, repo_path);
                 if install.is_empty() {
-                    logs.push("install command is cd-only without subsequent command; skipping".to_string());
+                    logs.push(
+                        "install command only changes directory and has no install step; skipping"
+                            .to_string(),
+                    );
                 } else {
                     let mut parts = install.split_whitespace();
                     if let Some(program) = parts.next() {
@@ -12859,7 +12867,10 @@ impl WorkspaceManager {
         };
         let (run_cwd, run_cmd) = Self::extract_workdir_and_command(&run_cmd, repo_path);
         if run_cmd.is_empty() {
-            logs.push("run command is cd-only without subsequent command; skipping process spawn".to_string());
+            logs.push(
+                "run command only changes directory and has no run step; skipping process spawn"
+                    .to_string(),
+            );
             return (None, None);
         }
 
@@ -19319,12 +19330,14 @@ dependencies:
     }
 
     #[test]
-    fn extract_workdir_and_command_supports_semicolon_separator() {
-        let default_dir = Path::new("/workspace/repo");
-        let (workdir, command) =
-            WorkspaceManager::extract_workdir_and_command("cd apps/server; npm run dev", default_dir);
-        assert_eq!(workdir, PathBuf::from("/workspace/repo/apps/server"));
-        assert_eq!(command, "npm run dev");
+    fn extract_workdir_and_command_rejects_workdir_outside_default() {
+        let default_dir = temp_dir("extract-workdir-default");
+        let outside_dir = temp_dir("extract-workdir-outside");
+        let command = format!("cd {} && npm run dev", outside_dir.display());
+        let (workdir, extracted) =
+            WorkspaceManager::extract_workdir_and_command(&command, default_dir.as_path());
+        assert_eq!(workdir, default_dir);
+        assert_eq!(extracted, "npm run dev");
     }
 
     #[test]
