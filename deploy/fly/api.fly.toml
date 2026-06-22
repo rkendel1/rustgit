@@ -11,7 +11,7 @@ primary_region = "iad"
   # fly secrets set --app trythissoftware-api KEY=value
 
 [[mounts]]
-  # Fly volumes are single-machine attachments; keep this app as a warm singleton.
+  # Fly volumes are single-machine attachments; this app is intentionally a warm singleton.
   source = "workspace_data"
   destination = "/data/workspaces"
 
