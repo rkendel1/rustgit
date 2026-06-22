@@ -34,7 +34,7 @@ async function handle(
 
   const subPath = path ? path.join("/") : "";
   const search = request.nextUrl.search;
-  const upstreamUrl = `http://localhost:${port}/${subPath}${search}`;
+  const upstreamUrl = `http://127.0.0.1:${port}/${subPath}${search}`;
 
   const forwardHeaders = new Headers();
   request.headers.forEach((value, key) => {
@@ -42,7 +42,7 @@ async function handle(
       forwardHeaders.set(key, value);
     }
   });
-  forwardHeaders.set("host", `localhost:${port}`);
+  forwardHeaders.set("host", `127.0.0.1:${port}`);
 
   let upstreamRes: Response;
   try {
