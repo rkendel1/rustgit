@@ -269,7 +269,7 @@ export async function OPTIONS(request: NextRequest) {
   const originDecision = resolveOriginDecision(request);
   if (!originDecision.allowedOrigin) {
     if (!originDecision.requestOrigin) {
-      return new NextResponse(null, { status: 403 });
+      return new NextResponse(null, { status: 204 });
     }
     return forbiddenOriginResponse(originDecision.requestOrigin);
   }
