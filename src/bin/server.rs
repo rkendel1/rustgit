@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -26,6 +26,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 type SharedManager = Arc<WorkspaceManager>;
 type FingerprintIndex = Arc<Mutex<HashMap<String, Value>>>;
+const ANALYZE_GIT_COMMAND_TIMEOUT_SECS: u64 = 120;
+const ANALYZE_COMMAND_POLL_INTERVAL_MS: u64 = 100;
 
 #[derive(Clone)]
 struct AppState {
@@ -164,6 +166,9 @@ struct AnalyzeRequest {
 fn err_response(err: RuntimeError) -> (StatusCode, Json<Value>) {
     let status = match &err {
         RuntimeError::WorkspaceMissing(_) => StatusCode::NOT_FOUND,
+        RuntimeError::CommandFailed(message) if message.contains("timed out") => {
+            StatusCode::GATEWAY_TIMEOUT
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json!({ "error": err.to_string() })))
@@ -241,9 +246,10 @@ fn prepare_repository_for_analysis(
         clone
     };
 
-    let output = build_clone_command(true)
-        .output()
-        .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+    let output = run_command_with_timeout(
+        build_clone_command(true),
+        ANALYZE_GIT_COMMAND_TIMEOUT_SECS,
+    )?;
 
     let output = if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -254,9 +260,10 @@ fn prepare_repository_for_analysis(
                 fs::remove_dir_all(&workspace)?;
             }
             fs::create_dir_all(&workspace)?;
-            let fallback_output = build_clone_command(false)
-                .output()
-                .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+            let fallback_output = run_command_with_timeout(
+                build_clone_command(false),
+                ANALYZE_GIT_COMMAND_TIMEOUT_SECS,
+            )?;
             fallback_output
         } else {
             return Err(RuntimeError::CommandFailed(format!(
@@ -278,13 +285,14 @@ fn prepare_repository_for_analysis(
     }
 
     if !commit.is_empty() {
-        let output = Command::new("git")
+        let mut checkout = Command::new("git");
+        checkout
             .arg("-C")
             .arg(&workspace)
             .arg("checkout")
             .arg(commit)
-            .output()
-            .map_err(|e| RuntimeError::CommandFailed(format!("git checkout failed: {e}")))?;
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let output = run_command_with_timeout(checkout, ANALYZE_GIT_COMMAND_TIMEOUT_SECS)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(RuntimeError::CommandFailed(format!(
@@ -295,6 +303,52 @@ fn prepare_repository_for_analysis(
     }
 
     Ok(workspace)
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout_secs: u64,
+) -> rustgit_wasm_runtime::Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|err| RuntimeError::CommandFailed(format!("failed to spawn command: {err}")))?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| {
+            RuntimeError::CommandFailed(format!(
+                "command timeout value too large: {timeout_secs}s"
+            ))
+        })?;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().map_err(|err| {
+                    RuntimeError::CommandFailed(format!("failed to collect command output: {err}"))
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    child.kill().map_err(|err| {
+                        RuntimeError::CommandFailed(format!(
+                            "command timed out after {timeout_secs}s but failed to kill process: {err}"
+                        ))
+                    })?;
+                    let _ = child.wait();
+                    return Err(RuntimeError::CommandFailed(format!(
+                        "command timed out after {timeout_secs}s and was killed"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(ANALYZE_COMMAND_POLL_INTERVAL_MS));
+            }
+            Err(err) => {
+                return Err(RuntimeError::CommandFailed(format!(
+                    "failed to poll command status: {err}"
+                )));
+            }
+        }
+    }
 }
 
 fn resolve_repository_commit(root: &FsPath) -> Option<String> {
@@ -1300,6 +1354,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::collections::HashMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -1316,7 +1371,7 @@ mod tests {
         app, app_proxy_non_forwardable_conflict, runtime_badge, AnalyzeCache, AppState,
         ExecutionHandle, ExecutionRoutingMode, WorkspaceManager,
     };
-    use rustgit_wasm_runtime::ExecutionReadinessState;
+    use rustgit_wasm_runtime::{ExecutionReadinessState, RuntimeError};
 
     fn test_state() -> AppState {
         let root = std::env::temp_dir().join(format!(
@@ -2007,5 +2062,33 @@ mod tests {
             );
             assert_eq!(payload["retry_may_help"], true);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_hung_process_and_returns_timeout_error() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let result = super::run_command_with_timeout(cmd, 1);
+        assert!(
+            matches!(result, Err(RuntimeError::CommandFailed(message)) if message.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_output_for_fast_command() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+        let output = super::run_command_with_timeout(cmd, 5).expect("echo should succeed");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    }
+
+    #[test]
+    fn err_response_maps_timeout_errors_to_gateway_timeout() {
+        let (status, _) = super::err_response(RuntimeError::CommandFailed(
+            "command timed out after 30s and was killed".to_string(),
+        ));
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     }
 }
