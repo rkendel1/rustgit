@@ -17899,10 +17899,24 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         let target = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
 
-        if entry.file_type()?.is_dir() {
+        if file_type.is_dir() {
             fs::create_dir_all(&target)?;
             copy_directory(&entry_path, &target)?;
+        } else if file_type.is_symlink() {
+            // entry.file_type() doesn't follow symlinks; check the real target
+            match entry_path.metadata() {
+                Ok(meta) if meta.is_dir() => {
+                    fs::create_dir_all(&target)?;
+                    copy_directory(&entry_path, &target)?;
+                }
+                Ok(_) => {
+                    // symlink to a file — copy the file content, skip on error
+                    let _ = fs::copy(&entry_path, &target);
+                }
+                Err(_) => {} // broken symlink — skip
+            }
         } else {
             fs::copy(&entry_path, &target)?;
         }
