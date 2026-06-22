@@ -12281,6 +12281,49 @@ impl WorkspaceManager {
         }
     }
 
+    /// Removes the on-disk directories for workspaces in terminal states (Failed / Stopped /
+    /// Destroyed) and purges the repo cache. Returns the number of workspaces evicted.
+    fn evict_terminal_workspaces(&self) -> usize {
+        let terminal = {
+            let workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+            workspaces
+                .iter()
+                .filter(|(_, r)| {
+                    matches!(
+                        r.workspace.state,
+                        WorkspaceState::Failed | WorkspaceState::Stopped | WorkspaceState::Destroyed
+                    )
+                })
+                .map(|(id, r)| (id.clone(), r.workspace.root.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut evicted = 0;
+        for (id, root) in &terminal {
+            if root.exists() {
+                let _ = fs::remove_dir_all(root);
+            }
+            // Remove from in-memory map so the ID is no longer surfaced.
+            self.workspaces
+                .lock()
+                .expect("workspace lock poisoned")
+                .remove(id);
+            evicted += 1;
+        }
+
+        // Also purge the repo clone cache — those dirs can be large.
+        let cache_dir = self.root.join("cache");
+        if cache_dir.exists() {
+            let _ = fs::remove_dir_all(&cache_dir);
+        }
+        self.repository_cache
+            .lock()
+            .expect("repo cache lock poisoned")
+            .clear();
+
+        evicted
+    }
+
     fn materialize_repository(&self, repo_url: &str, destination: &Path) -> Result<()> {
         const MIN_FREE_BYTES_TO_CLONE: u64 = 1024 * 1024 * 1024;      // 1 GB
         const MIN_FREE_BYTES_TO_CACHE: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB
@@ -12302,13 +12345,17 @@ impl WorkspaceManager {
             return Ok(());
         }
 
-        // Refuse to clone if the disk is already low — large repos can fill it quickly.
+        // If disk is low, evict terminal workspaces and the repo cache before giving up.
         let free_before = available_disk_bytes(destination).unwrap_or(u64::MAX);
         if free_before < MIN_FREE_BYTES_TO_CLONE {
-            return Err(RuntimeError::CommandFailed(format!(
-                "insufficient disk space to clone repository: {:.1} GB free, need at least 1 GB",
-                free_before as f64 / 1_073_741_824.0
-            )));
+            self.evict_terminal_workspaces();
+            let free_after_eviction = available_disk_bytes(destination).unwrap_or(0);
+            if free_after_eviction < MIN_FREE_BYTES_TO_CLONE {
+                return Err(RuntimeError::CommandFailed(format!(
+                    "insufficient disk space to clone repository: {:.1} GB free after cleanup, need at least 1 GB",
+                    free_after_eviction as f64 / 1_073_741_824.0
+                )));
+            }
         }
 
         if looks_like_local_path(repo_url) {
@@ -12483,6 +12530,9 @@ impl WorkspaceManager {
             set_failed(format!("workspace failed: {e}"));
             return;
         }
+
+        // Proactively free disk space from any finished workspaces before cloning.
+        self.evict_terminal_workspaces();
 
         set_state(WorkspaceState::Materializing);
         if let Err(e) = self.materialize_repository(repo_url, &repository_root) {
@@ -12909,6 +12959,9 @@ impl WasmWorkspace for WorkspaceManager {
                 },
             );
         }
+
+        // Proactively free disk space from any finished workspaces before cloning.
+        self.evict_terminal_workspaces();
 
         let launch_result = (|| -> Result<(ExecutionContext, ProcessHandle)> {
             Self::transition_state(&mut workspace, WorkspaceState::Materializing)?;
