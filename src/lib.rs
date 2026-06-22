@@ -12357,6 +12357,10 @@ pub trait ExecutionProvider {
     fn tier(&self) -> ExecutionTier;
     /// Runtime family owned by this provider.
     fn runtime(&self) -> RuntimeType;
+    /// Declares how clients can reach execution started by this provider.
+    fn transport(&self) -> ExecutionRoutingMode {
+        ExecutionRoutingMode::Local
+    }
     /// Provider capability metadata used for ranked selection.
     fn capability(&self) -> ProviderCapability {
         let (latency_score, cost_score, reliability_score) = match self.tier() {
@@ -13945,7 +13949,7 @@ impl WorkspaceManager {
                 successful: runtime.process_alive || runtime.exit_code == Some(0),
             }
         });
-        let routing_mode = Self::routing_mode_for_provider(&runtime.provider_selected);
+        let routing_mode = transport_for_provider_id(&runtime.provider_selected);
         let endpoint = match routing_mode {
             ExecutionRoutingMode::Local => runtime
                 .actual_port
@@ -14000,22 +14004,6 @@ impl WorkspaceManager {
         })
     }
 
-    fn routing_mode_for_provider(provider: &str) -> ExecutionRoutingMode {
-        let normalized = provider.to_ascii_lowercase();
-        let is_wasm = normalized.contains("wasm");
-        let is_remote = normalized.contains("cloud") || normalized.contains("remote");
-        let is_hybrid = normalized.contains("hybrid");
-
-        if is_hybrid || (is_wasm && is_remote) {
-            ExecutionRoutingMode::Hybrid
-        } else if is_remote {
-            ExecutionRoutingMode::Remote
-        } else if is_wasm {
-            ExecutionRoutingMode::Wasm
-        } else {
-            ExecutionRoutingMode::Local
-        }
-    }
 }
 
 fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
@@ -14035,6 +14023,25 @@ fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
         return "StaticRuntimeProvider".to_string();
     }
     pid_hint.to_string()
+}
+
+const LOCAL_AGENT_TRANSPORT_MODE: ExecutionRoutingMode = ExecutionRoutingMode::Local;
+static WASM_PROVIDER_FOR_TRANSPORT: WasmExecutionProvider = WasmExecutionProvider;
+static NODE_PROVIDER_FOR_TRANSPORT: NodeRuntimeProvider = NodeRuntimeProvider;
+static RUST_PROVIDER_FOR_TRANSPORT: RustRuntimeProvider = RustRuntimeProvider;
+static STATIC_PROVIDER_FOR_TRANSPORT: StaticRuntimeProvider = StaticRuntimeProvider;
+
+fn transport_for_provider_id(provider_id: &str) -> ExecutionRoutingMode {
+    match provider_id {
+        "WasmExecutionProvider" => WASM_PROVIDER_FOR_TRANSPORT.transport(),
+        // LocalAgentProvider requires an agent instance, so it cannot be
+        // instantiated as a stateless singleton just to call the default trait method.
+        "LocalAgentProvider" => LOCAL_AGENT_TRANSPORT_MODE,
+        "NodeRuntimeProvider" => NODE_PROVIDER_FOR_TRANSPORT.transport(),
+        "RustRuntimeProvider" => RUST_PROVIDER_FOR_TRANSPORT.transport(),
+        "StaticRuntimeProvider" => STATIC_PROVIDER_FOR_TRANSPORT.transport(),
+        _ => ExecutionRoutingMode::Local,
+    }
 }
 
 impl WasmWorkspace for WorkspaceManager {
@@ -17441,6 +17448,10 @@ impl ExecutionProvider for WasmExecutionProvider {
 
     fn runtime(&self) -> RuntimeType {
         RuntimeType::Wasm
+    }
+
+    fn transport(&self) -> ExecutionRoutingMode {
+        ExecutionRoutingMode::Wasm
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
@@ -25509,25 +25520,34 @@ all = ["network"]
     }
 
     #[test]
-    fn execution_routing_mode_maps_provider_ownership() {
+    fn execution_routing_mode_is_declared_by_provider_not_guessed_from_labels() {
         assert!(matches!(
-            WorkspaceManager::routing_mode_for_provider("WASM"),
+            WasmExecutionProvider.transport(),
             ExecutionRoutingMode::Wasm
         ));
         assert!(matches!(
-            WorkspaceManager::routing_mode_for_provider("CloudWorkspace"),
-            ExecutionRoutingMode::Remote
+            NodeRuntimeProvider.transport(),
+            ExecutionRoutingMode::Local
         ));
         assert!(matches!(
-            WorkspaceManager::routing_mode_for_provider("HybridRuntime"),
-            ExecutionRoutingMode::Hybrid
+            RustRuntimeProvider.transport(),
+            ExecutionRoutingMode::Local
         ));
         assert!(matches!(
-            WorkspaceManager::routing_mode_for_provider("WasmCloudBridge"),
-            ExecutionRoutingMode::Hybrid
+            StaticRuntimeProvider.transport(),
+            ExecutionRoutingMode::Local
+        ));
+
+        assert!(matches!(
+            transport_for_provider_id("WasmExecutionProvider"),
+            ExecutionRoutingMode::Wasm
         ));
         assert!(matches!(
-            WorkspaceManager::routing_mode_for_provider("UserMachine"),
+            transport_for_provider_id("NodeRuntimeProvider"),
+            ExecutionRoutingMode::Local
+        ));
+        assert!(matches!(
+            transport_for_provider_id("SomeFutureCloudThing"),
             ExecutionRoutingMode::Local
         ));
     }
