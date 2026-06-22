@@ -1028,7 +1028,14 @@ export default function Home() {
             </div>
             <div className={styles.tile}>
               <strong>Confidence</strong>
-              <span>{executionIntelligence?.executionConfidence?.score ?? executionIntelligence?.execution?.confidence ?? "n/a"}%</span>
+              <span>
+                {(() => {
+                  const score =
+                    executionIntelligence?.executionConfidence?.score ??
+                    executionIntelligence?.execution?.confidence;
+                  return typeof score === "number" ? `${score}%` : "n/a";
+                })()}
+              </span>
             </div>
             <div className={styles.tile}>
               <strong>Recommended runtime</strong>

@@ -205,7 +205,7 @@ fn apply_safe_command_heals(
         healed.push_str(" --host 0.0.0.0");
         heals.push("hostInjection".to_string());
     }
-    if !lower.contains("--port") {
+    if !lower.contains("--port") && !lower.contains("port=") {
         healed.push_str(" --port {PORT}");
         heals.push("portInjection".to_string());
     }

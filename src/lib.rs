@@ -13204,7 +13204,7 @@ impl WorkspaceManager {
     fn auto_heal_runtime_command(command: &str) -> String {
         let lower = command.to_ascii_lowercase();
         let mut healed = command.trim().to_string();
-        let is_node_like = ["npm ", "pnpm ", "yarn ", "bun ", "vite", "next "]
+        let is_node_like = ["npm ", "pnpm ", "yarn ", "bun ", "vite ", "next "]
             .iter()
             .any(|marker| lower.contains(marker));
         if !is_node_like {
@@ -13213,7 +13213,7 @@ impl WorkspaceManager {
         if !lower.contains("--host") && !lower.contains("hostname") {
             healed.push_str(" --host 0.0.0.0");
         }
-        if !lower.contains("--port") && !lower.contains(" port=") && !lower.contains("port=") {
+        if !lower.contains("--port") && !lower.contains("port=") {
             let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
             healed.push_str(" --port ");
             healed.push_str(&port);
