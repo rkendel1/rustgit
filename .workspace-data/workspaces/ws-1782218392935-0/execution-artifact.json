@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "executionId": "ws-1782218392935-0",
+  "provider": "unknown",
+  "runtime": "unknown",
+  "packageManager": null,
+  "assignedPort": null,
+  "proxyUrl": null,
+  "startupTimeMs": 5733,
+  "healthStatus": "failed",
+  "exitCode": 1,
+  "metadata": {
+    "launchCommand": null,
+    "startupDurationMs": 5733,
+    "healthCheckDurationMs": null,
+    "retries": 0,
+    "assignedRuntime": "unknown",
+    "assignedProvider": "unknown",
+    "proxyEndpoint": null,
+    "environmentSummary": {
+      "overrideCount": 0,
+      "environmentVariables": [],
+      "versionOverrides": []
+    },
+    "error": "workspace failed: command failed: git clone exited with status exit status: 128: Cloning into '/Users/randy/Desktop/rustgit/.workspace-data/workspaces/ws-1782218392935-0/repo'...\nremote: Repository not found.\nfatal: Authentication failed for 'https://github.com/rkendel1/v0-post-aggregator-with-web-sockets.git/'"
+  }
+}
