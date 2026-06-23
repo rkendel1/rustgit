@@ -2374,6 +2374,18 @@ fn runtime_trace_provider_inference_maps_known_pid_prefixes() {
         "NodeRuntimeProvider"
     );
     assert_eq!(
+        infer_provider_from_pid_hint("go:cache"),
+        "GoExecutionProvider"
+    );
+    assert_eq!(
+        infer_provider_from_pid_hint("python:cache"),
+        "PythonExecutionProvider"
+    );
+    assert_eq!(
+        infer_provider_from_pid_hint("java:cache"),
+        "JavaExecutionProvider"
+    );
+    assert_eq!(
         infer_provider_from_pid_hint("docker:cache"),
         "DockerExecutionProvider"
     );
@@ -2617,6 +2629,173 @@ fn execution_router_uses_generated_runtime_spec_for_provider_matching() {
     ]);
     let selection = router.select(&ctx).expect("select provider");
     assert_eq!(selection.provider_id, "RustRuntimeProvider");
+}
+
+#[test]
+fn execution_router_selects_go_provider_for_go_runtime() {
+    let graph = ExecutionGraph {
+        nodes: vec![ExecutionNode {
+            id: "build".to_string(),
+            node_type: ExecutionNodeType::Build,
+            command: Some("go build ./...".to_string()),
+            execution_mode: ExecutionMode::Native,
+            inputs: vec!["go.mod".to_string()],
+            outputs: vec!["bin/app".to_string()],
+            cache_key: None,
+            runtime: None,
+            cache_binding: None,
+        }],
+        edges: vec![],
+    }
+    .with_cache_keys();
+    let mut analysis = test_analysis(graph.clone(), WasmCompatibility::NotSupported, Framework::Go);
+    analysis.runtime_spec.language = "go".to_string();
+    analysis.runtime_spec.framework = "go".to_string();
+    analysis.runtime_spec.package_manager = Some("go".to_string());
+    analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+        preferred_provider: "GoExecutionProvider".to_string(),
+        fallback_providers: vec!["RustRuntimeProvider".to_string()],
+    };
+    let runtime_spec = analysis.runtime_spec.clone();
+    let compiled_runtime = analysis.compiled_runtime.clone();
+    let ctx = ExecutionContext {
+        workspace_id: "ws-go-provider".to_string(),
+        repo_path: "/tmp/repo".to_string(),
+        runtime_spec,
+        compiled_runtime,
+        analysis,
+        execution_graph: graph,
+        wasm_sandbox: None,
+        resources: ResourceQuotas {
+            max_memory_mb: 512,
+            max_cpu_millis: 1000,
+        },
+        network: NetworkPolicy {
+            allow_outbound: false,
+            allowed_hosts: vec![],
+        },
+    };
+    let router = ExecutionRouter::new(vec![
+        Box::new(NodeRuntimeProvider),
+        Box::new(GoExecutionProvider),
+        Box::new(RustRuntimeProvider),
+    ]);
+    let selection = router.select(&ctx).expect("select provider");
+    assert_eq!(selection.provider_id, "GoExecutionProvider");
+}
+
+#[test]
+fn execution_router_selects_python_provider_for_uv_package_manager() {
+    let graph = ExecutionGraph {
+        nodes: vec![ExecutionNode {
+            id: "run".to_string(),
+            node_type: ExecutionNodeType::DevServer,
+            command: Some("uv run python main.py".to_string()),
+            execution_mode: ExecutionMode::Native,
+            inputs: vec!["pyproject.toml".to_string()],
+            outputs: vec![],
+            cache_key: None,
+            runtime: None,
+            cache_binding: None,
+        }],
+        edges: vec![],
+    }
+    .with_cache_keys();
+    let mut analysis = test_analysis(
+        graph.clone(),
+        WasmCompatibility::NotSupported,
+        Framework::Unknown,
+    );
+    analysis.runtime_spec.language = "python".to_string();
+    analysis.runtime_spec.framework = "unknown".to_string();
+    analysis.runtime_spec.package_manager = Some("uv".to_string());
+    analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+        preferred_provider: "PythonExecutionProvider".to_string(),
+        fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+    };
+    let runtime_spec = analysis.runtime_spec.clone();
+    let compiled_runtime = analysis.compiled_runtime.clone();
+    let ctx = ExecutionContext {
+        workspace_id: "ws-python-uv-provider".to_string(),
+        repo_path: "/tmp/repo".to_string(),
+        runtime_spec,
+        compiled_runtime,
+        analysis,
+        execution_graph: graph,
+        wasm_sandbox: None,
+        resources: ResourceQuotas {
+            max_memory_mb: 512,
+            max_cpu_millis: 1000,
+        },
+        network: NetworkPolicy {
+            allow_outbound: false,
+            allowed_hosts: vec![],
+        },
+    };
+    let router = ExecutionRouter::new(vec![
+        Box::new(NodeRuntimeProvider),
+        Box::new(PythonExecutionProvider),
+        Box::new(RustRuntimeProvider),
+    ]);
+    let selection = router.select(&ctx).expect("select provider");
+    assert_eq!(selection.provider_id, "PythonExecutionProvider");
+}
+
+#[test]
+fn execution_router_selects_java_provider_for_java_runtime() {
+    let graph = ExecutionGraph {
+        nodes: vec![ExecutionNode {
+            id: "run".to_string(),
+            node_type: ExecutionNodeType::DevServer,
+            command: Some("mvn spring-boot:run".to_string()),
+            execution_mode: ExecutionMode::Native,
+            inputs: vec!["pom.xml".to_string()],
+            outputs: vec![],
+            cache_key: None,
+            runtime: None,
+            cache_binding: None,
+        }],
+        edges: vec![],
+    }
+    .with_cache_keys();
+    let mut analysis = test_analysis(
+        graph.clone(),
+        WasmCompatibility::NotSupported,
+        Framework::Unknown,
+    );
+    analysis.runtime_spec.language = "java".to_string();
+    analysis.runtime_spec.framework = "java".to_string();
+    analysis.runtime_spec.package_manager = Some("maven".to_string());
+    analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+        preferred_provider: "JavaExecutionProvider".to_string(),
+        fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+    };
+    let runtime_spec = analysis.runtime_spec.clone();
+    let compiled_runtime = analysis.compiled_runtime.clone();
+    let ctx = ExecutionContext {
+        workspace_id: "ws-java-provider".to_string(),
+        repo_path: "/tmp/repo".to_string(),
+        runtime_spec,
+        compiled_runtime,
+        analysis,
+        execution_graph: graph,
+        wasm_sandbox: None,
+        resources: ResourceQuotas {
+            max_memory_mb: 512,
+            max_cpu_millis: 1000,
+        },
+        network: NetworkPolicy {
+            allow_outbound: false,
+            allowed_hosts: vec![],
+        },
+    };
+    let router = ExecutionRouter::new(vec![
+        Box::new(NodeRuntimeProvider),
+        Box::new(JavaExecutionProvider),
+        Box::new(RustRuntimeProvider),
+    ]);
+    let selection = router.select(&ctx).expect("select provider");
+    assert_eq!(selection.provider_id, "JavaExecutionProvider");
 }
 
 #[test]
@@ -6318,6 +6497,18 @@ fn execution_routing_mode_is_declared_by_provider_not_guessed_from_labels() {
         ExecutionRoutingMode::Local
     ));
     assert!(matches!(
+        GoExecutionProvider.transport(),
+        ExecutionRoutingMode::Local
+    ));
+    assert!(matches!(
+        PythonExecutionProvider.transport(),
+        ExecutionRoutingMode::Local
+    ));
+    assert!(matches!(
+        JavaExecutionProvider.transport(),
+        ExecutionRoutingMode::Local
+    ));
+    assert!(matches!(
         RustRuntimeProvider.transport(),
         ExecutionRoutingMode::Local
     ));
@@ -6336,6 +6527,18 @@ fn execution_routing_mode_is_declared_by_provider_not_guessed_from_labels() {
     ));
     assert!(matches!(
         transport_for_provider_id("NodeRuntimeProvider"),
+        ExecutionRoutingMode::Local
+    ));
+    assert!(matches!(
+        transport_for_provider_id("GoExecutionProvider"),
+        ExecutionRoutingMode::Local
+    ));
+    assert!(matches!(
+        transport_for_provider_id("PythonExecutionProvider"),
+        ExecutionRoutingMode::Local
+    ));
+    assert!(matches!(
+        transport_for_provider_id("JavaExecutionProvider"),
         ExecutionRoutingMode::Local
     ));
     assert!(matches!(

@@ -219,6 +219,7 @@ pub enum RuntimeType {
     Rust,
     Go,
     Python,
+    Java,
     Static,
     Unknown,
 }
@@ -9877,6 +9878,7 @@ fn runtime_kind_label(runtime_kind: RuntimeKind) -> &'static str {
         RuntimeKind::Python => "python",
         RuntimeKind::Rust => "rust",
         RuntimeKind::Go => "go",
+        RuntimeKind::Java => "java",
         RuntimeKind::Wasm => "wasm",
         RuntimeKind::Static => "static",
         RuntimeKind::Unknown => "unknown",
@@ -12718,6 +12720,9 @@ impl WorkspaceManager {
             Box::new(LocalAgentProvider::default_agent()),
             Box::new(DockerExecutionProvider),
             Box::new(NodeRuntimeProvider),
+            Box::new(GoExecutionProvider),
+            Box::new(PythonExecutionProvider),
+            Box::new(JavaExecutionProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
         ];
@@ -14636,6 +14641,15 @@ fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
     if pid_hint.starts_with("node:") {
         return "NodeRuntimeProvider".to_string();
     }
+    if pid_hint.starts_with("go:") {
+        return "GoExecutionProvider".to_string();
+    }
+    if pid_hint.starts_with("python:") {
+        return "PythonExecutionProvider".to_string();
+    }
+    if pid_hint.starts_with("java:") {
+        return "JavaExecutionProvider".to_string();
+    }
     if pid_hint.starts_with("docker:") {
         return DockerExecutionProvider::id_static().to_string();
     }
@@ -14652,6 +14666,9 @@ const LOCAL_AGENT_TRANSPORT_MODE: ExecutionRoutingMode = ExecutionRoutingMode::L
 static WASM_PROVIDER_FOR_TRANSPORT: WasmExecutionProvider = WasmExecutionProvider;
 static DOCKER_PROVIDER_FOR_TRANSPORT: DockerExecutionProvider = DockerExecutionProvider;
 static NODE_PROVIDER_FOR_TRANSPORT: NodeRuntimeProvider = NodeRuntimeProvider;
+static GO_PROVIDER_FOR_TRANSPORT: GoExecutionProvider = GoExecutionProvider;
+static PYTHON_PROVIDER_FOR_TRANSPORT: PythonExecutionProvider = PythonExecutionProvider;
+static JAVA_PROVIDER_FOR_TRANSPORT: JavaExecutionProvider = JavaExecutionProvider;
 static RUST_PROVIDER_FOR_TRANSPORT: RustRuntimeProvider = RustRuntimeProvider;
 static STATIC_PROVIDER_FOR_TRANSPORT: StaticRuntimeProvider = StaticRuntimeProvider;
 
@@ -14663,6 +14680,9 @@ fn transport_for_provider_id(provider_id: &str) -> ExecutionRoutingMode {
         "LocalAgentProvider" => LOCAL_AGENT_TRANSPORT_MODE,
         "DockerExecutionProvider" => DOCKER_PROVIDER_FOR_TRANSPORT.transport(),
         "NodeRuntimeProvider" => NODE_PROVIDER_FOR_TRANSPORT.transport(),
+        "GoExecutionProvider" => GO_PROVIDER_FOR_TRANSPORT.transport(),
+        "PythonExecutionProvider" => PYTHON_PROVIDER_FOR_TRANSPORT.transport(),
+        "JavaExecutionProvider" => JAVA_PROVIDER_FOR_TRANSPORT.transport(),
         "RustRuntimeProvider" => RUST_PROVIDER_FOR_TRANSPORT.transport(),
         "StaticRuntimeProvider" => STATIC_PROVIDER_FOR_TRANSPORT.transport(),
         _ => ExecutionRoutingMode::Local,
@@ -15739,6 +15759,7 @@ fn runtime_kind_from_runtime_type(runtime: RuntimeType) -> RuntimeKind {
         RuntimeType::Rust => RuntimeKind::Rust,
         RuntimeType::Go => RuntimeKind::Go,
         RuntimeType::Python => RuntimeKind::Python,
+        RuntimeType::Java => RuntimeKind::Java,
         RuntimeType::Wasm => RuntimeKind::Wasm,
         RuntimeType::Static => RuntimeKind::Static,
         RuntimeType::Unknown => RuntimeKind::Unknown,
@@ -15911,6 +15932,10 @@ fn runtime_affinity_for_classification(
             preferred_provider: "PythonExecutionProvider".to_string(),
             fallback_providers: vec!["NodeRuntimeProvider".to_string()],
         },
+        RuntimeType::Java => RuntimeAffinity {
+            preferred_provider: "JavaExecutionProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        },
         RuntimeType::Go => RuntimeAffinity {
             preferred_provider: "GoExecutionProvider".to_string(),
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
@@ -15977,6 +16002,7 @@ fn framework_for_runtime(runtime: RuntimeType) -> Framework {
         RuntimeType::Rust => Framework::Rust,
         RuntimeType::Go => Framework::Go,
         RuntimeType::Python => Framework::Python,
+        RuntimeType::Java => Framework::Unknown,
         RuntimeType::Unknown => Framework::Unknown,
     }
 }
@@ -15987,7 +16013,10 @@ fn language_for_runtime(runtime: RuntimeType) -> Language {
         RuntimeType::Rust => Language::Rust,
         RuntimeType::Go => Language::Go,
         RuntimeType::Python => Language::Python,
-        RuntimeType::Wasm | RuntimeType::Static | RuntimeType::Unknown => Language::Unknown,
+        RuntimeType::Wasm
+        | RuntimeType::Java
+        | RuntimeType::Static
+        | RuntimeType::Unknown => Language::Unknown,
     }
 }
 
@@ -17528,6 +17557,9 @@ impl Default for RestApiSpec {
 
 struct NodeRuntimeProvider;
 struct DockerExecutionProvider;
+struct GoExecutionProvider;
+struct PythonExecutionProvider;
+struct JavaExecutionProvider;
 struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
 struct LocalAgentProvider {
@@ -17877,6 +17909,153 @@ impl ExecutionProvider for DockerExecutionProvider {
                 message: format!("docker health check failed: {err}"),
             }),
         }
+    }
+}
+
+impl ExecutionProvider for GoExecutionProvider {
+    fn id(&self) -> &'static str {
+        "GoExecutionProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Go
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.runtime_spec.language.eq_ignore_ascii_case("go")
+            || matches!(
+                ctx.analysis.framework,
+                Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo
+            )
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("go:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
+    }
+}
+
+impl ExecutionProvider for PythonExecutionProvider {
+    fn id(&self) -> &'static str {
+        "PythonExecutionProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Python
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.runtime_spec.language.eq_ignore_ascii_case("python")
+            || matches!(
+                ctx.analysis.framework,
+                Framework::Python
+                    | Framework::Flask
+                    | Framework::FastApi
+                    | Framework::Django
+                    | Framework::Streamlit
+                    | Framework::Gradio
+            )
+            || ctx
+                .runtime_spec
+                .package_manager
+                .as_deref()
+                .is_some_and(|pm| matches!(pm, "pip" | "pipenv" | "poetry" | "uv"))
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("python:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
+    }
+}
+
+impl ExecutionProvider for JavaExecutionProvider {
+    fn id(&self) -> &'static str {
+        "JavaExecutionProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Java
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.runtime_spec.language.eq_ignore_ascii_case("java")
+            || ctx.runtime_spec.framework.eq_ignore_ascii_case("java")
+            || ctx
+                .runtime_spec
+                .package_manager
+                .as_deref()
+                .is_some_and(|pm| matches!(pm, "maven" | "gradle"))
+            || Path::new(&ctx.repo_path).join("pom.xml").exists()
+            || Path::new(&ctx.repo_path).join("build.gradle").exists()
+            || Path::new(&ctx.repo_path).join("build.gradle.kts").exists()
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("java:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
     }
 }
 
@@ -18400,6 +18579,10 @@ fn cache_artifacts_for_image(image: &ExecutionImage) -> Vec<String> {
         RuntimeType::Go => {
             artifacts.push("go-mod-cache".to_string());
         }
+        RuntimeType::Java => {
+            artifacts.push("maven-cache".to_string());
+            artifacts.push("gradle-cache".to_string());
+        }
         RuntimeType::Static | RuntimeType::Unknown => {}
     }
     artifacts
@@ -18847,6 +19030,7 @@ fn runtime_type_to_agent_label(runtime: RuntimeType) -> &'static str {
         RuntimeType::Rust => "rust",
         RuntimeType::Go => "go",
         RuntimeType::Python => "python",
+        RuntimeType::Java => "java",
         RuntimeType::Static => "static",
         RuntimeType::Unknown => "unknown",
     }
@@ -19419,7 +19603,7 @@ fn service_role(service: &ServiceDefinition) -> ServiceRole {
                 ServiceRole::Backend
             }
         }
-        RuntimeType::Python | RuntimeType::Rust | RuntimeType::Go => {
+        RuntimeType::Python | RuntimeType::Rust | RuntimeType::Go | RuntimeType::Java => {
             if matches!(name.as_str(), "web" | "frontend" | "ui") {
                 ServiceRole::Frontend
             } else {
@@ -19452,6 +19636,12 @@ fn service_install_command(service: &ServiceDefinition) -> Option<String> {
         RuntimeType::Python => Some(format!(
             "cd {service_root} && python -m pip install -r requirements.txt"
         )),
+        RuntimeType::Java => Some(
+            match service.package_manager.as_deref().unwrap_or("maven") {
+                "gradle" => format!("cd {service_root} && ./gradlew dependencies"),
+                _ => format!("cd {service_root} && mvn dependency:resolve"),
+            },
+        ),
         _ => None,
     }
 }
@@ -19468,6 +19658,10 @@ fn service_build_command(service: &ServiceDefinition) -> String {
         RuntimeType::Rust => format!("cd {root} && cargo build"),
         RuntimeType::Go => format!("cd {root} && go build ./..."),
         RuntimeType::Python => format!("cd {root} && python -m compileall ."),
+        RuntimeType::Java => match service.package_manager.as_deref().unwrap_or("maven") {
+            "gradle" => format!("cd {root} && ./gradlew build"),
+            _ => format!("cd {root} && mvn package"),
+        },
         RuntimeType::Static => format!("cd {root}"),
         RuntimeType::Wasm | RuntimeType::Unknown => format!("cd {root}"),
     }
