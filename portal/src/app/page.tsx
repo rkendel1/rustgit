@@ -1204,7 +1204,11 @@ export default function Home() {
               {generatingBadge ? "Generating..." : "Generate badge"}
             </button>
           </div>
-          {badgeError ? <p className={styles.hint}>{badgeError}</p> : null}
+          {badgeError ? (
+            <section className={styles.errorPanel} role="alert">
+              {badgeError}
+            </section>
+          ) : null}
           {badgeResult ? (
             <div className={styles.grid}>
               <div className={styles.tile}>
