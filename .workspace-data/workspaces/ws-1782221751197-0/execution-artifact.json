@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "executionId": "ws-1782221751197-0",
+  "provider": "unknown",
+  "runtime": "javascript",
+  "packageManager": null,
+  "assignedPort": null,
+  "proxyUrl": null,
+  "startupTimeMs": 32128,
+  "healthStatus": "failed",
+  "exitCode": 1,
+  "metadata": {
+    "launchCommand": "npm run dev -- --host 0.0.0.0 --port {PORT}",
+    "startupDurationMs": 32128,
+    "healthCheckDurationMs": 30229,
+    "retries": 0,
+    "assignedRuntime": "javascript",
+    "assignedProvider": "unknown",
+    "proxyEndpoint": null,
+    "environmentSummary": {
+      "overrideCount": 0,
+      "environmentVariables": [],
+      "versionOverrides": []
+    },
+    "error": "runtime failed: command failed: readiness probe timed out",
+    "runtimeRepair": {
+      "finalRuntimeState": "failed"
+    }
+  }
+}

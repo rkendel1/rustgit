@@ -18383,8 +18383,10 @@ fn github_clone_error_reason(repo_url: &str, stderr: &str) -> String {
     {
         if stderr.contains("could not read Username for 'https://github.com'")
             || stderr.contains("could not read Password for 'https://github.com'")
+            || stderr.contains("Authentication failed for")
+            || stderr.contains("Repository not found")
         {
-            return "GitHub authentication is required in this environment; set RUSTGIT_GITHUB_TOKEN/GITHUB_PAT/GH_TOKEN or pass a credentialed repo URL such as https://<token>@github.com/owner/repo.git".to_string();
+            return "GitHub authentication is required. Set RUSTGIT_GITHUB_TOKEN/GITHUB_PAT/GH_TOKEN, or enter a token in the portal to access private repositories.".to_string();
         }
     }
 

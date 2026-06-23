@@ -200,6 +200,26 @@
   font-size: 0.9rem;
 }
 
+.tokenDetails {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.6rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.tokenSummary {
+  font-size: 0.8rem;
+  color: #64748b;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.tokenSummary::-webkit-details-marker { display: none; }
+
+.tokenDetails[open] .input {
+  margin-top: 0.5rem;
+}
+
 .envConfigGrid {
   display: grid;
   gap: 0.65rem;
@@ -625,6 +645,14 @@
   .sidebarMeta,
   .answerBox {
     border-top-color: #334155;
+  }
+
+  .tokenDetails {
+    border-color: #334155;
+  }
+
+  .tokenSummary {
+    color: #94a3b8;
   }
 
   .envVarName {

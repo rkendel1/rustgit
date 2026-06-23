@@ -251,7 +251,12 @@ function encodeWorkspacePath(path: string): string {
 async function readJsonResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`Request failed (${response.status}): ${text || "no response body"}`);
+    let message = text || `Request failed (${response.status})`;
+    try {
+      const parsed = JSON.parse(text) as { error?: string };
+      if (parsed.error) message = parsed.error;
+    } catch { /* use raw text */ }
+    throw new Error(message);
   }
   try {
     return JSON.parse(text) as T;
@@ -339,6 +344,7 @@ export default function Home() {
   const [workspacePreviewVersion, setWorkspacePreviewVersion] = useState(0);
   const [workspacePreviewError, setWorkspacePreviewError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
+  const [githubToken, setGithubToken] = useState("");
   const [envConfig, setEnvConfig] = useState<Record<string, string>>({});
   const [envExampleHints, setEnvExampleHints] = useState<Record<string, string>>({});
   const [freeingSpace, setFreeingSpace] = useState(false);
@@ -369,6 +375,12 @@ export default function Home() {
   const parsedRepo = useMemo(() => parseRepositoryInput(repository), [repository]);
   const canAnalyze = Boolean(parsedRepo) && !analyzing;
   const canRun = Boolean(parsedRepo) && !running;
+
+  function authRepoUrl(repoUrl: string): string {
+    const token = githubToken.trim();
+    if (!token || !repoUrl.startsWith("https://github.com/")) return repoUrl;
+    return repoUrl.replace("https://", `https://${token}@`);
+  }
 
   function resetResults(nextRepositoryValue: string) {
     setRepository(nextRepositoryValue);
@@ -691,7 +703,7 @@ export default function Home() {
           anon_user_id: anonymousIdentity.anonUserId,
           anon_session_id: anonymousIdentity.anonSessionId,
           device_fingerprint: PORTAL_DEVICE_FINGERPRINT,
-          repo_url: repo.repoUrl,
+          repo_url: authRepoUrl(repo.repoUrl),
           branch: branch.trim() || "main",
           commit: null,
           include_repository_summary: true,
@@ -783,7 +795,7 @@ export default function Home() {
           anon_user_id: createAnonymousId("anon-portal"),
           anon_session_id: createAnonymousId("portal-session"),
           device_fingerprint: "portal-home",
-          repo_url: repo.repoUrl,
+          repo_url: authRepoUrl(repo.repoUrl),
           branch: branch.trim() || "main",
           commit: null,
           ...buildLaunchOverrides(),
@@ -893,6 +905,18 @@ export default function Home() {
           <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
             {running ? "Starting..." : "Run"}
           </button>
+          <details className={styles.tokenDetails}>
+            <summary className={styles.tokenSummary}>GitHub token (private repos)</summary>
+            <input
+              id="github-token"
+              type="password"
+              autoComplete="off"
+              value={githubToken}
+              onChange={(e) => setGithubToken(e.target.value)}
+              placeholder="ghp_..."
+              className={styles.input}
+            />
+          </details>
         </div>
 
         <nav className={styles.navSection} aria-label="Portal sections">
