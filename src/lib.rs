@@ -8251,10 +8251,16 @@ fn build_runtime_repair_candidates(
 
     let mut candidates = Vec::new();
     if let Some(mut manifest_patch) = input.runtime_manifest.clone() {
-        if !manifest_patch.get("runtime").is_some_and(Value::is_object) {
+        if manifest_patch
+            .get("runtime")
+            .is_none_or(|runtime| !runtime.is_object())
+        {
             manifest_patch["runtime"] = json!({});
         }
-        if !manifest_patch.get("network").is_some_and(Value::is_object) {
+        if manifest_patch
+            .get("network")
+            .is_none_or(|network| !network.is_object())
+        {
             manifest_patch["network"] = json!({});
         }
         let start_command = failure_signal
@@ -13699,7 +13705,7 @@ impl WorkspaceManager {
         let mut health_duration_ms: Option<u64> = None;
         let mut repair_reason: Option<String> = None;
         let mut repair_confidence: Option<f32> = None;
-        let mut successful_patch: Option<String> = Some("original-manifest".to_string());
+        let mut successful_patch: Option<String> = None;
 
         let max_attempts = runtime_repair_attempt_limit();
         for attempt in 0..max_attempts {
@@ -13830,12 +13836,12 @@ impl WorkspaceManager {
                 }
             }
 
-            let Some(candidate) = repair_candidates.pop_front() else {
-                break;
-            };
             if attempt + 1 >= max_attempts {
                 break;
             }
+            let Some(candidate) = repair_candidates.pop_front() else {
+                break;
+            };
             if let Some(manifest_patch) = candidate.manifest_patch.as_ref() {
                 let _ = write_runtime_manifest_value(&repository_root, manifest_patch);
             }
@@ -13854,11 +13860,10 @@ impl WorkspaceManager {
             );
         }
 
-        if failure_message.is_some() {
+        if let Some(message) = failure_message {
             if let Some(manifest) = original_manifest.as_ref() {
                 let _ = write_runtime_manifest_value(&repository_root, manifest);
             }
-            let message = failure_message.unwrap_or_else(|| "runtime failed".to_string());
             self.fail_workspace(id, message.clone());
             self.emit_execution_artifact(
                 id,
@@ -13897,7 +13902,7 @@ impl WorkspaceManager {
             Some(RuntimeRepairTelemetry {
                 repair_reason,
                 repair_confidence,
-                successful_patch,
+                successful_patch: successful_patch.or_else(|| Some("original-manifest".to_string())),
                 final_runtime_state: "ready".to_string(),
             }),
         );
@@ -21775,12 +21780,20 @@ dependencies:
             artifact["metadata"]["launchCommand"].as_str(),
             Some("python3 -m http.server {PORT}")
         );
+        let runtime_repair = artifact
+            .get("metadata")
+            .and_then(|metadata| metadata.get("runtimeRepair"))
+            .expect("runtime repair telemetry");
         assert_eq!(
-            artifact["metadata"]["runtimeRepair"]["successfulPatch"].as_str(),
+            runtime_repair
+                .get("successfulPatch")
+                .and_then(Value::as_str),
             Some("original-manifest")
         );
         assert_eq!(
-            artifact["metadata"]["runtimeRepair"]["finalRuntimeState"].as_str(),
+            runtime_repair
+                .get("finalRuntimeState")
+                .and_then(Value::as_str),
             Some("ready")
         );
         assert!(artifact["startupTimeMs"].as_u64().unwrap_or_default() > 0);
@@ -21817,8 +21830,14 @@ dependencies:
             .as_str()
             .unwrap_or_default()
             .contains("launch failed"));
+        let runtime_repair = artifact
+            .get("metadata")
+            .and_then(|metadata| metadata.get("runtimeRepair"))
+            .expect("runtime repair telemetry");
         assert_eq!(
-            artifact["metadata"]["runtimeRepair"]["finalRuntimeState"].as_str(),
+            runtime_repair
+                .get("finalRuntimeState")
+                .and_then(Value::as_str),
             Some("failed")
         );
     }
