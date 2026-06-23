@@ -1172,8 +1172,8 @@ export default function Home() {
 
         <section className={styles.panel}>
           <h2>Badge Generator</h2>
-          <p className={styles.hint}>Generate embeddable badges directly from this portal.</p>
-          <label htmlFor="badge-mode" className={styles.label}>Runtime mode</label>
+          <p className={styles.hint}>Generate embeddable badges that reflect repository execution health.</p>
+          <label htmlFor="badge-mode" className={styles.label}>Badge mode</label>
           <select
             id="badge-mode"
             value={badgeMode}
