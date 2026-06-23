@@ -30,6 +30,7 @@ name = "generate-docs"
 path = "tools/generate_docs.rs"
 
 [dependencies]
+async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
