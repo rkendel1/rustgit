@@ -13,7 +13,8 @@ const NO_REPOSITORY_SELECTED = "No repository selected";
 const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
 const PORTAL_DEVICE_FINGERPRINT = "portal-home";
-const ANALYZE_PATH = "/api/proxy/api/analyze";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "");
+const ANALYZE_PATH = API_BASE_URL ? `${API_BASE_URL}/api/analyze` : "/api/proxy/api/analyze";
 
 type RepoContext = {
   owner: string;
