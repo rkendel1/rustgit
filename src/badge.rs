@@ -195,6 +195,17 @@ fn escape_svg_text(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn svg_text_units(value: &str) -> i32 {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn hash_prefix(value: &str, len: usize) -> String {
+    hash_key(value).chars().take(len).collect()
+}
+
 pub fn derive_badge_runtime_state(snapshot: &BadgeExecutionSnapshot) -> BadgeRuntimeState {
     if snapshot.healed_artifact_available {
         return BadgeRuntimeState::Healed;
@@ -229,10 +240,10 @@ pub fn badge_svg_endpoint(
     let repo_name = escape_svg_text(&format!("{owner}/{repo}"));
     let status_text = escape_svg_text(&format!("{emoji} {label}"));
     let health = snapshot.health_score.clamp(0.0, 100.0);
-    let left_width =
-        BADGE_PADDING_WIDTH + (repo_name.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_LEFT_WIDTH);
-    let right_width =
-        BADGE_PADDING_WIDTH + (status_text.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_RIGHT_WIDTH);
+    let left_width = BADGE_PADDING_WIDTH
+        + (svg_text_units(&repo_name) * BADGE_CHAR_WIDTH).max(BADGE_MIN_LEFT_WIDTH);
+    let right_width = BADGE_PADDING_WIDTH
+        + (svg_text_units(&status_text) * BADGE_CHAR_WIDTH).max(BADGE_MIN_RIGHT_WIDTH);
     let total_width = left_width + right_width;
 
     (
@@ -283,10 +294,10 @@ pub fn badge_seed_launch_endpoint(
     let (execution_path, execution_body) = executions_start_endpoint(&ExecutionStartRequest {
         org_id: None,
         user_id: None,
-        anon_user_id: Some(format!("anon-seed-{}", &hash_key(&repo_url)[..12])),
+        anon_user_id: Some(format!("anon-seed-{}", hash_prefix(&repo_url, 12))),
         anon_session_id: Some(format!(
             "seed-{}",
-            &hash_key(&format!("{repo_url}:{normalized_branch}"))[..12]
+            hash_prefix(&format!("{repo_url}:{normalized_branch}"), 12)
         )),
         device_fingerprint: Some("readme-badge-seed".to_string()),
         repo_url: repo_url.clone(),
