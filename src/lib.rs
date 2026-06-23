@@ -12718,6 +12718,9 @@ impl WorkspaceManager {
             Box::new(LocalAgentProvider::default_agent()),
             Box::new(DockerExecutionProvider),
             Box::new(NodeRuntimeProvider),
+            Box::new(GoExecutionProvider),
+            Box::new(PythonExecutionProvider),
+            Box::new(JavaExecutionProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
         ];
@@ -14636,6 +14639,15 @@ fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
     if pid_hint.starts_with("node:") {
         return "NodeRuntimeProvider".to_string();
     }
+    if pid_hint.starts_with("go:") {
+        return "GoExecutionProvider".to_string();
+    }
+    if pid_hint.starts_with("python:") {
+        return "PythonExecutionProvider".to_string();
+    }
+    if pid_hint.starts_with("java:") {
+        return "JavaExecutionProvider".to_string();
+    }
     if pid_hint.starts_with("docker:") {
         return DockerExecutionProvider::id_static().to_string();
     }
@@ -14652,6 +14664,9 @@ const LOCAL_AGENT_TRANSPORT_MODE: ExecutionRoutingMode = ExecutionRoutingMode::L
 static WASM_PROVIDER_FOR_TRANSPORT: WasmExecutionProvider = WasmExecutionProvider;
 static DOCKER_PROVIDER_FOR_TRANSPORT: DockerExecutionProvider = DockerExecutionProvider;
 static NODE_PROVIDER_FOR_TRANSPORT: NodeRuntimeProvider = NodeRuntimeProvider;
+static GO_PROVIDER_FOR_TRANSPORT: GoExecutionProvider = GoExecutionProvider;
+static PYTHON_PROVIDER_FOR_TRANSPORT: PythonExecutionProvider = PythonExecutionProvider;
+static JAVA_PROVIDER_FOR_TRANSPORT: JavaExecutionProvider = JavaExecutionProvider;
 static RUST_PROVIDER_FOR_TRANSPORT: RustRuntimeProvider = RustRuntimeProvider;
 static STATIC_PROVIDER_FOR_TRANSPORT: StaticRuntimeProvider = StaticRuntimeProvider;
 
@@ -14663,6 +14678,9 @@ fn transport_for_provider_id(provider_id: &str) -> ExecutionRoutingMode {
         "LocalAgentProvider" => LOCAL_AGENT_TRANSPORT_MODE,
         "DockerExecutionProvider" => DOCKER_PROVIDER_FOR_TRANSPORT.transport(),
         "NodeRuntimeProvider" => NODE_PROVIDER_FOR_TRANSPORT.transport(),
+        "GoExecutionProvider" => GO_PROVIDER_FOR_TRANSPORT.transport(),
+        "PythonExecutionProvider" => PYTHON_PROVIDER_FOR_TRANSPORT.transport(),
+        "JavaExecutionProvider" => JAVA_PROVIDER_FOR_TRANSPORT.transport(),
         "RustRuntimeProvider" => RUST_PROVIDER_FOR_TRANSPORT.transport(),
         "StaticRuntimeProvider" => STATIC_PROVIDER_FOR_TRANSPORT.transport(),
         _ => ExecutionRoutingMode::Local,
@@ -17528,6 +17546,9 @@ impl Default for RestApiSpec {
 
 struct NodeRuntimeProvider;
 struct DockerExecutionProvider;
+struct GoExecutionProvider;
+struct PythonExecutionProvider;
+struct JavaExecutionProvider;
 struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
 struct LocalAgentProvider {
@@ -17877,6 +17898,153 @@ impl ExecutionProvider for DockerExecutionProvider {
                 message: format!("docker health check failed: {err}"),
             }),
         }
+    }
+}
+
+impl ExecutionProvider for GoExecutionProvider {
+    fn id(&self) -> &'static str {
+        "GoExecutionProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Go
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.runtime_spec.language.eq_ignore_ascii_case("go")
+            || matches!(
+                ctx.analysis.framework,
+                Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo
+            )
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("go:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
+    }
+}
+
+impl ExecutionProvider for PythonExecutionProvider {
+    fn id(&self) -> &'static str {
+        "PythonExecutionProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Python
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.runtime_spec.language.eq_ignore_ascii_case("python")
+            || matches!(
+                ctx.analysis.framework,
+                Framework::Python
+                    | Framework::Flask
+                    | Framework::FastApi
+                    | Framework::Django
+                    | Framework::Streamlit
+                    | Framework::Gradio
+            )
+            || ctx
+                .runtime_spec
+                .package_manager
+                .as_deref()
+                .is_some_and(|pm| matches!(pm, "pip" | "pipenv" | "poetry" | "uv"))
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("python:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
+    }
+}
+
+impl ExecutionProvider for JavaExecutionProvider {
+    fn id(&self) -> &'static str {
+        "JavaExecutionProvider"
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Unknown
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        ctx.runtime_spec.language.eq_ignore_ascii_case("java")
+            || ctx.runtime_spec.framework.eq_ignore_ascii_case("java")
+            || ctx
+                .runtime_spec
+                .package_manager
+                .as_deref()
+                .is_some_and(|pm| matches!(pm, "maven" | "gradle"))
+            || Path::new(&ctx.repo_path).join("pom.xml").exists()
+            || Path::new(&ctx.repo_path).join("build.gradle").exists()
+            || Path::new(&ctx.repo_path).join("build.gradle.kts").exists()
+    }
+
+    fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        Ok(ProcessHandle {
+            pid_hint: format!("java:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        Ok(HealthStatus {
+            healthy: true,
+            message: "healthy".to_string(),
+        })
     }
 }
 
