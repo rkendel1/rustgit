@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { resolveLegacyFallbackPath } from "./legacy-path-fallback";
 
 const PRODUCTION_BASE_DOMAIN =
   process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "").replace(/\/.*$/, "") ??
@@ -176,10 +177,8 @@ async function proxyRequest(
     .join("/")
     .replace(/\/{2,}/g, "/")
     .replace(/^\/+|\/+$/g, "");
+  const legacyFallbackPath = resolveLegacyFallbackPath(joinedPath);
   const apiBaseUrl = resolveApiBaseUrl(request);
-  const upstreamUrl = buildUpstreamUrl(apiBaseUrl, joinedPath);
-
-  appendSearchParams(request.nextUrl.searchParams, upstreamUrl);
 
   const requestHeaders = new Headers();
   const contentType = request.headers.get("content-type");
@@ -213,11 +212,40 @@ async function proxyRequest(
       clearTimeout(timeoutId);
     }
   };
+  const requestPath = (path: string): Promise<Response> => {
+    const upstreamUrl = buildUpstreamUrl(apiBaseUrl, path);
+    appendSearchParams(request.nextUrl.searchParams, upstreamUrl);
+    return sendUpstreamRequest(upstreamUrl);
+  };
   let upstreamResponse: Response;
   try {
-    upstreamResponse = await sendUpstreamRequest(upstreamUrl);
+    upstreamResponse = await requestPath(joinedPath);
   } catch (error) {
-    return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
+    if (!legacyFallbackPath) {
+      return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
+    }
+    try {
+      upstreamResponse = await requestPath(legacyFallbackPath);
+    } catch (fallbackError) {
+      console.warn("Proxy legacy fallback request failed after upstream error", {
+        path: joinedPath,
+        fallbackPath: legacyFallbackPath,
+        error: fallbackError,
+      });
+      return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
+    }
+  }
+  if (upstreamResponse.status === 404 && legacyFallbackPath) {
+    try {
+      upstreamResponse = await requestPath(legacyFallbackPath);
+    } catch (error) {
+      console.warn("Proxy legacy fallback request failed after 404 response", {
+        path: joinedPath,
+        fallbackPath: legacyFallbackPath,
+        error,
+      });
+      return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
+    }
   }
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
