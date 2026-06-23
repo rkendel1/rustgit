@@ -19,8 +19,9 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use rustgit_wasm_runtime::{
     analyze::{
-        runtime_capability_statuses, AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest,
-        ANALYSIS_VERSION,
+        runtime_capability_statuses, runtime_discovery_paths, AnalyzeCache, AnalyzeEngine,
+        AnalyzeEngineRequest, ForgeRepositoryProvider, LocalWorkspaceProvider, RepositoryProvider,
+        RepositoryTree, ANALYSIS_VERSION,
     },
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
     healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, ExecutionHandle,
@@ -317,6 +318,84 @@ fn prepare_repository_for_analysis(
     Ok(workspace)
 }
 
+async fn prepare_virtual_repository_for_analysis(
+    repo_url: &str,
+    branch: &str,
+    commit: &str,
+) -> rustgit_wasm_runtime::Result<(PathBuf, String, String, u64, u64, usize, usize)> {
+    if FsPath::new(repo_url).exists() {
+        let provider = LocalWorkspaceProvider::new(repo_url);
+        let tree_started = Instant::now();
+        let tree = provider.tree().await?;
+        let tree_duration_ms = tree_started.elapsed().as_millis() as u64;
+        let paths = runtime_discovery_paths(&tree);
+        let resolved_commit = resolve_repository_commit(FsPath::new(repo_url)).unwrap_or_else(|| {
+            if commit.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                commit.trim().to_string()
+            }
+        });
+        return Ok((
+            PathBuf::from(repo_url),
+            resolved_commit,
+            "local".to_string(),
+            tree_duration_ms,
+            0,
+            paths.len(),
+            tree.files.len().saturating_sub(paths.len()),
+        ));
+    }
+
+    let provider = ForgeRepositoryProvider::from_url(repo_url, branch, commit).ok_or_else(|| {
+        RuntimeError::CommandFailed(
+            "unsupported repository provider; falling back to git clone".to_string(),
+        )
+    })?;
+    let metadata = provider.metadata().await?;
+    let workspace = std::env::temp_dir()
+        .join("rustgit-analyze")
+        .join(hash_key(repo_url))
+        .join(hash_key(&format!("{repo_url}:{branch}:{commit}:virtual")));
+    if workspace.exists() {
+        fs::remove_dir_all(&workspace)?;
+    }
+    fs::create_dir_all(&workspace)?;
+
+    let tree_started = Instant::now();
+    let tree = provider.tree().await?;
+    let tree_duration_ms = tree_started.elapsed().as_millis() as u64;
+    write_repository_tree_artifact(&workspace, &tree)?;
+
+    let runtime_paths = runtime_discovery_paths(&tree);
+    let download_started = Instant::now();
+    provider.download(&runtime_paths, &workspace).await?;
+    let download_duration_ms = download_started.elapsed().as_millis() as u64;
+    let resolved_commit = metadata.commit.unwrap_or_else(|| {
+        if commit.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            commit.trim().to_string()
+        }
+    });
+    Ok((
+        workspace,
+        resolved_commit,
+        metadata.provider,
+        tree_duration_ms,
+        download_duration_ms,
+        runtime_paths.len(),
+        tree.files.len().saturating_sub(runtime_paths.len()),
+    ))
+}
+
+fn write_repository_tree_artifact(root: &FsPath, tree: &RepositoryTree) -> rustgit_wasm_runtime::Result<()> {
+    let payload = serde_json::to_string_pretty(tree)
+        .map_err(|err| RuntimeError::CommandFailed(format!("tree serialization failed: {err}")))?;
+    fs::write(root.join("repository-tree.json"), payload)?;
+    Ok(())
+}
+
 fn run_command_with_timeout(
     mut command: Command,
     timeout_secs: u64,
@@ -538,35 +617,42 @@ async fn analyze_repository(
         .to_string();
     let requested_commit = body.commit.unwrap_or_default().trim().to_string();
 
-    let repo_url_for_prepare = repo_url.clone();
-    let branch_for_prepare = branch.clone();
-    let requested_commit_for_prepare = requested_commit.clone();
-    let clone_started = Instant::now();
-    let (repo_root, resolved_commit) = tokio::task::spawn_blocking(
-        move || -> rustgit_wasm_runtime::Result<(PathBuf, String)> {
-            let repo_root = prepare_repository_for_analysis(
-                &repo_url_for_prepare,
-                &branch_for_prepare,
-                &requested_commit_for_prepare,
-            )?;
-            let resolved_commit = resolve_repository_commit(&repo_root).unwrap_or_else(|| {
-                if requested_commit_for_prepare.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    requested_commit_for_prepare.clone()
-                }
-            });
-            Ok((repo_root, resolved_commit))
-        },
-    )
-    .await
-    .map_err(|join_error| {
-        err_response(RuntimeError::CommandFailed(format!(
-            "analyze task panicked: {join_error}"
-        )))
-    })?
-    .map_err(err_response)?;
-    let clone_duration_ms = clone_started.elapsed().as_millis() as u64;
+    let prepare_started = Instant::now();
+    let (repo_root, resolved_commit, provider_name, provider_tree_duration_ms, provider_read_duration_ms, runtime_files_loaded, runtime_files_skipped) =
+        match prepare_virtual_repository_for_analysis(&repo_url, &branch, &requested_commit).await {
+            Ok(result) => result,
+            Err(_) => {
+                let repo_url_for_prepare = repo_url.clone();
+                let branch_for_prepare = branch.clone();
+                let requested_commit_for_prepare = requested_commit.clone();
+                let (repo_root, resolved_commit) = tokio::task::spawn_blocking(
+                    move || -> rustgit_wasm_runtime::Result<(PathBuf, String)> {
+                        let repo_root = prepare_repository_for_analysis(
+                            &repo_url_for_prepare,
+                            &branch_for_prepare,
+                            &requested_commit_for_prepare,
+                        )?;
+                        let resolved_commit = resolve_repository_commit(&repo_root).unwrap_or_else(|| {
+                            if requested_commit_for_prepare.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                requested_commit_for_prepare.clone()
+                            }
+                        });
+                        Ok((repo_root, resolved_commit))
+                    },
+                )
+                .await
+                .map_err(|join_error| {
+                    err_response(RuntimeError::CommandFailed(format!(
+                        "analyze task panicked: {join_error}"
+                    )))
+                })?
+                .map_err(err_response)?;
+                (repo_root, resolved_commit, "git".to_string(), 0, 0, 0, 0)
+            }
+        };
+    let prepare_duration_ms = prepare_started.elapsed().as_millis() as u64;
     let resolved_cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit, ANALYSIS_VERSION);
     let analysis_id = format!("analyze-{resolved_cache_key}");
 
@@ -584,7 +670,11 @@ async fn analyze_repository(
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
         payload["metrics"] = json!({
             "analyze.duration": payload["durationMs"],
-            "clone.duration": clone_duration_ms,
+            "clone.duration": if provider_name == "git" { prepare_duration_ms } else { 0 },
+            "provider.tree.duration": provider_tree_duration_ms,
+            "provider.read.duration": provider_read_duration_ms,
+            "runtime.files.loaded": runtime_files_loaded,
+            "runtime.files.skipped": runtime_files_skipped,
             "cache.hit": true,
             "cache.miss": false
         });
@@ -639,7 +729,11 @@ async fn analyze_repository(
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
     payload["metrics"] = json!({
         "analyze.duration": payload["durationMs"],
-        "clone.duration": clone_duration_ms,
+        "clone.duration": if provider_name == "git" { prepare_duration_ms } else { 0 },
+        "provider.tree.duration": provider_tree_duration_ms,
+        "provider.read.duration": provider_read_duration_ms,
+        "runtime.files.loaded": runtime_files_loaded,
+        "runtime.files.skipped": runtime_files_skipped,
         "cache.hit": false,
         "cache.miss": true
     });
