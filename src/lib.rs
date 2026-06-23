@@ -14037,11 +14037,15 @@ impl WorkspaceManager {
         } else {
             "unknown".to_string()
         };
-        let exit_code = runtime
-            .as_ref()
-            .and_then(|r| r.exit_code)
-            .or_else(|| (health_status == "healthy").then_some(0))
-            .or_else(|| (workspace_state == WorkspaceState::Failed).then_some(1));
+        let exit_code = if let Some(code) = runtime.as_ref().and_then(|r| r.exit_code) {
+            Some(code)
+        } else if health_status == "healthy" {
+            Some(0)
+        } else if workspace_state == WorkspaceState::Failed {
+            Some(1)
+        } else {
+            None
+        };
         let startup_time_ms = runtime
             .as_ref()
             .map(|r| {
@@ -14059,7 +14063,13 @@ impl WorkspaceManager {
         let retry_count = retries.unwrap_or_else(|| {
             runtime
                 .as_ref()
-                .map(|r| r.readiness_attempts.saturating_sub(1))
+                .map(|r| {
+                    if r.readiness_attempts > 0 {
+                        r.readiness_attempts - 1
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
         });
 
