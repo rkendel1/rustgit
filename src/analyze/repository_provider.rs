@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures_util::stream::{self, StreamExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -39,6 +40,7 @@ const SKIPPED_DIRECTORIES: [&str; 8] = [
     "target/",
     ".next/",
 ];
+const PROVIDER_USER_AGENT: &str = "rustgit";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryMetadata {
@@ -103,9 +105,13 @@ pub fn runtime_discovery_paths(tree: &RepositoryTree) -> Vec<String> {
 }
 
 fn is_skipped_path(path: &str) -> bool {
-    SKIPPED_DIRECTORIES
-        .iter()
-        .any(|prefix| path.starts_with(prefix) || path.contains(&format!("/{prefix}")))
+    SKIPPED_DIRECTORIES.iter().any(|prefix| {
+        if path.starts_with(prefix) {
+            return true;
+        }
+        let prefix_no_slash = prefix.trim_end_matches('/');
+        path.split('/').any(|segment| segment == prefix_no_slash)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -252,9 +258,9 @@ impl ForgeRepositoryProvider {
             "gitlab"
         } else if host == "codeberg.org" {
             "codeberg"
-        } else if host.contains("forgejo") {
+        } else if host == "forgejo.org" || host.ends_with(".forgejo.org") {
             "forgejo"
-        } else if host.contains("gitea") {
+        } else if host == "gitea.com" || host.ends_with(".gitea.com") {
             "gitea"
         } else {
             return None;
@@ -277,20 +283,34 @@ impl ForgeRepositoryProvider {
     }
 
     fn raw_url(&self, path: &str) -> String {
+        let reference = self.commit.as_deref().unwrap_or(self.branch.as_str());
         match self.provider.as_str() {
             "github" => format!(
                 "https://raw.githubusercontent.com/{}/{}/{}/{}",
-                self.owner, self.repository, self.branch, path
+                self.owner, self.repository, reference, path
             ),
             "gitlab" => format!(
                 "https://gitlab.com/{}/{}/-/raw/{}/{}",
-                self.owner, self.repository, self.branch, path
+                self.owner, self.repository, reference, path
             ),
             _ => format!(
-                "https://{}/{}/{}/raw/branch/{}/{}",
-                self.host, self.owner, self.repository, self.branch, path
+                "https://{}/{}/{}/raw/{}/{}/{}",
+                self.host,
+                self.owner,
+                self.repository,
+                if self.commit.is_some() {
+                    "commit"
+                } else {
+                    "branch"
+                },
+                reference,
+                path
             ),
         }
+    }
+
+    fn tree_reference(&self) -> &str {
+        self.commit.as_deref().unwrap_or(self.branch.as_str())
     }
 }
 
@@ -332,12 +352,14 @@ impl RepositoryProvider for ForgeRepositoryProvider {
         let (files, directories, children, sha) = if self.provider == "github" {
             let url = format!(
                 "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-                self.owner, self.repository, self.branch
+                self.owner,
+                self.repository,
+                self.tree_reference()
             );
             let response = self
                 .client
                 .get(url)
-                .header("User-Agent", "rustgit")
+                .header("User-Agent", PROVIDER_USER_AGENT)
                 .send()
                 .await
                 .map_err(|err| RuntimeError::CommandFailed(format!("provider tree failed: {err}")))?;
@@ -376,27 +398,37 @@ impl RepositoryProvider for ForgeRepositoryProvider {
             (files, directories, children, Some(payload.sha))
         } else if self.provider == "gitlab" {
             let project = format!("{}/{}", self.owner, self.repository).replace('/', "%2F");
-            let url = format!(
-                "https://gitlab.com/api/v4/projects/{project}/repository/tree?recursive=true&per_page=100&ref={}",
-                self.branch
-            );
-            let response = self
-                .client
-                .get(url)
-                .header("User-Agent", "rustgit")
-                .send()
-                .await
-                .map_err(|err| RuntimeError::CommandFailed(format!("provider tree failed: {err}")))?;
-            if !response.status().is_success() {
-                return Err(RuntimeError::CommandFailed(format!(
-                    "provider tree failed with status {}",
-                    response.status()
-                )));
+            let mut page_number = 1_u32;
+            let mut payload = Vec::new();
+            loop {
+                let url = format!(
+                    "https://gitlab.com/api/v4/projects/{project}/repository/tree?recursive=true&per_page=100&page={page_number}&ref={}",
+                    self.tree_reference()
+                );
+                let response = self
+                    .client
+                    .get(url)
+                    .header("User-Agent", PROVIDER_USER_AGENT)
+                    .send()
+                    .await
+                    .map_err(|err| RuntimeError::CommandFailed(format!("provider tree failed: {err}")))?;
+                if !response.status().is_success() {
+                    return Err(RuntimeError::CommandFailed(format!(
+                        "provider tree failed with status {}",
+                        response.status()
+                    )));
+                }
+                let page_items = response
+                    .json::<Vec<GitLabTreeItem>>()
+                    .await
+                    .map_err(|err| RuntimeError::CommandFailed(format!("provider tree decode failed: {err}")))?;
+                let count = page_items.len();
+                payload.extend(page_items);
+                if count < 100 {
+                    break;
+                }
+                page_number += 1;
             }
-            let payload = response
-                .json::<Vec<GitLabTreeItem>>()
-                .await
-                .map_err(|err| RuntimeError::CommandFailed(format!("provider tree decode failed: {err}")))?;
             let files = payload
                 .iter()
                 .filter(|entry| entry.kind == "blob")
@@ -420,12 +452,15 @@ impl RepositoryProvider for ForgeRepositoryProvider {
         } else {
             let url = format!(
                 "https://{}/api/v1/repos/{}/{}/git/trees/{}?recursive=true",
-                self.host, self.owner, self.repository, self.branch
+                self.host,
+                self.owner,
+                self.repository,
+                self.tree_reference()
             );
             let response = self
                 .client
                 .get(url)
-                .header("User-Agent", "rustgit")
+                .header("User-Agent", PROVIDER_USER_AGENT)
                 .send()
                 .await
                 .map_err(|err| RuntimeError::CommandFailed(format!("provider tree failed: {err}")))?;
@@ -478,15 +513,21 @@ impl RepositoryProvider for ForgeRepositoryProvider {
     }
 
     async fn exists(&self, path: &str) -> Result<bool> {
-        let tree = self.tree().await?;
-        Ok(tree.files.iter().any(|candidate| candidate == path))
+        let response = self
+            .client
+            .head(self.raw_url(path))
+            .header("User-Agent", PROVIDER_USER_AGENT)
+            .send()
+            .await
+            .map_err(|err| RuntimeError::CommandFailed(format!("provider exists failed: {err}")))?;
+        Ok(response.status().is_success())
     }
 
     async fn read(&self, path: &str) -> Result<RepositoryFile> {
         let response = self
             .client
             .get(self.raw_url(path))
-            .header("User-Agent", "rustgit")
+            .header("User-Agent", PROVIDER_USER_AGENT)
             .send()
             .await
             .map_err(|err| RuntimeError::CommandFailed(format!("provider read failed: {err}")))?;
@@ -509,9 +550,16 @@ impl RepositoryProvider for ForgeRepositoryProvider {
     }
 
     async fn download(&self, paths: &[String], destination: &Path) -> Result<()> {
-        for path in paths {
-            let file = self.read(path).await?;
-            let target = destination.join(path);
+        let mut buffered = stream::iter(paths.iter().cloned().map(|path| async move {
+            self.read(&path).await
+        }))
+        .buffer_unordered(8);
+        let mut files = Vec::new();
+        while let Some(file) = buffered.next().await {
+            files.push(file?);
+        }
+        for file in files {
+            let target = destination.join(&file.path);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
