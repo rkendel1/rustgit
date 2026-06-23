@@ -1074,7 +1074,11 @@ export default function Home() {
             </div>
             {workspace?.ports && workspace.ports.length > 0 ? (
               workspace.ports.map((p) => {
-                const appUrl = buildAppUrl(workspace.id, p.route);
+                const route = p.route?.startsWith("/") ? p.route : "/";
+                const isLocalDev = !process.env.NEXT_PUBLIC_BASE_DOMAIN;
+                const directUrl = `${p.protocol ?? "http"}://127.0.0.1:${p.port}${route}`;
+                const proxyUrl = buildAppUrl(workspace.id, p.route);
+                const appUrl = isLocalDev ? directUrl : proxyUrl;
                 if (!appUrl) return null;
                 return (
                   <div key={p.port} className={styles.tile} style={{ gridColumn: "1 / -1" }}>

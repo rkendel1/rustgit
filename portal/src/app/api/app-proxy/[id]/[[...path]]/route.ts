@@ -6,7 +6,7 @@ const BACKEND_BASE =
     ? "http://localhost:8080"
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 
-const MAX_PROBE_TIMEOUT_MS = 500;
+const MAX_PROBE_TIMEOUT_MS = 10_000;
 
 type WorkspaceRuntime = {
   framework?: string;
